@@ -1,0 +1,21 @@
+[package]
+name = "bt-protocol"
+description = "Public wire DTOs and protocol types for Belltower clients and servers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[dependencies]
+bt-core = { version = "0.1.0", path = "../bt-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+camino.workspace = true
+url.workspace = true

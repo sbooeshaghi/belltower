@@ -1,0 +1,44 @@
+Doctor status=ok protocol=belltower.v1
+Current connection=openai model=gpt-5.4-mini tool_mode=extended
+Defaults default_connection=openai auth_storage=auto
+Connections:
+- openai (openai) readiness=ready
+  ready=yes support=runtime_supported model=gpt-5.4-mini
+  auth=secret:keychain
+  probe=ok
+- anthropic (anthropic) readiness=auth missing
+  ready=no support=runtime_supported model=sonnet-4.6
+  auth=missing
+  probe=login required
+- vertex (vertex) readiness=runtime unsupported
+  ready=no support=planned model=gemini-2.5-pro
+  auth=json:adc
+  probe=provider planned
+- chatgpt (openai-chatgpt) readiness=configured model unavailable
+  ready=no support=runtime_supported model=gpt-5.4
+  auth=oauth:oauth:tried=keychain
+  probe=use gpt-5.4-mini
+Connection models:
+- openai (openai) readiness=ready
+  support=runtime_supported default_model=gpt-5.4-mini
+  auth=keychain discovered_from=api
+  models=gpt-5.4-mini (default), gpt-5.4 (discovered)
+- anthropic (anthropic) readiness=auth missing
+  support=runtime_supported default_model=sonnet-4.6
+  auth=missing discovered_from=none
+  models=none
+- vertex (vertex) readiness=runtime unsupported
+  support=planned default_model=gemini-2.5-pro
+  auth=adc discovered_from=none
+  models=none
+- chatgpt (openai-chatgpt) readiness=configured model unavailable
+  support=runtime_supported default_model=gpt-5.4
+  auth=oauth discovered_from=api
+  models=gpt-5.4-mini (discovered)
+Local backends:
+- Ollama status=ready models=qwen3.5:latest, gpt-oss:20b
+MCP servers=1 discovered=0 ready=0 degraded=1 disabled=0 tools=1
+MCP servers:
+- docs enabled=yes transport=http status=degraded:retrying tools=1
+MCP tools:
+- docs.search server=docs risk=high group=external

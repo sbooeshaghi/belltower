@@ -1,0 +1,196 @@
+{
+  "error_envelope": {
+    "class": "provider",
+    "code": "provider_error",
+    "message": "provider stream failed",
+    "retryable": true,
+    "details": {
+      "provider": "openai",
+      "request_id": "req_123"
+    }
+  },
+  "health_response": {
+    "status": "ok",
+    "protocol_version": "belltower.v1"
+  },
+  "create_session_request": {
+    "project_root": "/tmp/belltower/project",
+    "connection_id": "openai",
+    "model_id": "gpt-5.1",
+    "tool_mode": "extended",
+    "display_name": "Protocol fixture session",
+    "objective": "Verify protocol fixtures",
+    "budget": {
+      "max_wall_clock_seconds": 300,
+      "max_tokens": 120000,
+      "max_turns": 12,
+      "max_cost_usd": 8.5
+    }
+  },
+  "create_session_response": {
+    "session": {
+      "session_id": "00000000-0000-0000-0000-000000000001",
+      "project_root": "/tmp/belltower/project",
+      "connection_id": "openai",
+      "model_id": "gpt-5.1",
+      "tool_mode": "extended",
+      "settings_revision_id": 1,
+      "created_at": [
+        2026,
+        90,
+        12,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "updated_at": [
+        2026,
+        90,
+        12,
+        12,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "status": "Active",
+      "display_name": "Protocol fixture session",
+      "objective": "Verify protocol fixtures",
+      "parent_session_id": null,
+      "parent_branch_id": null,
+      "parent_turn_id": null
+    },
+    "branch": {
+      "branch_id": "20000000-0000-0000-0000-000000000001",
+      "session_id": "00000000-0000-0000-0000-000000000001",
+      "parent_branch_id": null,
+      "parent_event_id": "40000000-0000-0000-0000-000000000001",
+      "head_event_id": "40000000-0000-0000-0000-000000000001",
+      "summary": "Main branch summary",
+      "created_at": [
+        2026,
+        90,
+        12,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "is_default": true
+    }
+  },
+  "update_session_request": {
+    "connection_id": "local",
+    "model_id": "qwen2.5-coder:7b",
+    "tool_mode": "standard",
+    "reset_model_to_default": false
+  },
+  "update_session_budget_request": {
+    "budget": {
+      "max_wall_clock_seconds": 300,
+      "max_tokens": 120000,
+      "max_turns": 12,
+      "max_cost_usd": 8.5
+    }
+  },
+  "send_message_request": {
+    "branch_id": "20000000-0000-0000-0000-000000000001",
+    "message": {
+      "message_id": "60000000-0000-0000-0000-000000000001",
+      "role": "User",
+      "parts": [
+        {
+          "Text": {
+            "text": "Please inspect the protocol surface."
+          }
+        }
+      ],
+      "created_at": [
+        2026,
+        90,
+        12,
+        4,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "spawn_session_request": {
+    "parent_branch_id": "20000000-0000-0000-0000-000000000001",
+    "parent_turn_id": "30000000-0000-0000-0000-000000000001",
+    "objective": "Review MCP state transitions",
+    "display_name": "MCP child",
+    "connection_id": "anthropic",
+    "model_id": "claude-3-7-sonnet-20250219"
+  },
+  "spawn_session_response": {
+    "parent_session_id": "00000000-0000-0000-0000-000000000001",
+    "parent_branch_id": "20000000-0000-0000-0000-000000000001",
+    "parent_turn_id": "30000000-0000-0000-0000-000000000001",
+    "child_session": {
+      "session_id": "00000000-0000-0000-0000-000000000002",
+      "project_root": "/tmp/belltower/project",
+      "connection_id": "anthropic",
+      "model_id": "claude-3-7-sonnet-20250219",
+      "tool_mode": "standard",
+      "settings_revision_id": 1,
+      "created_at": [
+        2026,
+        90,
+        12,
+        20,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "updated_at": [
+        2026,
+        90,
+        12,
+        25,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "status": "Active",
+      "display_name": "MCP child",
+      "objective": "Review MCP state transitions",
+      "parent_session_id": "00000000-0000-0000-0000-000000000001",
+      "parent_branch_id": "20000000-0000-0000-0000-000000000001",
+      "parent_turn_id": "30000000-0000-0000-0000-000000000001"
+    },
+    "child_branch": {
+      "branch_id": "20000000-0000-0000-0000-000000000002",
+      "session_id": "00000000-0000-0000-0000-000000000002",
+      "parent_branch_id": "20000000-0000-0000-0000-000000000001",
+      "parent_event_id": "40000000-0000-0000-0000-000000000001",
+      "head_event_id": "40000000-0000-0000-0000-000000000002",
+      "summary": "Child branch summary",
+      "created_at": [
+        2026,
+        90,
+        12,
+        20,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "is_default": true
+    }
+  }
+}

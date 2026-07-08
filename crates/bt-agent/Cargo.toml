@@ -1,0 +1,22 @@
+[package]
+name = "bt-agent"
+description = "Pure agent loop and transcript assembly primitives for Belltower."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[dependencies]
+bt-core = { version = "0.1.0", path = "../bt-core" }
+bt-tools = { version = "0.1.0", path = "../bt-tools" }
+camino.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

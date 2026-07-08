@@ -1,0 +1,22 @@
+version = 1
+
+[[window]]
+provider = "openai-compatible"
+model_pattern = "o4-mini"
+context_window_tokens = 200000
+
+[[window]]
+provider = "anthropic"
+model_pattern = "claude-sonnet-4"
+context_window_tokens = 200000
+
+[[window]]
+provider = "google-vertex"
+model_pattern = "gemini-2.5-pro"
+context_window_tokens = 1048576
+
+[[window]]
+provider = "openai-compatible"
+model_pattern = "qwen3"
+context_window_tokens = 32768
+

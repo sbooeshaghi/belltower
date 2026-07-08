@@ -1,0 +1,11 @@
+Session 00000000
+Status: Active  Runtime: working
+Project: /tmp/belltower/project
+Connection: openai  Model: gpt-5.1
+Active branch: 20000000  Total branches: 2
+Turns: 3  Messages: 5  Tool calls: 2
+Approvals: 1 total, 1 pending
+Raw chunks: 4  Last seq: 42
+Controls: cancel_requested=false  pending_steer=1
+Related sessions:
+- child 00000000 [MCP child] conn=anthropic model=claude-3-7-sonnet-20250219 origin_branch=20000000 origin_turn=30000000

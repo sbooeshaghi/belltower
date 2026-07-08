@@ -1,0 +1,21 @@
+[package]
+name = "bt-session"
+description = "SQLite-backed session store, projections, replay, and export support for Belltower."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[dependencies]
+bt-core = { version = "0.1.0", path = "../bt-core" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

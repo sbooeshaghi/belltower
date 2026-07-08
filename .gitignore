@@ -1,0 +1,5 @@
+target/
+auth_token
+.DS_Store
+.tmux/
+belltower.db

@@ -1,0 +1,4062 @@
+{
+  "components": {
+    "schemas": {
+      "ActivateBranchRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "carry_summary": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "carry_summary"
+        ],
+        "type": "object"
+      },
+      "AnswerToolRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "call_id": {
+            "type": "string"
+          },
+          "response": {}
+        },
+        "required": [
+          "call_id",
+          "response"
+        ],
+        "type": "object"
+      },
+      "ApprovalDecision": {
+        "description": "ApprovalDecision is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "ApprovalScope": {
+        "description": "ApprovalScope is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "ApproveToolRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "call_id": {
+            "type": "string"
+          },
+          "decision": {
+            "$ref": "#/components/schemas/ApprovalDecision"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ApprovalScope"
+          },
+          "tool_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "call_id",
+          "tool_name",
+          "scope",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "BranchInspection": {
+        "description": "BranchInspection is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "BranchMessagesPageResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "branch_id": {
+            "type": "string"
+          },
+          "has_more_before": {
+            "type": "boolean"
+          },
+          "last_seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/SequencedMessageDto"
+            },
+            "type": "array"
+          },
+          "newest_seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "oldest_seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "branch_id",
+          "messages",
+          "has_more_before"
+        ],
+        "type": "object"
+      },
+      "BranchOperatorCommandsPageResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "branch_id": {
+            "type": "string"
+          },
+          "commands": {
+            "items": {
+              "$ref": "#/components/schemas/RecordedOperatorCommandDto"
+            },
+            "type": "array"
+          },
+          "has_more_before": {
+            "type": "boolean"
+          },
+          "last_seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "newest_seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "oldest_seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "branch_id",
+          "commands",
+          "has_more_before"
+        ],
+        "type": "object"
+      },
+      "BranchOperatorCommandsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "branch_id": {
+            "type": "string"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/EventEnvelope"
+            },
+            "type": "array"
+          },
+          "last_seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "branch_id",
+          "events"
+        ],
+        "type": "object"
+      },
+      "BranchRecord": {
+        "description": "BranchRecord is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "BranchesResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "branches": {
+            "items": {
+              "$ref": "#/components/schemas/BranchRecord"
+            },
+            "type": "array"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "branches"
+        ],
+        "type": "object"
+      },
+      "BudgetConfig": {
+        "description": "BudgetConfig is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "CancelSessionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "CompactSessionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "branch_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "branch_id"
+        ],
+        "type": "object"
+      },
+      "CompactSessionResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "branch_id": {
+            "type": "string"
+          },
+          "compaction": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ContextCompactionDto"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "model_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "branch_id",
+          "model_id"
+        ],
+        "type": "object"
+      },
+      "ConnectionDescriptor": {
+        "description": "ConnectionDescriptor is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "ConnectionModelInventory": {
+        "description": "ConnectionModelInventory is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "ConnectionModelsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "connections": {
+            "items": {
+              "$ref": "#/components/schemas/ConnectionModelInventory"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "connections"
+        ],
+        "type": "object"
+      },
+      "ConnectionsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "connections": {
+            "items": {
+              "$ref": "#/components/schemas/ConnectionDescriptor"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "connections"
+        ],
+        "type": "object"
+      },
+      "ContextCompactionDto": {
+        "additionalProperties": false,
+        "properties": {
+          "compaction_id": {
+            "type": "string"
+          },
+          "context_boundary_seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "files_modified": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "files_read": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "first_kept_branch_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "first_kept_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "first_kept_seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "latency_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "messages_after": {
+            "type": "integer"
+          },
+          "messages_before": {
+            "type": "integer"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "phase": {
+            "type": "string"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "summary_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tokens_after": {
+            "type": "integer"
+          },
+          "tokens_before": {
+            "type": "integer"
+          },
+          "trigger": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "compaction_id",
+          "trigger",
+          "phase",
+          "status",
+          "reason",
+          "provider",
+          "model",
+          "context_boundary_seq_id",
+          "summary_message_id",
+          "first_kept_message_id",
+          "first_kept_branch_id",
+          "first_kept_seq_id",
+          "latency_ms",
+          "summary",
+          "messages_before",
+          "messages_after",
+          "tokens_before",
+          "tokens_after",
+          "files_read",
+          "files_modified"
+        ],
+        "type": "object"
+      },
+      "CreateBranchRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "activate": {
+            "type": "boolean"
+          },
+          "carry_summary": {
+            "type": "boolean"
+          },
+          "from_branch_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "from_branch_id",
+          "activate",
+          "carry_summary"
+        ],
+        "type": "object"
+      },
+      "CreateBranchResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "branch": {
+            "$ref": "#/components/schemas/BranchRecord"
+          }
+        },
+        "required": [
+          "branch"
+        ],
+        "type": "object"
+      },
+      "CreateSessionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BudgetConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "connection_id": {
+            "type": "string"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "model_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "objective": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "project_root": {
+            "type": "string"
+          },
+          "tool_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionToolMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "project_root",
+          "connection_id"
+        ],
+        "type": "object"
+      },
+      "CreateSessionResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "branch": {
+            "$ref": "#/components/schemas/BranchRecord"
+          },
+          "session": {
+            "$ref": "#/components/schemas/SessionRecord"
+          }
+        },
+        "required": [
+          "session",
+          "branch"
+        ],
+        "type": "object"
+      },
+      "ErrorEnvelope": {
+        "additionalProperties": false,
+        "properties": {
+          "class": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "details": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "class",
+          "code",
+          "message",
+          "retryable"
+        ],
+        "type": "object"
+      },
+      "EventEnvelope": {
+        "description": "EventEnvelope is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "ExportFormat": {
+        "enum": [
+          "legacy-bundle",
+          "jsonl",
+          "html",
+          "sharegpt",
+          "otlp"
+        ],
+        "type": "string"
+      },
+      "HealthResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "protocol_version": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "protocol_version"
+        ],
+        "type": "object"
+      },
+      "ListSessionsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/SessionRecord"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "sessions"
+        ],
+        "type": "object"
+      },
+      "McpInventoryResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "servers": {
+            "items": {
+              "$ref": "#/components/schemas/McpServerDescriptor"
+            },
+            "type": "array"
+          },
+          "tools": {
+            "items": {
+              "$ref": "#/components/schemas/McpToolDescriptor"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "servers",
+          "tools"
+        ],
+        "type": "object"
+      },
+      "McpServerDescriptor": {
+        "description": "McpServerDescriptor is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "McpServersResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "servers": {
+            "items": {
+              "$ref": "#/components/schemas/McpServerDescriptor"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "servers"
+        ],
+        "type": "object"
+      },
+      "McpToolDescriptor": {
+        "description": "McpToolDescriptor is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "McpToolsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "tools": {
+            "items": {
+              "$ref": "#/components/schemas/McpToolDescriptor"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "tools"
+        ],
+        "type": "object"
+      },
+      "Message": {
+        "description": "Message is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "ModelBackendDescriptor": {
+        "description": "ModelBackendDescriptor is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "ModelBackendsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "backends": {
+            "items": {
+              "$ref": "#/components/schemas/ModelBackendDescriptor"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "backends"
+        ],
+        "type": "object"
+      },
+      "ModelRecommendationsReport": {
+        "description": "ModelRecommendationsReport is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "ModelRecommendationsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "report": {
+            "$ref": "#/components/schemas/ModelRecommendationsReport"
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "type": "object"
+      },
+      "PushOtlpExportRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "project_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "PushOtlpExportResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "bytes_sent": {
+            "type": "integer"
+          },
+          "content_type": {
+            "type": "string"
+          },
+          "rejected_spans": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "request_url": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "status_code": {
+            "type": "integer"
+          },
+          "warning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "session_id",
+          "request_url",
+          "content_type",
+          "bytes_sent",
+          "status_code"
+        ],
+        "type": "object"
+      },
+      "QueuedMessageInspection": {
+        "description": "QueuedMessageInspection is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "RawChunkDto": {
+        "additionalProperties": false,
+        "properties": {
+          "branch_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "chunk_id": {
+            "type": "integer"
+          },
+          "content_base64": {
+            "type": "string"
+          },
+          "event_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "llm_call_ordinal": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "provider": {
+            "type": "string"
+          },
+          "received_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "stream_name": {
+            "type": "string"
+          },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "chunk_id",
+          "provider",
+          "stream_name",
+          "content_base64",
+          "received_at"
+        ],
+        "type": "object"
+      },
+      "RawSseEnvelope": {
+        "description": "RawSseEnvelope is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "RecordOperatorCommandRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "command_type": {
+            "type": "string"
+          },
+          "output": {
+            "type": "string"
+          },
+          "raw_input": {
+            "type": "string"
+          },
+          "success": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "command_type",
+          "raw_input",
+          "output",
+          "success"
+        ],
+        "type": "object"
+      },
+      "RecordedOperatorCommandDto": {
+        "additionalProperties": false,
+        "properties": {
+          "command_type": {
+            "type": "string"
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "output": {
+            "type": "string"
+          },
+          "raw_input": {
+            "type": "string"
+          },
+          "seq_id": {
+            "type": "integer"
+          },
+          "success": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "seq_id",
+          "occurred_at",
+          "command_type",
+          "raw_input",
+          "output",
+          "success"
+        ],
+        "type": "object"
+      },
+      "RunShellCommandRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "raw_input": {
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "raw_input",
+          "command"
+        ],
+        "type": "object"
+      },
+      "SendMessageOutcome": {
+        "oneOf": [
+          {
+            "properties": {
+              "outcome": {
+                "const": "dispatched"
+              }
+            },
+            "required": [
+              "outcome"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "outcome": {
+                "const": "queued"
+              },
+              "position": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "outcome",
+              "position"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SendMessageRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "branch_id": {
+            "type": "string"
+          },
+          "message": {
+            "$ref": "#/components/schemas/Message"
+          }
+        },
+        "required": [
+          "branch_id",
+          "message"
+        ],
+        "type": "object"
+      },
+      "SendMessageResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "branch_id": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string"
+          },
+          "position": {
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "branch_id",
+          "outcome"
+        ],
+        "type": "object"
+      },
+      "SequencedMessageDto": {
+        "additionalProperties": false,
+        "properties": {
+          "message": {
+            "$ref": "#/components/schemas/Message"
+          },
+          "seq_id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "seq_id",
+          "message"
+        ],
+        "type": "object"
+      },
+      "ServerCapabilities": {
+        "additionalProperties": false,
+        "properties": {
+          "approvals": {
+            "type": "boolean"
+          },
+          "exports": {
+            "type": "boolean"
+          },
+          "lineage_inspection": {
+            "type": "boolean"
+          },
+          "mcp_inventory": {
+            "type": "boolean"
+          },
+          "mcp_reload": {
+            "type": "boolean"
+          },
+          "pending_input": {
+            "type": "boolean"
+          },
+          "raw_chunk_paging": {
+            "type": "boolean"
+          },
+          "session_queue": {
+            "type": "boolean"
+          },
+          "spawn_session": {
+            "type": "boolean"
+          },
+          "workflow_inspection": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "approvals",
+          "pending_input",
+          "session_queue",
+          "workflow_inspection",
+          "lineage_inspection",
+          "raw_chunk_paging",
+          "exports",
+          "mcp_inventory",
+          "mcp_reload",
+          "spawn_session"
+        ],
+        "type": "object"
+      },
+      "ServerInfoResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/ServerCapabilities"
+          },
+          "protocol_version": {
+            "type": "string"
+          },
+          "server_version": {
+            "type": "string"
+          },
+          "supported_protocol_versions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "server_version",
+          "protocol_version",
+          "supported_protocol_versions",
+          "capabilities"
+        ],
+        "type": "object"
+      },
+      "SessionBranchInspectionResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "active_branch_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "branches": {
+            "items": {
+              "$ref": "#/components/schemas/BranchInspection"
+            },
+            "type": "array"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "branches"
+        ],
+        "type": "object"
+      },
+      "SessionEventsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/EventEnvelope"
+            },
+            "type": "array"
+          },
+          "last_seq_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "events"
+        ],
+        "type": "object"
+      },
+      "SessionExecutionInspection": {
+        "description": "SessionExecutionInspection is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "SessionExecutionResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "inspection": {
+            "$ref": "#/components/schemas/SessionExecutionInspection"
+          }
+        },
+        "required": [
+          "inspection"
+        ],
+        "type": "object"
+      },
+      "SessionExportResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "content_type": {
+            "type": "string"
+          },
+          "format": {
+            "$ref": "#/components/schemas/ExportFormat"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "format",
+          "content_type",
+          "content"
+        ],
+        "type": "object"
+      },
+      "SessionInspection": {
+        "description": "SessionInspection is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "SessionInspectionResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "inspection": {
+            "$ref": "#/components/schemas/SessionInspection"
+          }
+        },
+        "required": [
+          "inspection"
+        ],
+        "type": "object"
+      },
+      "SessionLineageInspection": {
+        "description": "SessionLineageInspection is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "SessionLineageResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "inspection": {
+            "$ref": "#/components/schemas/SessionLineageInspection"
+          }
+        },
+        "required": [
+          "inspection"
+        ],
+        "type": "object"
+      },
+      "SessionMessagesResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "branch_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            },
+            "type": "array"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "messages"
+        ],
+        "type": "object"
+      },
+      "SessionQueueClearResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "cleared_messages": {
+            "items": {
+              "$ref": "#/components/schemas/QueuedMessageInspection"
+            },
+            "type": "array"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "cleared_messages"
+        ],
+        "type": "object"
+      },
+      "SessionQueueInspection": {
+        "description": "SessionQueueInspection is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "SessionQueueResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "inspection": {
+            "$ref": "#/components/schemas/SessionQueueInspection"
+          }
+        },
+        "required": [
+          "inspection"
+        ],
+        "type": "object"
+      },
+      "SessionRawChunksResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "chunks": {
+            "items": {
+              "$ref": "#/components/schemas/RawChunkDto"
+            },
+            "type": "array"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "chunks"
+        ],
+        "type": "object"
+      },
+      "SessionRecord": {
+        "description": "SessionRecord is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "SessionSearchMatch": {
+        "description": "SessionSearchMatch is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "SessionSearchResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "branch_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "query": {
+            "type": "string"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/SessionSearchMatch"
+            },
+            "type": "array"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "query",
+          "limit",
+          "results"
+        ],
+        "type": "object"
+      },
+      "SessionToolCallInspection": {
+        "description": "SessionToolCallInspection is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "SessionToolCallResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "inspection": {
+            "$ref": "#/components/schemas/SessionToolCallInspection"
+          }
+        },
+        "required": [
+          "inspection"
+        ],
+        "type": "object"
+      },
+      "SessionToolMode": {
+        "description": "SessionToolMode is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "SessionTreeInspection": {
+        "description": "SessionTreeInspection is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "SessionTreeResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "inspection": {
+            "$ref": "#/components/schemas/SessionTreeInspection"
+          }
+        },
+        "required": [
+          "inspection"
+        ],
+        "type": "object"
+      },
+      "SessionTurnsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "type": "string"
+          },
+          "turns": {
+            "items": {
+              "$ref": "#/components/schemas/TurnInspection"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "session_id",
+          "turns"
+        ],
+        "type": "object"
+      },
+      "SessionWorkflowInspection": {
+        "description": "SessionWorkflowInspection is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "SessionWorkflowResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "inspection": {
+            "$ref": "#/components/schemas/SessionWorkflowInspection"
+          }
+        },
+        "required": [
+          "inspection"
+        ],
+        "type": "object"
+      },
+      "SpawnSessionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "model_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "objective": {
+            "type": "string"
+          },
+          "parent_branch_id": {
+            "type": "string"
+          },
+          "parent_turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "parent_branch_id",
+          "objective"
+        ],
+        "type": "object"
+      },
+      "SpawnSessionResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "child_branch": {
+            "$ref": "#/components/schemas/BranchRecord"
+          },
+          "child_session": {
+            "$ref": "#/components/schemas/SessionRecord"
+          },
+          "parent_branch_id": {
+            "type": "string"
+          },
+          "parent_session_id": {
+            "type": "string"
+          },
+          "parent_turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "parent_session_id",
+          "parent_branch_id",
+          "child_session",
+          "child_branch"
+        ],
+        "type": "object"
+      },
+      "StatusInspection": {
+        "description": "StatusInspection is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "StatusInspectionResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "inspection": {
+            "$ref": "#/components/schemas/StatusInspection"
+          }
+        },
+        "required": [
+          "inspection"
+        ],
+        "type": "object"
+      },
+      "SteerSessionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "type": "object"
+      },
+      "TurnInspection": {
+        "description": "TurnInspection is defined in bt-core or bt-protocol and serialized through bt-protocol.",
+        "type": "object"
+      },
+      "TurnRawChunksPageResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "branch_id": {
+            "type": "string"
+          },
+          "chunks": {
+            "items": {
+              "$ref": "#/components/schemas/RawChunkDto"
+            },
+            "type": "array"
+          },
+          "has_more_before": {
+            "type": "boolean"
+          },
+          "newest_chunk_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "oldest_chunk_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "turn_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "branch_id",
+          "turn_id",
+          "chunks",
+          "has_more_before"
+        ],
+        "type": "object"
+      },
+      "UpdateSessionBudgetRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "budget": {
+            "$ref": "#/components/schemas/BudgetConfig"
+          }
+        },
+        "required": [
+          "budget"
+        ],
+        "type": "object"
+      },
+      "UpdateSessionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "model_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reset_model_to_default": {
+            "type": "boolean"
+          },
+          "tool_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionToolMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "reset_model_to_default"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "BearerAuth": {
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "Public HTTP and SSE API for Belltower clients.",
+    "title": "Belltower Server API",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/connections": {
+      "get": {
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List configured connections.",
+        "tags": [
+          "providers"
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "summary": "Health check and protocol version.",
+        "tags": [
+          "server"
+        ]
+      }
+    },
+    "/mcp": {
+      "get": {
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpInventoryResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Inspect MCP inventory.",
+        "tags": [
+          "mcp"
+        ]
+      }
+    },
+    "/mcp/reload": {
+      "post": {
+        "parameters": [],
+        "responses": {
+          "202": {
+            "description": "Accepted with no response body"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Reload MCP configuration.",
+        "tags": [
+          "mcp"
+        ]
+      }
+    },
+    "/mcp/servers": {
+      "get": {
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpServersResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List MCP servers.",
+        "tags": [
+          "mcp"
+        ]
+      }
+    },
+    "/mcp/tools": {
+      "get": {
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpToolsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List MCP tools.",
+        "tags": [
+          "mcp"
+        ]
+      }
+    },
+    "/models/backends": {
+      "get": {
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelBackendsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List model backends.",
+        "tags": [
+          "models"
+        ]
+      }
+    },
+    "/models/connections": {
+      "get": {
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionModelsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List models by connection.",
+        "tags": [
+          "models"
+        ]
+      }
+    },
+    "/models/connections/{connection_id}": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionModelsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Inspect model availability for one connection.",
+        "tags": [
+          "models"
+        ]
+      }
+    },
+    "/models/recommendations": {
+      "get": {
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelRecommendationsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List model recommendations.",
+        "tags": [
+          "models"
+        ]
+      }
+    },
+    "/server/info": {
+      "get": {
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerInfoResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Server version and capability metadata.",
+        "tags": [
+          "server"
+        ]
+      }
+    },
+    "/sessions": {
+      "get": {
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSessionsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List sessions.",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "post": {
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateSessionResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Create a session.",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/sessions/{session_id}": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionInspectionResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Inspect a session.",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateSessionResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Update session settings.",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/sessions/{session_id}/answer": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnswerToolRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted with no response body"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Answer a pending operator question.",
+        "tags": [
+          "control"
+        ]
+      }
+    },
+    "/sessions/{session_id}/approve": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApproveToolRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted with no response body"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Resolve a pending tool approval.",
+        "tags": [
+          "control"
+        ]
+      }
+    },
+    "/sessions/{session_id}/branches": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchesResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List session branches.",
+        "tags": [
+          "branches"
+        ]
+      },
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBranchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateBranchResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Create a session branch.",
+        "tags": [
+          "branches"
+        ]
+      }
+    },
+    "/sessions/{session_id}/branches/inspect": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionBranchInspectionResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Inspect session branches.",
+        "tags": [
+          "branches"
+        ]
+      }
+    },
+    "/sessions/{session_id}/branches/{branch_id}/activate": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "branch_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActivateBranchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted with no response body"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Activate a branch.",
+        "tags": [
+          "branches"
+        ]
+      }
+    },
+    "/sessions/{session_id}/branches/{branch_id}/commands": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "branch_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchOperatorCommandsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Read branch operator commands.",
+        "tags": [
+          "operator"
+        ]
+      }
+    },
+    "/sessions/{session_id}/branches/{branch_id}/commands/page": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "branch_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchOperatorCommandsPageResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Page branch operator commands.",
+        "tags": [
+          "operator"
+        ]
+      }
+    },
+    "/sessions/{session_id}/branches/{branch_id}/messages": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "branch_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionMessagesResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Read branch messages.",
+        "tags": [
+          "transcript"
+        ]
+      }
+    },
+    "/sessions/{session_id}/branches/{branch_id}/messages/page": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "branch_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchMessagesPageResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Page branch messages.",
+        "tags": [
+          "transcript"
+        ]
+      }
+    },
+    "/sessions/{session_id}/branches/{branch_id}/turns/{turn_id}/raw_chunks/page": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "branch_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "turn_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnRawChunksPageResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Page raw provider chunks for a turn.",
+        "tags": [
+          "telemetry"
+        ]
+      }
+    },
+    "/sessions/{session_id}/budget": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSessionBudgetRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionInspectionResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Configure session budget limits.",
+        "tags": [
+          "control"
+        ]
+      }
+    },
+    "/sessions/{session_id}/cancel": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted with no response body"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Request session cancellation.",
+        "tags": [
+          "control"
+        ]
+      }
+    },
+    "/sessions/{session_id}/commands": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordOperatorCommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted with no response body"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Record a durable operator command.",
+        "tags": [
+          "operator"
+        ]
+      }
+    },
+    "/sessions/{session_id}/commands/shell": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunShellCommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted with no response body"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Run and record an operator shell command.",
+        "tags": [
+          "operator"
+        ]
+      }
+    },
+    "/sessions/{session_id}/compact": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompactSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompactSessionResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Compact branch context.",
+        "tags": [
+          "branches"
+        ]
+      }
+    },
+    "/sessions/{session_id}/events": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionEventsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Replay stored session events.",
+        "tags": [
+          "events"
+        ]
+      }
+    },
+    "/sessions/{session_id}/events/stream": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/RawSseEnvelope"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Subscribe to session events as SSE.",
+        "tags": [
+          "events"
+        ]
+      }
+    },
+    "/sessions/{session_id}/execution": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionExecutionResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Inspect live and replayable execution state.",
+        "tags": [
+          "inspection"
+        ]
+      }
+    },
+    "/sessions/{session_id}/export/otlp/push": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PushOtlpExportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PushOtlpExportResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Push an OTLP export to a collector.",
+        "tags": [
+          "exports"
+        ]
+      }
+    },
+    "/sessions/{session_id}/export/{format}": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "format",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionExportResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Export a session.",
+        "tags": [
+          "exports"
+        ]
+      }
+    },
+    "/sessions/{session_id}/lineage": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionLineageResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Inspect session lineage.",
+        "tags": [
+          "inspection"
+        ]
+      }
+    },
+    "/sessions/{session_id}/message": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendMessageResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Send or queue a user message.",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/sessions/{session_id}/messages": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionMessagesResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Read active branch messages.",
+        "tags": [
+          "transcript"
+        ]
+      }
+    },
+    "/sessions/{session_id}/queue": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionQueueResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Inspect pending control-plane state.",
+        "tags": [
+          "control"
+        ]
+      }
+    },
+    "/sessions/{session_id}/queue/clear": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionQueueClearResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Clear queued user messages.",
+        "tags": [
+          "control"
+        ]
+      }
+    },
+    "/sessions/{session_id}/raw_chunks": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionRawChunksResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "List raw provider chunks for a session.",
+        "tags": [
+          "telemetry"
+        ]
+      }
+    },
+    "/sessions/{session_id}/search": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionSearchResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Search canonical session history.",
+        "tags": [
+          "inspection"
+        ]
+      }
+    },
+    "/sessions/{session_id}/spawn": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpawnSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpawnSessionResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Spawn a child session.",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/sessions/{session_id}/steer": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SteerSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted with no response body"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Queue steering input for a session.",
+        "tags": [
+          "control"
+        ]
+      }
+    },
+    "/sessions/{session_id}/tool-calls/{call_id}": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "call_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionToolCallResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Inspect a tool call.",
+        "tags": [
+          "tools"
+        ]
+      }
+    },
+    "/sessions/{session_id}/tree": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTreeResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Inspect session tree.",
+        "tags": [
+          "inspection"
+        ]
+      }
+    },
+    "/sessions/{session_id}/turns": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTurnsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Inspect session turns.",
+        "tags": [
+          "inspection"
+        ]
+      }
+    },
+    "/sessions/{session_id}/workflow": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionWorkflowResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Inspect workflow state.",
+        "tags": [
+          "inspection"
+        ]
+      }
+    },
+    "/status/inspect": {
+      "get": {
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusInspectionResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Belltower error response"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Inspect readiness status.",
+        "tags": [
+          "providers"
+        ]
+      }
+    }
+  },
+  "servers": [
+    {
+      "description": "Default local Belltower server",
+      "url": "http://127.0.0.1:7400"
+    }
+  ],
+  "x-belltower-protocol-version": "belltower.v1"
+}

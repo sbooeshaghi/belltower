@@ -1,0 +1,23 @@
+Models current_connection=openai current_model=gpt-5.4-mini
+Local models memory=64GB
+Connections:
+- openai (openai) readiness=ready
+  support=runtime_supported default_model=gpt-5.4-mini
+  auth=keychain discovered_from=api
+  models=gpt-5.4-mini (default), gpt-5.4 (discovered)
+- anthropic (anthropic) readiness=auth missing
+  support=runtime_supported default_model=sonnet-4.6
+  auth=missing discovered_from=none
+  models=none
+- vertex (vertex) readiness=runtime unsupported
+  support=planned default_model=gemini-2.5-pro
+  auth=adc discovered_from=none
+  models=none
+- chatgpt (openai-chatgpt) readiness=configured model unavailable
+  support=runtime_supported default_model=gpt-5.4
+  auth=oauth discovered_from=api
+  models=gpt-5.4-mini (discovered)
+Backends:
+- Ollama status=ready models=qwen3.5:latest, gpt-oss:20b
+Recommendations:
+- Laptop fits=yes max_memory=64GB models=qwen3.5:latest, gpt-oss:20b

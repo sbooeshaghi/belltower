@@ -1,0 +1,18 @@
+[package]
+name = "bt-models"
+description = "Model catalog discovery and configured-model support checks for Belltower."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[dependencies]
+bt-core = { version = "0.1.0", path = "../bt-core" }
+reqwest.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio.workspace = true

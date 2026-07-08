@@ -1,0 +1,531 @@
+use bt_core::{
+    ApprovalDecision, ApprovalDecisionSource, ApprovalRequest, ApprovalRequirement, ApprovalScope,
+    Result, SessionId, ToolCallId, ToolDisplayGroup, ToolRiskClass, traits::ApprovalEvaluator,
+};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+#[derive(Default)]
+pub struct ApprovalState {
+    inner: Mutex<ApprovalStore>,
+}
+
+#[derive(Default)]
+struct ApprovalStore {
+    per_call: HashMap<ToolCallId, ApprovalDecision>,
+    per_session: HashMap<(SessionId, String), ApprovalDecision>,
+    global: HashMap<String, ApprovalDecision>,
+}
+
+impl ApprovalState {
+    fn lock_store(&self) -> Result<std::sync::MutexGuard<'_, ApprovalStore>> {
+        self.inner
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("approval lock poisoned".to_owned()))
+    }
+
+    fn apply_reusable_decision(
+        store: &mut ApprovalStore,
+        session_id: SessionId,
+        fingerprint: String,
+        decision: ApprovalDecision,
+    ) {
+        match decision_scope(&decision) {
+            ApprovalScope::Once => {}
+            ApprovalScope::Session => {
+                store
+                    .per_session
+                    .insert((session_id, fingerprint), decision);
+            }
+            ApprovalScope::Always => {
+                store.global.insert(fingerprint, decision);
+            }
+        }
+    }
+
+    pub fn record_call(&self, call_id: ToolCallId, decision: ApprovalDecision) -> Result<()> {
+        self.lock_store()?.per_call.insert(call_id, decision);
+        Ok(())
+    }
+
+    pub fn record_for_request(
+        &self,
+        request: &ApprovalRequest,
+        decision: ApprovalDecision,
+    ) -> Result<()> {
+        let fingerprint = approval_request_fingerprint(request);
+        let mut store = self.lock_store()?;
+        store
+            .per_call
+            .insert(request.call_id.clone(), decision.clone());
+        Self::apply_reusable_decision(&mut store, request.session_id, fingerprint, decision);
+        Ok(())
+    }
+
+    pub fn seed_reusable_decision(
+        &self,
+        session_id: SessionId,
+        fingerprint: String,
+        decision: ApprovalDecision,
+    ) -> Result<()> {
+        let mut store = self.lock_store()?;
+        Self::apply_reusable_decision(&mut store, session_id, fingerprint, decision);
+        Ok(())
+    }
+
+    pub fn get(&self, call_id: &ToolCallId) -> Result<Option<ApprovalDecision>> {
+        Ok(self.lock_store()?.per_call.get(call_id).cloned())
+    }
+
+    pub fn evaluate_request(&self, request: &ApprovalRequest) -> Result<Option<ApprovalDecision>> {
+        if let Some(existing) = self.get(&request.call_id)? {
+            return Ok(Some(existing));
+        }
+
+        let fingerprint = approval_request_fingerprint(request);
+        let mut store = self.lock_store()?;
+
+        if let Some(decision) = store
+            .per_session
+            .get(&(request.session_id, fingerprint.clone()))
+            .cloned()
+        {
+            store
+                .per_call
+                .insert(request.call_id.clone(), decision.clone());
+            return Ok(Some(decision));
+        }
+
+        if let Some(decision) = store.global.get(&fingerprint).cloned() {
+            store
+                .per_call
+                .insert(request.call_id.clone(), decision.clone());
+            return Ok(Some(decision));
+        }
+
+        Ok(None)
+    }
+}
+
+impl ApprovalEvaluator for ApprovalState {
+    fn evaluate(&self, request: &ApprovalRequest) -> Result<Option<ApprovalDecision>> {
+        self.evaluate_request(request)
+    }
+}
+
+pub struct PolicyApprovalEvaluator {
+    state: Arc<ApprovalState>,
+    auto_approve_patterns: Vec<String>,
+}
+
+impl PolicyApprovalEvaluator {
+    #[must_use]
+    pub fn new(state: Arc<ApprovalState>, auto_approve_patterns: Vec<String>) -> Self {
+        Self {
+            state,
+            auto_approve_patterns,
+        }
+    }
+
+    fn auto_approve(&self, request: &ApprovalRequest) -> Option<ApprovalDecision> {
+        if matches!(request.requirement, ApprovalRequirement::FirstUsePerSession)
+            && matches!(
+                request.tool_metadata.risk_class,
+                ToolRiskClass::Safe | ToolRiskClass::Moderate
+            )
+            && !matches!(
+                request.tool_metadata.display_group,
+                ToolDisplayGroup::External
+            )
+        {
+            return Some(ApprovalDecision::Approved {
+                decided_at: time::OffsetDateTime::now_utc(),
+                decided_by: "policy:first-use-session".to_owned(),
+                scope: ApprovalScope::Session,
+                source: ApprovalDecisionSource::Policy {
+                    rule: "first_use_session".to_owned(),
+                },
+            });
+        }
+
+        if matches!(
+            request.tool_metadata.display_group,
+            ToolDisplayGroup::Execution
+        ) {
+            let command = request
+                .arguments
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if let Some(pattern) = self
+                .auto_approve_patterns
+                .iter()
+                .find(|pattern| command_matches_pattern(command, pattern))
+            {
+                return Some(ApprovalDecision::Approved {
+                    decided_at: time::OffsetDateTime::now_utc(),
+                    decided_by: "policy:shell-pattern".to_owned(),
+                    scope: ApprovalScope::Session,
+                    source: ApprovalDecisionSource::Policy {
+                        rule: format!("command_pattern:{pattern}"),
+                    },
+                });
+            }
+        }
+
+        None
+    }
+}
+
+impl ApprovalEvaluator for PolicyApprovalEvaluator {
+    fn evaluate(&self, request: &ApprovalRequest) -> Result<Option<ApprovalDecision>> {
+        if let Some(existing) = self.state.evaluate_request(request)? {
+            return Ok(Some(existing));
+        }
+
+        if let Some(decision) = self.auto_approve(request) {
+            self.state.record_for_request(request, decision.clone())?;
+            return Ok(Some(decision));
+        }
+
+        Ok(None)
+    }
+}
+
+pub struct RuntimeApprovalEvaluator {
+    state: ApprovalState,
+}
+
+impl RuntimeApprovalEvaluator {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: ApprovalState::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn state(&self) -> &ApprovalState {
+        &self.state
+    }
+}
+
+impl Default for RuntimeApprovalEvaluator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ApprovalEvaluator for RuntimeApprovalEvaluator {
+    fn evaluate(&self, request: &ApprovalRequest) -> Result<Option<ApprovalDecision>> {
+        self.state.get(&request.call_id)
+    }
+}
+
+fn command_matches_pattern(command: &str, pattern: &str) -> bool {
+    let command = command.trim();
+    let pattern = pattern.trim();
+    if pattern.is_empty() || contains_shell_control_syntax(command) {
+        return false;
+    }
+
+    if command == pattern {
+        return true;
+    }
+
+    command.strip_prefix(pattern).is_some_and(|remainder| {
+        remainder
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_whitespace())
+    })
+}
+
+fn contains_shell_control_syntax(command: &str) -> bool {
+    command.chars().any(|ch| {
+        matches!(
+            ch,
+            ';' | '&' | '|' | '<' | '>' | '`' | '$' | '\\' | '\n' | '\r'
+        )
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::{ApprovalState, PolicyApprovalEvaluator};
+    use bt_core::{
+        ApprovalDecision, ApprovalDecisionSource, ApprovalRequest, ApprovalRequirement,
+        ApprovalScope, SessionId, ToolCallId, ToolDisplayGroup, ToolExecutionMode,
+        ToolInterruptBehavior, ToolMetadata, ToolRiskClass, traits::ApprovalEvaluator,
+    };
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn request(
+        session_id: SessionId,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> ApprovalRequest {
+        ApprovalRequest {
+            session_id,
+            call_id: ToolCallId::new(format!("call-{tool_name}")),
+            tool_name: tool_name.to_owned(),
+            arguments,
+            requirement: if matches!(tool_name, "write" | "edit") {
+                ApprovalRequirement::FirstUsePerSession
+            } else if tool_name == "shell" {
+                ApprovalRequirement::Always
+            } else {
+                ApprovalRequirement::Never
+            },
+            tool_metadata: metadata_for(tool_name),
+            requested_at: time::OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn metadata_for(tool_name: &str) -> ToolMetadata {
+        match tool_name {
+            "write" | "edit" => ToolMetadata {
+                risk_class: ToolRiskClass::Moderate,
+                is_read_only: false,
+                is_concurrency_safe: false,
+                interrupt_behavior: ToolInterruptBehavior::WaitForCompletion,
+                execution_mode: ToolExecutionMode::Immediate,
+                should_defer: false,
+                catalogue_tags: Vec::new(),
+                display_group: ToolDisplayGroup::Codebase,
+            },
+            "shell" => ToolMetadata {
+                risk_class: ToolRiskClass::High,
+                is_read_only: false,
+                is_concurrency_safe: false,
+                interrupt_behavior: ToolInterruptBehavior::TerminateProcess,
+                execution_mode: ToolExecutionMode::Immediate,
+                should_defer: false,
+                catalogue_tags: Vec::new(),
+                display_group: ToolDisplayGroup::Execution,
+            },
+            _ => ToolMetadata {
+                risk_class: ToolRiskClass::Safe,
+                is_read_only: true,
+                is_concurrency_safe: true,
+                interrupt_behavior: ToolInterruptBehavior::Immediate,
+                execution_mode: ToolExecutionMode::Immediate,
+                should_defer: false,
+                catalogue_tags: Vec::new(),
+                display_group: ToolDisplayGroup::Inspection,
+            },
+        }
+    }
+
+    #[test]
+    fn write_is_auto_approved() {
+        let evaluator =
+            PolicyApprovalEvaluator::new(Arc::new(ApprovalState::default()), Vec::new());
+        let session_id = SessionId::new();
+        let decision = evaluator
+            .evaluate(&request(session_id, "write", json!({"path": "note.txt"})))
+            .expect("evaluation should succeed");
+        assert!(matches!(
+            decision,
+            Some(ApprovalDecision::Approved {
+                scope: ApprovalScope::Session,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn matching_shell_pattern_is_auto_approved() {
+        let evaluator = PolicyApprovalEvaluator::new(
+            Arc::new(ApprovalState::default()),
+            vec!["cargo test".to_owned()],
+        );
+        let session_id = SessionId::new();
+        let decision = evaluator
+            .evaluate(&request(
+                session_id,
+                "shell",
+                json!({"command": "cargo test --workspace"}),
+            ))
+            .expect("evaluation should succeed");
+        assert!(matches!(
+            decision,
+            Some(ApprovalDecision::Approved {
+                scope: ApprovalScope::Session,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn shell_pattern_does_not_match_suffix_smuggling() {
+        let evaluator = PolicyApprovalEvaluator::new(
+            Arc::new(ApprovalState::default()),
+            vec!["cargo test".to_owned()],
+        );
+        let session_id = SessionId::new();
+        let decision = evaluator
+            .evaluate(&request(
+                session_id,
+                "shell",
+                json!({"command": "cargo testevil"}),
+            ))
+            .expect("evaluation should succeed");
+        assert!(decision.is_none());
+    }
+
+    #[test]
+    fn shell_pattern_does_not_match_control_operator_smuggling() {
+        let evaluator = PolicyApprovalEvaluator::new(
+            Arc::new(ApprovalState::default()),
+            vec!["cargo test".to_owned()],
+        );
+        let session_id = SessionId::new();
+
+        for command in [
+            "cargo test --workspace && rm -rf /tmp/demo",
+            "cargo test --workspace; rm -rf /tmp/demo",
+            "cargo test --workspace | sh",
+            "cargo test --workspace\nrm -rf /tmp/demo",
+            "cargo test $(cat /tmp/hidden-args)",
+            "cargo test > /tmp/output",
+        ] {
+            let decision = evaluator
+                .evaluate(&request(session_id, "shell", json!({"command": command})))
+                .expect("evaluation should succeed");
+            assert!(decision.is_none(), "{command} should not be auto-approved");
+        }
+    }
+
+    #[test]
+    fn unknown_shell_command_stays_pending() {
+        let evaluator = PolicyApprovalEvaluator::new(
+            Arc::new(ApprovalState::default()),
+            vec!["cargo test".to_owned()],
+        );
+        let session_id = SessionId::new();
+        let decision = evaluator
+            .evaluate(&request(
+                session_id,
+                "shell",
+                json!({"command": "rm -rf /tmp/demo"}),
+            ))
+            .expect("evaluation should succeed");
+        assert!(decision.is_none());
+    }
+
+    #[test]
+    fn recorded_decision_wins_over_policy() {
+        let state = Arc::new(ApprovalState::default());
+        let session_id = SessionId::new();
+        state
+            .record_call(
+                ToolCallId::new("call-shell"),
+                ApprovalDecision::Denied {
+                    decided_at: time::OffsetDateTime::now_utc(),
+                    decided_by: "user".to_owned(),
+                    reason: Some("no".to_owned()),
+                    scope: ApprovalScope::Once,
+                    source: ApprovalDecisionSource::Human,
+                },
+            )
+            .expect("record decision");
+        let evaluator = PolicyApprovalEvaluator::new(state, vec!["cargo test".to_owned()]);
+        let decision = evaluator
+            .evaluate(&ApprovalRequest {
+                session_id,
+                call_id: ToolCallId::new("call-shell"),
+                tool_name: "shell".to_owned(),
+                arguments: json!({"command": "cargo test --workspace"}),
+                requirement: ApprovalRequirement::Always,
+                tool_metadata: metadata_for("shell"),
+                requested_at: time::OffsetDateTime::now_utc(),
+            })
+            .expect("evaluation should succeed");
+        assert!(matches!(
+            decision,
+            Some(ApprovalDecision::Denied {
+                scope: ApprovalScope::Once,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn session_scoped_approval_reuses_matching_request_in_same_session() {
+        let state = ApprovalState::default();
+        let session_id = SessionId::new();
+        let first = request(session_id, "shell", json!({"command":"pwd"}));
+        state
+            .record_for_request(
+                &first,
+                ApprovalDecision::Approved {
+                    decided_at: time::OffsetDateTime::now_utc(),
+                    decided_by: "user".to_owned(),
+                    scope: ApprovalScope::Session,
+                    source: ApprovalDecisionSource::Human,
+                },
+            )
+            .expect("record session approval");
+
+        let next = ApprovalRequest {
+            session_id,
+            call_id: ToolCallId::new("call-2"),
+            tool_name: "shell".to_owned(),
+            arguments: json!({"command":"pwd","call_id":"ignored"}),
+            requirement: ApprovalRequirement::Always,
+            tool_metadata: metadata_for("shell"),
+            requested_at: time::OffsetDateTime::now_utc(),
+        };
+        let decision = state.evaluate(&next).expect("evaluate");
+        assert!(matches!(
+            decision,
+            Some(ApprovalDecision::Approved {
+                scope: ApprovalScope::Session,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn session_scoped_approval_does_not_cross_sessions() {
+        let state = ApprovalState::default();
+        let first_session = SessionId::new();
+        let second_session = SessionId::new();
+        let first = request(first_session, "shell", json!({"command":"pwd"}));
+        state
+            .record_for_request(
+                &first,
+                ApprovalDecision::Approved {
+                    decided_at: time::OffsetDateTime::now_utc(),
+                    decided_by: "user".to_owned(),
+                    scope: ApprovalScope::Session,
+                    source: ApprovalDecisionSource::Human,
+                },
+            )
+            .expect("record session approval");
+
+        let next = ApprovalRequest {
+            session_id: second_session,
+            call_id: ToolCallId::new("call-2"),
+            tool_name: "shell".to_owned(),
+            arguments: json!({"command":"pwd"}),
+            requirement: ApprovalRequirement::Always,
+            tool_metadata: metadata_for("shell"),
+            requested_at: time::OffsetDateTime::now_utc(),
+        };
+        assert!(state.evaluate(&next).expect("evaluate").is_none());
+    }
+}
+
+fn decision_scope(decision: &ApprovalDecision) -> ApprovalScope {
+    match decision {
+        ApprovalDecision::Approved { scope, .. } | ApprovalDecision::Denied { scope, .. } => *scope,
+    }
+}
+
+pub(crate) fn approval_request_fingerprint(request: &ApprovalRequest) -> String {
+    request.fingerprint()
+}

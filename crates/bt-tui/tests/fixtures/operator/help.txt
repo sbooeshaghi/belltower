@@ -1,0 +1,34 @@
+/help
+  Show available commands
+/status
+  Render provider auth and readiness for configured connections
+/models [connection]
+  Render model availability, optionally for one connection
+/mcp [reload]
+  Render MCP server and tool status, or reload MCP server registrations
+/session
+  Render a structured summary of the current session
+/inspect [session|tool <call-id>]
+  Inspect the current session or a specific tool call by id
+/history [limit]
+  Render recent turn history in the chat transcript
+/usage [limit]
+  Render token, cost, and latency summaries from executed turns
+/new
+  Create a new session
+/compact
+  Run runtime compaction on the current branch context
+/branch
+  Create and switch to a new branch
+/cancel
+  Cancel the current in-flight turn
+/connection [id]
+  Show or switch the session connection
+/defaults [connection <id>|model <model-id>|use <connection> [model]]
+  Show or update global defaults for future sessions
+/use <connection> [model]
+  Guided connection and model selection with readiness feedback
+/help all
+  Show advanced slash commands
+Contextual controls
+  approvals resolve through the approval chooser; queued follow-up state is rendered inline

@@ -1,0 +1,12 @@
+[package]
+name = "bt-improve"
+description = "Improvement and evaluation helpers for Belltower."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[dependencies]
+bt-core = { version = "0.1.0", path = "../bt-core" }

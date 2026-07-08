@@ -1,0 +1,12 @@
+{
+  "raw_sse_envelope": {
+    "id": 42,
+    "event": "turn.finished",
+    "protocol_version": "belltower.v1",
+    "data": {
+      "event_id": "40000000-0000-0000-0000-000000000001",
+      "seq_id": 42,
+      "status": "completed"
+    }
+  }
+}

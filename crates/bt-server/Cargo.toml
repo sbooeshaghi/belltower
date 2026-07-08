@@ -1,0 +1,46 @@
+[package]
+name = "bt-server"
+description = "HTTP, SSE, and local server transport for Belltower."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[[bin]]
+name = "bt-server"
+path = "src/main.rs"
+
+[dependencies]
+async-stream.workspace = true
+axum.workspace = true
+base64.workspace = true
+bt-agent = { version = "0.1.0", path = "../bt-agent" }
+bt-auth = { version = "0.1.0", path = "../bt-auth" }
+bt-context = { version = "0.1.0", path = "../bt-context" }
+bt-core = { version = "0.1.0", path = "../bt-core" }
+bt-otel = { version = "0.1.0", path = "../bt-otel" }
+bt-providers = { version = "0.1.0", path = "../bt-providers" }
+bt-protocol = { version = "0.1.0", path = "../bt-protocol" }
+bt-readiness = { version = "0.1.0", path = "../bt-readiness" }
+bt-runtime = { version = "0.1.0", path = "../bt-runtime" }
+bt-tools = { version = "0.1.0", path = "../bt-tools" }
+camino.workspace = true
+clap.workspace = true
+opentelemetry-proto.workspace = true
+prost.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+bt-client = { version = "0.1.0", path = "../bt-client" }
+bt-runtime = { version = "0.1.0", path = "../bt-runtime", features = ["test-support"] }
+futures-util.workspace = true
+tempfile.workspace = true

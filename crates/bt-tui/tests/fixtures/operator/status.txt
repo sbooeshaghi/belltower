@@ -1,0 +1,10 @@
+Status current_connection=openai current_model=gpt-5.4-mini tool_mode=extended default_connection=openai auth_storage=auto
+Connections:
+- openai readiness=ready model=gpt-5.4-mini auth=secret:keychain
+  probe=ok
+- anthropic readiness=auth missing model=sonnet-4.6 auth=missing
+  probe=login required
+- vertex readiness=runtime unsupported model=gemini-2.5-pro auth=json:adc
+  probe=provider planned
+- chatgpt readiness=configured model unavailable model=gpt-5.4 auth=oauth:oauth:tried=keychain
+  probe=use gpt-5.4-mini

@@ -1,0 +1,185 @@
+{
+  "connections_response": {
+    "connections": [
+      {
+        "id": "openai",
+        "provider": "openai",
+        "base_url": "https://api.openai.com/v1/",
+        "default_model": "gpt-5.1",
+        "auth_sources": [
+          "auth_store",
+          "OPENAI_API_KEY"
+        ],
+        "model_fallbacks": [
+          "gpt-5-mini",
+          "gpt-5-nano"
+        ]
+      }
+    ]
+  },
+  "server_info_response": {
+    "server_version": "0.1.0",
+    "protocol_version": "belltower.v1",
+    "supported_protocol_versions": [
+      "belltower.v1"
+    ],
+    "capabilities": {
+      "approvals": true,
+      "pending_input": true,
+      "session_queue": true,
+      "workflow_inspection": true,
+      "lineage_inspection": true,
+      "raw_chunk_paging": true,
+      "exports": true,
+      "mcp_inventory": true,
+      "mcp_reload": true,
+      "spawn_session": true
+    }
+  },
+  "status_inspection_response": {
+    "inspection": {
+      "auth_storage": "auto (ephemeral env vars, keychain default write when available, auth store (/tmp/belltower/auth.json) fallback)",
+      "default_connection": "openai",
+      "connections": [
+        {
+          "connection_id": "openai",
+          "provider": "openai",
+          "default_model": "gpt-5.1",
+          "auth_state": "Configured",
+          "auth_kind": "ApiKey",
+          "auth_source": "keychain (service belltower, account openai)",
+          "auth_tried_sources": [
+            "ephemeral environment",
+            "keychain (service belltower)"
+          ],
+          "support_state": "RuntimeSupported",
+          "readiness_state": "ready",
+          "probe_ready": true,
+          "probe_status": "ok"
+        }
+      ]
+    }
+  },
+  "mcp_inventory_response": {
+    "servers": [
+      {
+        "name": "docs",
+        "transport": "StreamableHttp",
+        "enabled": true,
+        "status": "Ready"
+      }
+    ],
+    "tools": [
+      {
+        "server_name": "docs",
+        "tool_name": "search_docs",
+        "qualified_name": "docs.search_docs",
+        "description": "Search the documentation corpus",
+        "parameters_schema": {
+          "properties": {
+            "query": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        }
+      }
+    ]
+  },
+  "mcp_servers_response": {
+    "servers": [
+      {
+        "name": "docs",
+        "transport": "StreamableHttp",
+        "enabled": true,
+        "status": "Ready"
+      }
+    ]
+  },
+  "mcp_tools_response": {
+    "tools": [
+      {
+        "server_name": "docs",
+        "tool_name": "search_docs",
+        "qualified_name": "docs.search_docs",
+        "description": "Search the documentation corpus",
+        "parameters_schema": {
+          "properties": {
+            "query": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        }
+      }
+    ]
+  },
+  "model_backends_response": {
+    "backends": [
+      {
+        "kind": "Ollama",
+        "label": "Ollama",
+        "base_url": "http://127.0.0.1:11434/",
+        "status": "Ready",
+        "available_models": [
+          "qwen2.5-coder:7b",
+          "gpt-oss:20b"
+        ]
+      }
+    ]
+  },
+  "connection_models_response": {
+    "connections": [
+      {
+        "connection_id": "openai",
+        "provider": "openai",
+        "default_model": "gpt-5.1",
+        "auth_state": "Configured",
+        "auth_source": "keychain (service belltower, account openai)",
+        "support_state": "RuntimeSupported",
+        "readiness_state": "ready",
+        "probe_ready": true,
+        "probe_status": "ok",
+        "discovered_source": "provider_api",
+        "models": [
+          {
+            "model_id": "gpt-5.1",
+            "source": "default"
+          },
+          {
+            "model_id": "gpt-5-mini",
+            "source": "fallback"
+          },
+          {
+            "model_id": "gpt-5.2",
+            "source": "discovered"
+          }
+        ]
+      }
+    ]
+  },
+  "model_recommendations_response": {
+    "report": {
+      "hardware": {
+        "total_memory_gb": 64
+      },
+      "recommendations": [
+        {
+          "label": "Laptop",
+          "max_memory_gb": 64,
+          "models": [
+            "qwen2.5-coder:7b",
+            "gpt-oss:20b"
+          ],
+          "fits_hardware": true
+        }
+      ]
+    }
+  }
+}

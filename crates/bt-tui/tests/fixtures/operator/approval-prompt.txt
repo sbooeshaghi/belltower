@@ -1,0 +1,5 @@
+approval: shell call_she cargo test -p bt-tui
+› Approve once           Run this tool call and ask again next time
+  Approve for session    Allow matching calls for the rest of this session
+  Approve always         Allow matching calls for the current server runtime
+  Deny                   Reject this tool call

@@ -1,0 +1,20 @@
+[package]
+name = "bt-otel"
+description = "OpenTelemetry export and span construction for Belltower sessions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[dependencies]
+bt-core = { version = "0.1.0", path = "../bt-core" }
+bt-protocol = { version = "0.1.0", path = "../bt-protocol" }
+camino.workspace = true
+opentelemetry-proto.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tracing.workspace = true

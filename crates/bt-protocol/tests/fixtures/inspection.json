@@ -1,0 +1,903 @@
+{
+  "session_inspection_response": {
+    "inspection": {
+      "session": {
+        "session_id": "00000000-0000-0000-0000-000000000001",
+        "project_root": "/tmp/belltower/project",
+        "connection_id": "openai",
+        "model_id": "gpt-5.1",
+        "tool_mode": "extended",
+        "settings_revision_id": 1,
+        "created_at": [
+          2026,
+          90,
+          12,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "updated_at": [
+          2026,
+          90,
+          12,
+          12,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "status": "Active",
+        "display_name": "Protocol fixture session",
+        "objective": "Verify protocol fixtures",
+        "parent_session_id": null,
+        "parent_branch_id": null,
+        "parent_turn_id": null
+      },
+      "active_branch": {
+        "branch_id": "20000000-0000-0000-0000-000000000001",
+        "session_id": "00000000-0000-0000-0000-000000000001",
+        "parent_branch_id": null,
+        "parent_event_id": "40000000-0000-0000-0000-000000000001",
+        "head_event_id": "40000000-0000-0000-0000-000000000001",
+        "summary": "Main branch summary",
+        "created_at": [
+          2026,
+          90,
+          12,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "is_default": true
+      },
+      "branches": [
+        {
+          "branch_id": "20000000-0000-0000-0000-000000000001",
+          "session_id": "00000000-0000-0000-0000-000000000001",
+          "parent_branch_id": null,
+          "parent_event_id": "40000000-0000-0000-0000-000000000001",
+          "head_event_id": "40000000-0000-0000-0000-000000000001",
+          "summary": "Main branch summary",
+          "created_at": [
+            2026,
+            90,
+            12,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "is_default": true
+        },
+        {
+          "branch_id": "20000000-0000-0000-0000-000000000002",
+          "session_id": "00000000-0000-0000-0000-000000000002",
+          "parent_branch_id": "20000000-0000-0000-0000-000000000001",
+          "parent_event_id": "40000000-0000-0000-0000-000000000001",
+          "head_event_id": "40000000-0000-0000-0000-000000000002",
+          "summary": "Child branch summary",
+          "created_at": [
+            2026,
+            90,
+            12,
+            20,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "is_default": true
+        }
+      ],
+      "runtime_state": "Working",
+      "turn_count": 3,
+      "message_count": 5,
+      "tool_call_count": 2,
+      "approval_count": 1,
+      "pending_approval_count": 1,
+      "pending_input_count": 1,
+      "raw_chunk_count": 4,
+      "last_seq_id": 42,
+      "cancel_requested": false,
+      "pending_steer_count": 1,
+      "related_sessions": [
+        {
+          "relation": "Child",
+          "session_id": "00000000-0000-0000-0000-000000000002",
+          "display_name": "MCP child",
+          "objective": "Review MCP state transitions",
+          "status": "Active",
+          "connection_id": "anthropic",
+          "model_id": "claude-3-7-sonnet-20250219",
+          "origin_branch_id": "20000000-0000-0000-0000-000000000001",
+          "origin_turn_id": "30000000-0000-0000-0000-000000000001",
+          "updated_at": [
+            2026,
+            90,
+            12,
+            25,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "cost_summary": {
+        "prompt_tokens": 100,
+        "completion_tokens": 40,
+        "total_tokens": 140,
+        "total_cost_usd": 0.0042,
+        "unpriced_completion_count": 1,
+        "updated_at": [
+          2026,
+          90,
+          12,
+          12,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    }
+  },
+  "session_events_response": {
+    "session_id": "00000000-0000-0000-0000-000000000001",
+    "events": [
+      {
+        "seq_id": 41,
+        "event_id": "40000000-0000-0000-0000-000000000001",
+        "session_id": "00000000-0000-0000-0000-000000000001",
+        "branch_id": "20000000-0000-0000-0000-000000000001",
+        "turn_id": "30000000-0000-0000-0000-000000000001",
+        "span_id": "50000000-0000-0000-0000-000000000001",
+        "parent_span_id": null,
+        "span_kind": "Agent",
+        "occurred_at": [
+          2026,
+          90,
+          12,
+          5,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "payload": {
+          "TurnInstructionProvenanceRecorded": {
+            "provenance": {
+              "turn_id": "30000000-0000-0000-0000-000000000001",
+              "provider": "openai",
+              "model": "gpt-5.1",
+              "settings_revision_id": 1,
+              "core_prompt": {
+                "source": "builtin://core-prompt",
+                "title": "Belltower Core Prompt",
+                "body": "You are Belltower."
+              },
+              "provider_overlay": {
+                "source": "provider://openai",
+                "title": "OpenAI Overlay",
+                "body": "Prefer concise tool plans."
+              },
+              "instructions": [
+                {
+                  "source": "file:///tmp/belltower/AGENTS.md",
+                  "title": "AGENTS.md",
+                  "body": "Follow repository rules."
+                },
+                {
+                  "source": "file:///tmp/belltower/docs/development/developer-guidelines.md",
+                  "title": "Developer Guidelines",
+                  "body": "Honor modular seams."
+                }
+              ],
+              "rendered_system_prompt": "You are Belltower.\nPrefer concise tool plans.\nFollow repository rules.\nHonor modular seams."
+            }
+          }
+        },
+        "attributes": {
+          "session.id": "00000000-0000-0000-0000-000000000001",
+          "turn.id": "30000000-0000-0000-0000-000000000001"
+        }
+      },
+      {
+        "seq_id": 42,
+        "event_id": "40000000-0000-0000-0000-000000000002",
+        "session_id": "00000000-0000-0000-0000-000000000001",
+        "branch_id": "20000000-0000-0000-0000-000000000001",
+        "turn_id": "30000000-0000-0000-0000-000000000001",
+        "span_id": "50000000-0000-0000-0000-000000000002",
+        "parent_span_id": "50000000-0000-0000-0000-000000000001",
+        "span_kind": "Llm",
+        "occurred_at": [
+          2026,
+          90,
+          12,
+          6,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "payload": {
+          "CompletionChunk": {
+            "llm_call_ordinal": 1,
+            "deltas": [
+              {
+                "AppendText": {
+                  "text": "hello"
+                }
+              },
+              {
+                "AppendRefusal": {
+                  "text": null,
+                  "provider_reason": "safety",
+                  "opaque_metadata": {
+                    "rule": "example"
+                  }
+                }
+              }
+            ],
+            "raw_chunk_index": 7
+          }
+        },
+        "attributes": {
+          "session.id": "00000000-0000-0000-0000-000000000001",
+          "turn.id": "30000000-0000-0000-0000-000000000001"
+        }
+      }
+    ],
+    "last_seq_id": 42
+  },
+  "session_turns_response": {
+    "session_id": "00000000-0000-0000-0000-000000000001",
+    "turns": [
+      {
+        "turn_id": "30000000-0000-0000-0000-000000000001",
+        "branch_id": "20000000-0000-0000-0000-000000000001",
+        "provider": "openai",
+        "model": "gpt-5.1",
+        "message_count": 3,
+        "settings_revision_id": 1,
+        "started_at": [
+          2026,
+          90,
+          12,
+          5,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "finished_at": [
+          2026,
+          90,
+          12,
+          6,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "status": "completed",
+        "finish_reason": "stop",
+        "latency_ms": 1200,
+        "event_seq_start": 30,
+        "event_seq_end": 42,
+        "event_count": 12,
+        "pending_approval_count": 1,
+        "raw_chunk_count": 4,
+        "tool_calls": [
+          {
+            "call_id": "call-shell-1",
+            "tool_name": "shell",
+            "approval_status": "approved",
+            "execution_status": "completed"
+          }
+        ]
+      }
+    ]
+  },
+  "session_execution_response": {
+    "inspection": {
+      "session_id": "00000000-0000-0000-0000-000000000001",
+      "total_events": 7,
+      "event_counts": {
+        "session": 2,
+        "agent": 1,
+        "llm": 2,
+        "tool": 1,
+        "chain": 1
+      },
+      "related_sessions": [
+        {
+          "relation": "Child",
+          "session_id": "00000000-0000-0000-0000-000000000002",
+          "display_name": "MCP child",
+          "objective": "Review MCP state transitions",
+          "status": "Active",
+          "connection_id": "anthropic",
+          "model_id": "claude-3-7-sonnet-20250219",
+          "origin_branch_id": "20000000-0000-0000-0000-000000000001",
+          "origin_turn_id": "30000000-0000-0000-0000-000000000001",
+          "updated_at": [
+            2026,
+            90,
+            12,
+            25,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "turns": [
+        {
+          "turn_id": "30000000-0000-0000-0000-000000000001",
+          "branch_id": "20000000-0000-0000-0000-000000000001",
+          "settings_revision_id": 1,
+          "source": "ApprovalResume",
+          "resumed_from_call_id": "call-shell-1",
+          "provider": "openai",
+          "model": "gpt-5.1",
+          "started_at": [
+            2026,
+            90,
+            12,
+            5,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "finished_at": [
+            2026,
+            90,
+            12,
+            6,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "status": "completed",
+          "finish_reason": "stop",
+          "latency_ms": 1200,
+          "event_seq_start": 30,
+          "event_seq_end": 42,
+          "event_count": 12,
+          "raw_chunk_count": 4,
+          "llm_call_count": 1,
+          "approval_pause_count": 1,
+          "resumed_after_approval": true,
+          "event_counts": {
+            "session": 2,
+            "agent": 1,
+            "llm": 2,
+            "tool": 1,
+            "chain": 1
+          },
+          "usage": {
+            "prompt_tokens": 120,
+            "completion_tokens": 64,
+            "total_tokens": 184,
+            "cache_read_tokens": null,
+            "cache_write_tokens": null,
+            "reasoning_tokens": 12
+          },
+          "cost": {
+            "prompt_usd": 0.0012,
+            "completion_usd": 0.0024,
+            "total_usd": 0.0036,
+            "cache_read_usd": null,
+            "cache_write_usd": null,
+            "reasoning_usd": 0.0002
+          },
+          "context_manifests": [
+            {
+              "turn_id": "30000000-0000-0000-0000-000000000001",
+              "branch_id": "20000000-0000-0000-0000-000000000001",
+              "llm_call_ordinal": 1,
+              "provider": "openai",
+              "model": "gpt-5.1",
+              "settings_revision_id": 1,
+              "context_boundary_seq_id": 29,
+              "system_prompt": {
+                "present": true,
+                "char_count": 128
+              },
+              "messages": [
+                {
+                  "message_id": "60000000-0000-0000-0000-000000000001",
+                  "role": "User",
+                  "source_branch_id": "20000000-0000-0000-0000-000000000001",
+                  "source_seq_id": 28,
+                  "part_count": 1,
+                  "visible_text_chars": 42
+                }
+              ],
+              "tools": [
+                {
+                  "name": "shell",
+                  "risk_class": "moderate",
+                  "is_read_only": false,
+                  "execution_mode": "user_input",
+                  "should_defer": false
+                }
+              ],
+              "max_tokens": 2048,
+              "thinking": null,
+              "compacted": false
+            }
+          ],
+          "tool_calls": [
+            {
+              "call_id": "call-shell-1",
+              "tool_name": "shell",
+              "approval_status": "approved",
+              "execution_status": "completed"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "session_queue_response": {
+    "inspection": {
+      "session_id": "00000000-0000-0000-0000-000000000001",
+      "runtime_state": "WaitingOnApproval",
+      "cancel_requested": false,
+      "pending_steer_count": 1,
+      "queued_messages": [
+        {
+          "branch_id": "20000000-0000-0000-0000-000000000001",
+          "enqueued_at": [
+            2026,
+            90,
+            12,
+            8,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "message": {
+            "message_id": "60000000-0000-0000-0000-000000000001",
+            "role": "User",
+            "parts": [
+              {
+                "Text": {
+                  "text": "Queued follow-up message."
+                }
+              }
+            ],
+            "created_at": [
+              2026,
+              90,
+              12,
+              4,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "settings_revision_id": 1
+        }
+      ],
+      "pending_approvals": [
+        {
+          "call_id": "call-approval-1",
+          "tool_name": "shell",
+          "branch_id": "20000000-0000-0000-0000-000000000001",
+          "turn_id": "30000000-0000-0000-0000-000000000001",
+          "settings_revision_id": 1,
+          "requested_at": [
+            2026,
+            90,
+            12,
+            9,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "pending_inputs": [
+        {
+          "call_id": "call-input-1",
+          "prompt": "Choose the deployment target",
+          "choices": [
+            "staging",
+            "prod"
+          ],
+          "branch_id": "20000000-0000-0000-0000-000000000001",
+          "turn_id": "30000000-0000-0000-0000-000000000001",
+          "settings_revision_id": 1,
+          "requested_at": [
+            2026,
+            90,
+            12,
+            10,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      ]
+    }
+  },
+  "session_queue_clear_response": {
+    "session_id": "00000000-0000-0000-0000-000000000001",
+    "cleared_messages": [
+      {
+        "branch_id": "20000000-0000-0000-0000-000000000001",
+        "enqueued_at": [
+          2026,
+          90,
+          12,
+          11,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "message": {
+          "message_id": "60000000-0000-0000-0000-000000000001",
+          "role": "User",
+          "parts": [
+            {
+              "Text": {
+                "text": "Cleared queued follow-up message."
+              }
+            }
+          ],
+          "created_at": [
+            2026,
+            90,
+            12,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "settings_revision_id": 1
+      }
+    ]
+  },
+  "session_lineage_response": {
+    "inspection": {
+      "focus_session_id": "00000000-0000-0000-0000-000000000001",
+      "root_session_id": "00000000-0000-0000-0000-000000000001",
+      "nodes": [
+        {
+          "session": {
+            "session_id": "00000000-0000-0000-0000-000000000001",
+            "project_root": "/tmp/belltower/project",
+            "connection_id": "openai",
+            "model_id": "gpt-5.1",
+            "tool_mode": "extended",
+            "settings_revision_id": 1,
+            "created_at": [
+              2026,
+              90,
+              12,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "updated_at": [
+              2026,
+              90,
+              12,
+              12,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "status": "Active",
+            "display_name": "Protocol fixture session",
+            "objective": "Verify protocol fixtures",
+            "parent_session_id": null,
+            "parent_branch_id": null,
+            "parent_turn_id": null
+          },
+          "depth": 0,
+          "is_focus": true
+        },
+        {
+          "session": {
+            "session_id": "00000000-0000-0000-0000-000000000002",
+            "project_root": "/tmp/belltower/project",
+            "connection_id": "anthropic",
+            "model_id": "claude-3-7-sonnet-20250219",
+            "tool_mode": "standard",
+            "settings_revision_id": 1,
+            "created_at": [
+              2026,
+              90,
+              12,
+              20,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "updated_at": [
+              2026,
+              90,
+              12,
+              25,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "status": "Active",
+            "display_name": "MCP child",
+            "objective": "Review MCP state transitions",
+            "parent_session_id": "00000000-0000-0000-0000-000000000001",
+            "parent_branch_id": "20000000-0000-0000-0000-000000000001",
+            "parent_turn_id": "30000000-0000-0000-0000-000000000001"
+          },
+          "depth": 1,
+          "is_focus": false
+        }
+      ]
+    }
+  },
+  "session_workflow_response": {
+    "inspection": {
+      "focus_session_id": "00000000-0000-0000-0000-000000000001",
+      "root_session_id": "00000000-0000-0000-0000-000000000001",
+      "node_count": 2,
+      "runtime_counts": {
+        "idle": 1,
+        "working": 1,
+        "waiting_on_input": 0,
+        "waiting_on_approval": 0,
+        "cancel_requested": 0
+      },
+      "status_counts": {
+        "active": 2,
+        "completed": 0,
+        "failed": 0,
+        "abandoned": 0
+      },
+      "nodes": [
+        {
+          "session": {
+            "session_id": "00000000-0000-0000-0000-000000000001",
+            "project_root": "/tmp/belltower/project",
+            "connection_id": "openai",
+            "model_id": "gpt-5.1",
+            "tool_mode": "extended",
+            "settings_revision_id": 1,
+            "created_at": [
+              2026,
+              90,
+              12,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "updated_at": [
+              2026,
+              90,
+              12,
+              12,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "status": "Active",
+            "display_name": "Protocol fixture session",
+            "objective": "Verify protocol fixtures",
+            "parent_session_id": null,
+            "parent_branch_id": null,
+            "parent_turn_id": null
+          },
+          "depth": 0,
+          "is_focus": true,
+          "runtime_state": "Working",
+          "active_branch_id": "20000000-0000-0000-0000-000000000001",
+          "turn_count": 3,
+          "message_count": 5,
+          "tool_call_count": 2,
+          "pending_approval_count": 1,
+          "child_session_count": 1,
+          "last_seq_id": 42
+        },
+        {
+          "session": {
+            "session_id": "00000000-0000-0000-0000-000000000002",
+            "project_root": "/tmp/belltower/project",
+            "connection_id": "anthropic",
+            "model_id": "claude-3-7-sonnet-20250219",
+            "tool_mode": "standard",
+            "settings_revision_id": 1,
+            "created_at": [
+              2026,
+              90,
+              12,
+              20,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "updated_at": [
+              2026,
+              90,
+              12,
+              25,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "status": "Active",
+            "display_name": "MCP child",
+            "objective": "Review MCP state transitions",
+            "parent_session_id": "00000000-0000-0000-0000-000000000001",
+            "parent_branch_id": "20000000-0000-0000-0000-000000000001",
+            "parent_turn_id": "30000000-0000-0000-0000-000000000001"
+          },
+          "depth": 1,
+          "is_focus": false,
+          "runtime_state": "Idle",
+          "active_branch_id": "20000000-0000-0000-0000-000000000002",
+          "turn_count": 1,
+          "message_count": 1,
+          "tool_call_count": 0,
+          "pending_approval_count": 0,
+          "child_session_count": 0,
+          "last_seq_id": 52
+        }
+      ]
+    }
+  },
+  "session_tree_response": {
+    "inspection": {
+      "session": {
+        "session_id": "00000000-0000-0000-0000-000000000001",
+        "project_root": "/tmp/belltower/project",
+        "connection_id": "openai",
+        "model_id": "gpt-5.1",
+        "tool_mode": "extended",
+        "settings_revision_id": 1,
+        "created_at": [
+          2026,
+          90,
+          12,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "updated_at": [
+          2026,
+          90,
+          12,
+          12,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "status": "Active",
+        "display_name": "Protocol fixture session",
+        "objective": "Verify protocol fixtures",
+        "parent_session_id": null,
+        "parent_branch_id": null,
+        "parent_turn_id": null
+      },
+      "active_branch_id": "20000000-0000-0000-0000-000000000001",
+      "branches": [
+        {
+          "branch": {
+            "branch_id": "20000000-0000-0000-0000-000000000001",
+            "session_id": "00000000-0000-0000-0000-000000000001",
+            "parent_branch_id": null,
+            "parent_event_id": "40000000-0000-0000-0000-000000000001",
+            "head_event_id": "40000000-0000-0000-0000-000000000001",
+            "summary": "Main branch summary",
+            "created_at": [
+              2026,
+              90,
+              12,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "is_default": true
+          },
+          "depth": 0,
+          "is_active": true,
+          "total_message_count": 5,
+          "local_message_count": 3,
+          "turn_count": 3,
+          "latest_turn_id": "30000000-0000-0000-0000-000000000001",
+          "latest_event_seq": 42,
+          "latest_message_preview": "Protocol fixtures are green."
+        }
+      ],
+      "related_sessions": [
+        {
+          "relation": "Child",
+          "session_id": "00000000-0000-0000-0000-000000000002",
+          "display_name": "MCP child",
+          "objective": "Review MCP state transitions",
+          "status": "Active",
+          "connection_id": "anthropic",
+          "model_id": "claude-3-7-sonnet-20250219",
+          "origin_branch_id": "20000000-0000-0000-0000-000000000001",
+          "origin_turn_id": "30000000-0000-0000-0000-000000000001",
+          "updated_at": [
+            2026,
+            90,
+            12,
+            25,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      ]
+    }
+  }
+}

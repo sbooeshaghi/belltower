@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust workspace
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.0
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Check bt-agent purity
+        run: cargo test -p bt-agent --test purity
+
+      - name: Check crate boundaries
+        run: bash scripts/check_crate_boundaries.sh
+
+      - name: Check file size bounds
+        run: bash scripts/file_size_lint.sh
+
+      - name: Check OpenAPI contract
+        run: make openapi-check

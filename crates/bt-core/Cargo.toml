@@ -1,0 +1,23 @@
+[package]
+name = "bt-core"
+description = "Core types, events, and shared traits for Belltower."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[dependencies]
+camino.workspace = true
+futures-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+toml.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

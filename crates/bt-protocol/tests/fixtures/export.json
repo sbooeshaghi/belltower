@@ -1,0 +1,26 @@
+{
+  "session_export_response": {
+    "session_id": "00000000-0000-0000-0000-000000000001",
+    "format": "jsonl",
+    "content_type": "application/x-ndjson",
+    "content": "{\"kind\":\"session\"}\n"
+  },
+  "push_otlp_export_request": {
+    "endpoint": "https://phoenix.example.com",
+    "project_name": "belltower-dev",
+    "api_key": null,
+    "headers": {
+      "x-api-key": "secret",
+      "x-project": "belltower"
+    }
+  },
+  "push_otlp_export_response": {
+    "session_id": "00000000-0000-0000-0000-000000000001",
+    "request_url": "https://phoenix.example.com/v1/traces",
+    "content_type": "application/x-protobuf",
+    "bytes_sent": 2048,
+    "status_code": 200,
+    "rejected_spans": 0,
+    "warning": null
+  }
+}

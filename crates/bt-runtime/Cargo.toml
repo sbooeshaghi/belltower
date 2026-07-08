@@ -1,0 +1,32 @@
+[package]
+name = "bt-runtime"
+description = "Runtime orchestration for Belltower agent turns, tools, queue, and control-plane state."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[features]
+test-support = []
+
+[dependencies]
+bt-agent = { version = "0.1.0", path = "../bt-agent" }
+bt-context = { version = "0.1.0", path = "../bt-context" }
+bt-core = { version = "0.1.0", path = "../bt-core" }
+bt-mcp = { version = "0.1.0", path = "../bt-mcp" }
+bt-models = { version = "0.1.0", path = "../bt-models" }
+bt-otel = { version = "0.1.0", path = "../bt-otel" }
+bt-session = { version = "0.1.0", path = "../bt-session" }
+bt-tools = { version = "0.1.0", path = "../bt-tools" }
+camino.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile.workspace = true

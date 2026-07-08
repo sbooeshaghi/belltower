@@ -1,0 +1,29 @@
+# Local case-study mirrors are kept as disposable working clones, not as
+# nested Git repositories inside Belltower.
+harnesses/Warp/
+harnesses/agent-of-empires/
+harnesses/aider/
+harnesses/awesome-agent-harness/
+harnesses/code/
+harnesses/codex/
+harnesses/gemini-cli/
+harnesses/goose/
+harnesses/grok-cli/
+harnesses/hermes-agent/
+harnesses/letta-code/
+harnesses/mistral-vibe/
+harnesses/oh-my-pi/
+harnesses/opencode/
+harnesses/pi-mono/
+harnesses/qwen-code/
+memory/honcho/
+orchestration/paperclip/
+protocols/agent-client-protocol/
+research/autoresearch/
+telemetry/braintrust-sdk/
+telemetry/langfuse/
+telemetry/openinference/
+telemetry/opentelemetry-proto/
+telemetry/opentelemetry-specification/
+telemetry/phoenix/
+training/atropos/

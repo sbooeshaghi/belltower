@@ -1,0 +1,216 @@
+version = 1
+
+# OpenAI API standard short-context rates.
+# Source: https://developers.openai.com/api/docs/pricing
+[[pricing]]
+provider = "openai-compatible"
+model_pattern = "gpt-5.4"
+prompt_usd_per_million = 2.50
+completion_usd_per_million = 15.00
+cache_read_usd_per_million = 0.25
+reasoning_usd_per_million = 15.00
+
+[[pricing]]
+provider = "openai-compatible"
+model_pattern = "gpt-5.4-mini"
+prompt_usd_per_million = 0.75
+completion_usd_per_million = 4.50
+cache_read_usd_per_million = 0.075
+reasoning_usd_per_million = 4.50
+
+[[pricing]]
+provider = "openai-compatible"
+model_pattern = "gpt-5.3-codex"
+prompt_usd_per_million = 1.75
+completion_usd_per_million = 14.00
+cache_read_usd_per_million = 0.175
+reasoning_usd_per_million = 14.00
+
+# Explicit row avoids falling through the shorter gpt-5.3-codex prefix
+# when the Spark model is configured.
+[[pricing]]
+provider = "openai-compatible"
+model_pattern = "gpt-5.3-codex-spark"
+prompt_usd_per_million = 1.75
+completion_usd_per_million = 14.00
+cache_read_usd_per_million = 0.175
+reasoning_usd_per_million = 14.00
+
+# Existing non-default API model retained for compatibility.
+[[pricing]]
+provider = "openai-compatible"
+model_pattern = "o4-mini"
+prompt_usd_per_million = 1.10
+completion_usd_per_million = 4.40
+
+# Local OpenAI-compatible models have no external provider billing.
+[[pricing]]
+provider = "openai-compatible"
+model_pattern = "qwen3:latest"
+prompt_usd_per_million = 0.00
+completion_usd_per_million = 0.00
+
+[[pricing]]
+provider = "openai-compatible"
+model_pattern = "gpt-oss:20b"
+prompt_usd_per_million = 0.00
+completion_usd_per_million = 0.00
+
+[[pricing]]
+provider = "openai-compatible"
+model_pattern = "qwen2.5-coder:7b"
+prompt_usd_per_million = 0.00
+completion_usd_per_million = 0.00
+
+# Anthropic API standard rates.
+# Sources:
+# - https://platform.claude.com/docs/en/docs/about-claude/pricing
+# - https://www.anthropic.com/claude/opus
+[[pricing]]
+provider = "anthropic"
+model_pattern = "claude-opus-4-7"
+prompt_usd_per_million = 5.00
+completion_usd_per_million = 25.00
+cache_read_usd_per_million = 0.50
+reasoning_usd_per_million = 25.00
+
+[[pricing]]
+provider = "anthropic"
+model_pattern = "claude-opus-4-6"
+prompt_usd_per_million = 5.00
+completion_usd_per_million = 25.00
+cache_read_usd_per_million = 0.50
+cache_write_usd_per_million = 6.25
+reasoning_usd_per_million = 25.00
+
+[[pricing]]
+provider = "anthropic"
+model_pattern = "claude-sonnet-4"
+prompt_usd_per_million = 3.00
+completion_usd_per_million = 15.00
+cache_read_usd_per_million = 0.30
+cache_write_usd_per_million = 3.75
+reasoning_usd_per_million = 15.00
+
+[[pricing]]
+provider = "anthropic"
+model_pattern = "claude-sonnet-4-6"
+prompt_usd_per_million = 3.00
+completion_usd_per_million = 15.00
+cache_read_usd_per_million = 0.30
+cache_write_usd_per_million = 3.75
+reasoning_usd_per_million = 15.00
+
+[[pricing]]
+provider = "anthropic"
+model_pattern = "claude-sonnet-4-5"
+prompt_usd_per_million = 3.00
+completion_usd_per_million = 15.00
+cache_read_usd_per_million = 0.30
+cache_write_usd_per_million = 3.75
+reasoning_usd_per_million = 15.00
+
+[[pricing]]
+provider = "anthropic"
+model_pattern = "claude-haiku-4-5"
+prompt_usd_per_million = 1.00
+completion_usd_per_million = 5.00
+cache_read_usd_per_million = 0.10
+cache_write_usd_per_million = 1.25
+reasoning_usd_per_million = 5.00
+
+[[pricing]]
+provider = "anthropic"
+model_pattern = "claude-opus-3"
+prompt_usd_per_million = 15.00
+completion_usd_per_million = 75.00
+cache_read_usd_per_million = 1.50
+cache_write_usd_per_million = 18.75
+reasoning_usd_per_million = 75.00
+
+# Vertex AI Gemini standard <= 200K input-token rates.
+# Source: https://cloud.google.com/vertex-ai/generative-ai/pricing
+[[pricing]]
+provider = "google-vertex"
+model_pattern = "gemini-2.5-pro"
+prompt_usd_per_million = 1.25
+completion_usd_per_million = 10.00
+cache_read_usd_per_million = 0.125
+reasoning_usd_per_million = 10.00
+
+[[pricing]]
+provider = "google-vertex"
+model_pattern = "gemini-2.5-flash"
+prompt_usd_per_million = 0.30
+completion_usd_per_million = 2.50
+cache_read_usd_per_million = 0.030
+reasoning_usd_per_million = 2.50
+
+# OpenAI API models referenced for operator fallback but absent from
+# the current public OpenAI API pricing page.
+[[unpriced_models]]
+provider = "openai-compatible"
+model_pattern = "gpt-5.2-codex"
+reason = "referenced fallback is not listed on the current public OpenAI API pricing page"
+
+[[unpriced_models]]
+provider = "openai-compatible"
+model_pattern = "gpt-5.1-codex-max"
+reason = "referenced fallback is not listed on the current public OpenAI API pricing page"
+
+[[unpriced_models]]
+provider = "openai-compatible"
+model_pattern = "gpt-5.2"
+reason = "referenced fallback is not listed on the current public OpenAI API pricing page"
+
+[[unpriced_models]]
+provider = "openai-compatible"
+model_pattern = "gpt-5.1-codex-mini"
+reason = "referenced fallback is not listed on the current public OpenAI API pricing page"
+
+# ChatGPT subscription-backed models do not expose per-token billing for
+# this connection, even when an API model with the same slug has a price.
+[[unpriced_models]]
+provider = "openai-chatgpt"
+model_pattern = "gpt-5.5"
+reason = "subscription-backed ChatGPT connection has no public per-token billing surface"
+
+[[unpriced_models]]
+provider = "openai-chatgpt"
+model_pattern = "gpt-5.4-mini"
+reason = "subscription-backed ChatGPT connection has no public per-token billing surface"
+
+[[unpriced_models]]
+provider = "openai-chatgpt"
+model_pattern = "gpt-5.4"
+reason = "subscription-backed ChatGPT connection has no public per-token billing surface"
+
+[[unpriced_models]]
+provider = "openai-chatgpt"
+model_pattern = "gpt-5.2-codex"
+reason = "subscription-backed ChatGPT connection has no public per-token billing surface"
+
+[[unpriced_models]]
+provider = "openai-chatgpt"
+model_pattern = "gpt-5.1-codex-max"
+reason = "subscription-backed ChatGPT connection has no public per-token billing surface"
+
+[[unpriced_models]]
+provider = "openai-chatgpt"
+model_pattern = "gpt-5.3-codex"
+reason = "subscription-backed ChatGPT connection has no public per-token billing surface"
+
+[[unpriced_models]]
+provider = "openai-chatgpt"
+model_pattern = "gpt-5.3-codex-spark"
+reason = "subscription-backed ChatGPT connection has no public per-token billing surface"
+
+[[unpriced_models]]
+provider = "openai-chatgpt"
+model_pattern = "gpt-5.2"
+reason = "subscription-backed ChatGPT connection has no public per-token billing surface"
+
+[[unpriced_models]]
+provider = "openai-chatgpt"
+model_pattern = "gpt-5.1-codex-mini"
+reason = "subscription-backed ChatGPT connection has no public per-token billing surface"

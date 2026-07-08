@@ -1,0 +1,94 @@
+version = 1
+
+[[connections]]
+id = "openai"
+provider = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+default_model = "gpt-5.4"
+auth_sources = ["env:OPENAI_API_KEY"]
+model_fallbacks = ["gpt-5.2-codex", "gpt-5.1-codex-max", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2", "gpt-5.1-codex-mini"]
+discoverable_model_selectors = [
+  { kind = "exact", value = "gpt-5.4" },
+  { kind = "exact", value = "gpt-5.2-codex" },
+  { kind = "exact", value = "gpt-5.1-codex-max" },
+  { kind = "exact", value = "gpt-5.4-mini" },
+  { kind = "exact", value = "gpt-5.3-codex" },
+  { kind = "exact", value = "gpt-5.3-codex-spark" },
+  { kind = "exact", value = "gpt-5.2" },
+  { kind = "exact", value = "gpt-5.1-codex-mini" },
+]
+[[connections.auth_methods]]
+id = "openai_api_key"
+kind = "api_key"
+label = "API key"
+source_hint = "env:OPENAI_API_KEY"
+supports_refresh = false
+
+[[connections]]
+id = "anthropic"
+provider = "anthropic"
+base_url = "https://api.anthropic.com"
+default_model = "claude-sonnet-4-6"
+auth_sources = ["env:ANTHROPIC_API_KEY"]
+model_fallbacks = ["claude-opus-4-7", "claude-opus-4-6", "claude-haiku-4-5", "claude-opus-3", "claude-sonnet-4-5"]
+discoverable_model_selectors = [
+  { kind = "prefix", value = "claude-opus-4-7" },
+  { kind = "prefix", value = "claude-sonnet-4-6" },
+  { kind = "prefix", value = "claude-haiku-4-5" },
+  { kind = "prefix", value = "claude-opus-4-6" },
+  { kind = "prefix", value = "claude-opus-3" },
+  { kind = "prefix", value = "claude-sonnet-4-5" },
+]
+[[connections.auth_methods]]
+id = "anthropic_api_key"
+kind = "api_key"
+label = "API key"
+source_hint = "env:ANTHROPIC_API_KEY"
+supports_refresh = false
+
+[[connections]]
+id = "vertex"
+provider = "google-vertex"
+base_url = "https://aiplatform.googleapis.com"
+default_model = "gemini-2.5-pro"
+auth_sources = ["special:gcloud-adc"]
+model_fallbacks = ["gemini-2.5-flash"]
+[[connections.auth_methods]]
+id = "vertex_gcloud_adc"
+kind = "json_document"
+label = "Google ADC"
+source_hint = "special:gcloud-adc"
+supports_refresh = false
+
+[[connections]]
+id = "chatgpt"
+provider = "openai-chatgpt"
+base_url = "https://chatgpt.com/backend-api"
+default_model = "gpt-5.4-mini"
+auth_sources = ["auth_store"]
+model_fallbacks = ["gpt-5.5", "gpt-5.4", "gpt-5.2-codex", "gpt-5.1-codex-max", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2", "gpt-5.1-codex-mini"]
+discoverable_model_selectors = [
+  { kind = "exact", value = "gpt-5.5" },
+  { kind = "exact", value = "gpt-5.4" },
+  { kind = "exact", value = "gpt-5.2-codex" },
+  { kind = "exact", value = "gpt-5.1-codex-max" },
+  { kind = "exact", value = "gpt-5.4-mini" },
+  { kind = "exact", value = "gpt-5.3-codex" },
+  { kind = "exact", value = "gpt-5.3-codex-spark" },
+  { kind = "exact", value = "gpt-5.2" },
+  { kind = "exact", value = "gpt-5.1-codex-mini" },
+]
+[[connections.auth_methods]]
+id = "chatgpt_device_code"
+kind = "oauth_device_code"
+label = "ChatGPT device code"
+source_hint = "auth_store"
+supports_refresh = true
+
+[[connections]]
+id = "local"
+provider = "openai-compatible"
+base_url = "http://127.0.0.1:11434/v1"
+default_model = "qwen3:latest"
+auth_sources = []
+model_fallbacks = ["gpt-oss:20b", "qwen2.5-coder:7b"]

@@ -1,0 +1,34 @@
+Tool call shell call_shell
+branch=20000000-0000-0000-0000-000000000011 turn=30000000-0000-0000-0000-000000000011
+approval_status=approved execution_status=completed
+requested_seq=7 completed_seq=9
+Arguments:
+{
+  "command": "cargo test -p bt-tui"
+}
+Result:
+{
+  "exit_code": 0,
+  "stdout": "ok"
+}
+Approval decision:
+{
+  "Approved": {
+    "decided_at": [
+      1970,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "decided_by": "operator",
+    "scope": "Session",
+    "source": {
+      "kind": "human"
+    }
+  }
+}

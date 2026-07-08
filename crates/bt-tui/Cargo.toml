@@ -1,0 +1,28 @@
+[package]
+name = "bt-tui"
+description = "Terminal user interface for Belltower."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[[bin]]
+name = "bt-tui"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+bt-client = { version = "0.1.0", path = "../bt-client" }
+bt-core = { version = "0.1.0", path = "../bt-core" }
+bt-protocol = { version = "0.1.0", path = "../bt-protocol" }
+clap.workspace = true
+crossterm.workspace = true
+futures-util.workspace = true
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
+serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true
+unicode-width.workspace = true
+url.workspace = true
