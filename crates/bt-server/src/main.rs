@@ -634,12 +634,13 @@ async fn approve_tool(
             Ok(tool_result) => tool_result,
             Err(error) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
-                state.runtime.record_turn_failure(
+                state.runtime.record_resumed_tool_failure(
                     &turn_session,
                     &branch,
                     &connection,
                     &model_id,
                     resumed.turn_id,
+                    &resumable.tool_call,
                     &error.0,
                     latency_ms,
                 )?;

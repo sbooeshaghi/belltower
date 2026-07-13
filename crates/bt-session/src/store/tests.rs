@@ -405,6 +405,222 @@ fn approval_projection_preserves_request_snapshot_and_resolution() {
 }
 
 #[test]
+fn tool_and_approval_projections_isolate_equal_call_ids_by_session() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (first_session, first_branch) = sample_session();
+    let (second_session, second_branch) = sample_session();
+    store
+        .create_session(&first_session, &first_branch)
+        .expect("create first session");
+    store
+        .create_session(&second_session, &second_branch)
+        .expect("create second session");
+
+    let call_id = ToolCallId::new("provider-call-id");
+    for (session, branch, tool_name, decision) in [
+        (
+            &first_session,
+            &first_branch,
+            "first-tool",
+            ApprovalDecision::Approved {
+                decided_at: OffsetDateTime::UNIX_EPOCH,
+                decided_by: "first-operator".to_owned(),
+                scope: ApprovalScope::Session,
+                source: ApprovalDecisionSource::Human,
+            },
+        ),
+        (
+            &second_session,
+            &second_branch,
+            "second-tool",
+            ApprovalDecision::Denied {
+                decided_at: OffsetDateTime::UNIX_EPOCH,
+                decided_by: "second-operator".to_owned(),
+                reason: Some("different session".to_owned()),
+                scope: ApprovalScope::Session,
+                source: ApprovalDecisionSource::Human,
+            },
+        ),
+    ] {
+        store
+            .append_event(&EventEnvelope::new(
+                session.session_id,
+                branch.branch_id,
+                SpanKind::Tool,
+                EventPayload::ToolCallRequested {
+                    call_id: call_id.clone(),
+                    tool_name: tool_name.to_owned(),
+                    arguments: serde_json::json!({ "session": session.session_id.to_string() }),
+                },
+            ))
+            .expect("append tool request");
+        store
+            .append_event(&EventEnvelope::new(
+                session.session_id,
+                branch.branch_id,
+                SpanKind::Tool,
+                EventPayload::ToolApprovalRequested {
+                    call_id: call_id.clone(),
+                    tool_name: tool_name.to_owned(),
+                    snapshot: None,
+                },
+            ))
+            .expect("append approval request");
+        store
+            .append_event(&EventEnvelope::new(
+                session.session_id,
+                branch.branch_id,
+                SpanKind::Tool,
+                EventPayload::ToolApprovalResolved {
+                    call_id: call_id.clone(),
+                    tool_name: tool_name.to_owned(),
+                    request_fingerprint: None,
+                    resolution: None,
+                    decision,
+                },
+            ))
+            .expect("append approval resolution");
+    }
+
+    let first_tool_runs = store
+        .load_tool_runs(first_session.session_id)
+        .expect("load first tool runs");
+    let second_tool_runs = store
+        .load_tool_runs(second_session.session_id)
+        .expect("load second tool runs");
+    assert_eq!(first_tool_runs.len(), 1);
+    assert_eq!(second_tool_runs.len(), 1);
+    assert_eq!(first_tool_runs[0].tool_name, "first-tool");
+    assert_eq!(second_tool_runs[0].tool_name, "second-tool");
+    assert_eq!(
+        first_tool_runs[0].arguments,
+        Some(serde_json::json!({ "session": first_session.session_id.to_string() }))
+    );
+    assert_eq!(
+        second_tool_runs[0].arguments,
+        Some(serde_json::json!({ "session": second_session.session_id.to_string() }))
+    );
+
+    let first_approvals = store
+        .load_approvals(first_session.session_id)
+        .expect("load first approvals");
+    let second_approvals = store
+        .load_approvals(second_session.session_id)
+        .expect("load second approvals");
+    assert_eq!(first_approvals.len(), 1);
+    assert_eq!(second_approvals.len(), 1);
+    assert_eq!(first_approvals[0].tool_name, "first-tool");
+    assert_eq!(first_approvals[0].status, "approved");
+    assert_eq!(second_approvals[0].tool_name, "second-tool");
+    assert_eq!(second_approvals[0].status, "denied");
+}
+
+#[test]
+fn migration_rebuilds_tool_and_approval_projections_with_composite_identity() {
+    let file = NamedTempFile::new().expect("tempfile");
+    let (first_session, first_branch) = sample_session();
+    let (second_session, second_branch) = sample_session();
+    let call_id = ToolCallId::new("reused-provider-call-id");
+
+    {
+        let mut store = SqliteSessionStore::open(file.path()).expect("open store");
+        for (session, branch, tool_name) in [
+            (&first_session, &first_branch, "first-tool"),
+            (&second_session, &second_branch, "second-tool"),
+        ] {
+            store
+                .create_session(session, branch)
+                .expect("create session");
+            store
+                .append_event(&EventEnvelope::new(
+                    session.session_id,
+                    branch.branch_id,
+                    SpanKind::Tool,
+                    EventPayload::ToolCallRequested {
+                        call_id: call_id.clone(),
+                        tool_name: tool_name.to_owned(),
+                        arguments: serde_json::json!({ "tool": tool_name }),
+                    },
+                ))
+                .expect("append tool request");
+            store
+                .append_event(&EventEnvelope::new(
+                    session.session_id,
+                    branch.branch_id,
+                    SpanKind::Tool,
+                    EventPayload::ToolApprovalRequested {
+                        call_id: call_id.clone(),
+                        tool_name: tool_name.to_owned(),
+                        snapshot: None,
+                    },
+                ))
+                .expect("append approval request");
+        }
+
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE approval_projection;
+                 DROP TABLE tool_run_projection;
+                 CREATE TABLE approval_projection (
+                    call_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    request_fingerprint TEXT,
+                    request_snapshot_json TEXT,
+                    decision_json TEXT,
+                    resolution_json TEXT,
+                    updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE tool_run_projection (
+                    call_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    arguments_json TEXT,
+                    result_json TEXT,
+                    updated_at TEXT NOT NULL
+                 );",
+            )
+            .expect("replace with legacy projection schema");
+    }
+
+    let store = SqliteSessionStore::open(file.path()).expect("migrate store");
+    for (session, tool_name) in [
+        (&first_session, "first-tool"),
+        (&second_session, "second-tool"),
+    ] {
+        let tool_runs = store
+            .load_tool_runs(session.session_id)
+            .expect("load rebuilt tool runs");
+        let approvals = store
+            .load_approvals(session.session_id)
+            .expect("load rebuilt approvals");
+        assert_eq!(tool_runs.len(), 1);
+        assert_eq!(tool_runs[0].tool_name, tool_name);
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].tool_name, tool_name);
+    }
+
+    for table in ["approval_projection", "tool_run_projection"] {
+        let mut statement = store
+            .connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("table info");
+        let primary_key_columns = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+            })
+            .expect("primary key columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect primary key columns");
+        assert!(primary_key_columns.contains(&("session_id".to_owned(), 1)));
+        assert!(primary_key_columns.contains(&("call_id".to_owned(), 2)));
+    }
+}
+
+#[test]
 fn unfinished_resumed_turn_recovery_scans_turn_boundaries_only() {
     let mut store = SqliteSessionStore::open_in_memory().expect("store");
     let (session, branch) = sample_session();

@@ -2,8 +2,8 @@
 
 use async_stream::try_stream;
 use bt_core::{
-    BelltowerError, BranchId, ConnectionId, ErrorClass, SessionId, ToolCallId, TurnId,
-    auth_token_path, server_auth_token_path_for_url,
+    BelltowerError, BranchId, ErrorClass, SessionId, ToolCallId, TurnId, auth_token_path,
+    server_auth_token_path_for_url,
 };
 use bt_protocol::{
     ActivateBranchRequest, AnswerToolRequest, ApproveToolRequest, BranchMessagesPageResponse,
@@ -1003,14 +1003,6 @@ impl TryFrom<&str> for BelltowerClient {
 
     fn try_from(value: &str) -> Result<Self> {
         Self::new_discovering_auth(Url::parse(value).map_err(BelltowerError::Url)?)
-    }
-}
-
-impl TryFrom<ConnectionId> for BelltowerClient {
-    type Error = ClientError;
-
-    fn try_from(_value: ConnectionId) -> Result<Self> {
-        Self::try_from("http://127.0.0.1:7400/")
     }
 }
 

@@ -6289,6 +6289,186 @@ async fn approval_resume_keeps_paused_settings_revision_after_session_model_chan
 }
 
 #[tokio::test]
+async fn failed_approved_tool_resume_records_one_terminal_transition() {
+    let server = spawn_server(BelltowerConfig::from_embedded().expect("config")).await;
+    let client = Client::new();
+    let (session, branch) = server
+        .runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("local"),
+            None,
+            SessionToolMode::Extended,
+            Some("failed-approval-resume".to_owned()),
+            None,
+        )
+        .expect("create session");
+    let paused_turn_id = TurnId::new();
+    let call_id = ToolCallId::new("call-unavailable-tool");
+    let tool_name = "unavailable_tool".to_owned();
+    let arguments = serde_json::json!({"value": "test"});
+    let tool_call = ToolCall {
+        tool_name: tool_name.clone(),
+        call_id: call_id.to_string(),
+        arguments: arguments.clone(),
+    };
+    let approval_request = bt_core::ApprovalRequest {
+        session_id: session.session_id,
+        call_id: call_id.clone(),
+        tool_name: tool_name.clone(),
+        arguments: arguments.clone(),
+        requirement: bt_core::ApprovalRequirement::Always,
+        tool_metadata: bt_core::ToolMetadata {
+            risk_class: bt_core::ToolRiskClass::Moderate,
+            is_read_only: false,
+            is_concurrency_safe: false,
+            interrupt_behavior: bt_core::ToolInterruptBehavior::Immediate,
+            execution_mode: bt_core::ToolExecutionMode::Immediate,
+            should_defer: false,
+            catalogue_tags: vec!["test".to_owned()],
+            display_group: bt_core::ToolDisplayGroup::External,
+        },
+        requested_at: time::OffsetDateTime::now_utc(),
+    };
+
+    server
+        .runtime
+        .append_message(&session, &branch, Role::User, "run the unavailable tool")
+        .expect("append user message");
+    server
+        .runtime
+        .record_turn_started(
+            session.session_id,
+            branch.branch_id,
+            paused_turn_id,
+            "openai-compatible".to_owned(),
+            "test-model".to_owned(),
+            1,
+            session.settings_revision_id,
+            TurnStartSource::UserMessage,
+            None,
+        )
+        .expect("record paused turn");
+    server
+        .runtime
+        .append_raw_message(
+            &session,
+            &branch,
+            Message::from_part(
+                Role::Assistant,
+                MessagePart::ToolCall {
+                    call: tool_call.clone(),
+                },
+            ),
+            Some(paused_turn_id),
+        )
+        .expect("append tool call message");
+    server
+        .runtime
+        .record_tool_call_requested(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            tool_name.clone(),
+            arguments,
+            Some(paused_turn_id),
+        )
+        .expect("record tool request");
+    server
+        .runtime
+        .record_approval_requested_for_request(
+            session.session_id,
+            branch.branch_id,
+            &approval_request,
+            Some(paused_turn_id),
+        )
+        .expect("record approval request");
+
+    let response = server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/approve", session.session_id),
+        )
+        .json(&ApproveToolRequest {
+            call_id: call_id.clone(),
+            tool_name: tool_name.clone(),
+            scope: ApprovalScope::Once,
+            decision: ApprovalDecision::Approved {
+                decided_at: time::OffsetDateTime::now_utc(),
+                decided_by: "test".to_owned(),
+                scope: ApprovalScope::Once,
+                source: ApprovalDecisionSource::Human,
+            },
+        })
+        .send()
+        .await
+        .expect("approve tool");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let events = server
+        .runtime
+        .all_events(session.session_id)
+        .expect("canonical events");
+    let terminal_start = events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::MessageAppended { message }
+                    if matches!(
+                        message.tool_result(),
+                        Some(result) if result.call_id == call_id && result.is_error
+                    )
+            )
+        })
+        .expect("error tool result message");
+    let terminal_events = &events[terminal_start..terminal_start + 4];
+    assert!(matches!(
+        &terminal_events[1].payload,
+        EventPayload::ToolExecutionFinished { call_id: recorded, result, .. }
+            if *recorded == call_id && result.is_error
+    ));
+    assert!(matches!(
+        &terminal_events[2].payload,
+        EventPayload::SessionError {
+            class: ErrorClass::Tool,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &terminal_events[3].payload,
+        EventPayload::TurnFinished { status, .. } if status == "failed"
+    ));
+    assert!(
+        terminal_events
+            .iter()
+            .all(|event| event.turn_id == terminal_events[0].turn_id)
+    );
+
+    let queue = server
+        .runtime
+        .inspect_queue(session.session_id)
+        .expect("queue inspection")
+        .expect("session queue");
+    assert!(queue.pending_approvals.is_empty());
+    let inspection = server
+        .runtime
+        .inspect_tool_call(session.session_id, call_id)
+        .expect("tool inspection")
+        .expect("recorded tool call");
+    assert_eq!(inspection.approval_status.as_deref(), Some("approved"));
+    assert_eq!(inspection.execution_status.as_deref(), Some("completed"));
+    assert_eq!(
+        inspection
+            .result
+            .as_ref()
+            .and_then(|value| value.get("is_error")),
+        Some(&Value::Bool(true))
+    );
+}
+
+#[tokio::test]
 async fn answer_round_trip_starts_resumed_turn_before_result_events() {
     let mock_provider = spawn_mock_provider().await;
     let server = spawn_server(config_for_mock_provider(&mock_provider.base_url)).await;

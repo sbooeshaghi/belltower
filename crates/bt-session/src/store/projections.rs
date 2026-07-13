@@ -222,12 +222,12 @@ impl SqliteSessionStore {
                 let request_snapshot_json =
                     snapshot.as_ref().map(serde_json::to_string).transpose()?;
                 tx.execute(
-                    "INSERT INTO approval_projection (call_id, session_id, tool_name, status, request_fingerprint, request_snapshot_json, decision_json, resolution_json, updated_at)
+                    "INSERT INTO approval_projection (session_id, call_id, tool_name, status, request_fingerprint, request_snapshot_json, decision_json, resolution_json, updated_at)
                      VALUES (?1, ?2, ?3, 'pending', ?4, ?5, NULL, NULL, ?6)
-                     ON CONFLICT(call_id) DO UPDATE SET status = 'pending', tool_name = excluded.tool_name, request_fingerprint = excluded.request_fingerprint, request_snapshot_json = excluded.request_snapshot_json, updated_at = excluded.updated_at",
+                     ON CONFLICT(session_id, call_id) DO UPDATE SET status = 'pending', tool_name = excluded.tool_name, request_fingerprint = excluded.request_fingerprint, request_snapshot_json = excluded.request_snapshot_json, updated_at = excluded.updated_at",
                     params![
-                        call_id.to_string(),
                         event.session_id.to_string(),
+                        call_id.to_string(),
                         tool_name,
                         request_fingerprint,
                         request_snapshot_json,
@@ -249,12 +249,12 @@ impl SqliteSessionStore {
                     .or(request_fingerprint.as_deref());
                 let resolution_json = resolution.as_ref().map(serde_json::to_string).transpose()?;
                 tx.execute(
-                    "INSERT INTO approval_projection (call_id, session_id, tool_name, status, request_fingerprint, decision_json, resolution_json, updated_at)
+                    "INSERT INTO approval_projection (session_id, call_id, tool_name, status, request_fingerprint, decision_json, resolution_json, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                     ON CONFLICT(call_id) DO UPDATE SET status = excluded.status, request_fingerprint = excluded.request_fingerprint, decision_json = excluded.decision_json, resolution_json = excluded.resolution_json, updated_at = excluded.updated_at",
+                     ON CONFLICT(session_id, call_id) DO UPDATE SET status = excluded.status, request_fingerprint = excluded.request_fingerprint, decision_json = excluded.decision_json, resolution_json = excluded.resolution_json, updated_at = excluded.updated_at",
                     params![
-                        call_id.to_string(),
                         event.session_id.to_string(),
+                        call_id.to_string(),
                         tool_name,
                         approval_status(decision),
                         resolved_fingerprint,
@@ -271,12 +271,12 @@ impl SqliteSessionStore {
                 arguments,
             } => {
                 tx.execute(
-                    "INSERT INTO tool_run_projection (call_id, session_id, tool_name, status, arguments_json, result_json, updated_at)
+                    "INSERT INTO tool_run_projection (session_id, call_id, tool_name, status, arguments_json, result_json, updated_at)
                      VALUES (?1, ?2, ?3, 'requested', ?4, NULL, ?5)
-                     ON CONFLICT(call_id) DO UPDATE SET status = 'requested', arguments_json = excluded.arguments_json, updated_at = excluded.updated_at",
+                     ON CONFLICT(session_id, call_id) DO UPDATE SET status = 'requested', arguments_json = excluded.arguments_json, updated_at = excluded.updated_at",
                     params![
-                        call_id.to_string(),
                         event.session_id.to_string(),
+                        call_id.to_string(),
                         tool_name,
                         serde_json::to_string(arguments)?,
                         format_time(event.occurred_at)?
@@ -290,12 +290,12 @@ impl SqliteSessionStore {
                 result,
             } => {
                 tx.execute(
-                    "INSERT INTO tool_run_projection (call_id, session_id, tool_name, status, arguments_json, result_json, updated_at)
+                    "INSERT INTO tool_run_projection (session_id, call_id, tool_name, status, arguments_json, result_json, updated_at)
                      VALUES (?1, ?2, ?3, 'completed', NULL, ?4, ?5)
-                     ON CONFLICT(call_id) DO UPDATE SET status = 'completed', result_json = excluded.result_json, updated_at = excluded.updated_at",
+                     ON CONFLICT(session_id, call_id) DO UPDATE SET status = 'completed', result_json = excluded.result_json, updated_at = excluded.updated_at",
                     params![
-                        call_id.to_string(),
                         event.session_id.to_string(),
+                        call_id.to_string(),
                         tool_name,
                         serde_json::to_string(result)?,
                         format_time(event.occurred_at)?

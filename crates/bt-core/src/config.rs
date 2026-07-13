@@ -454,6 +454,7 @@ impl BelltowerConfig {
     }
 
     fn apply_overrides(&mut self, raw_toml: &str) -> Result<()> {
+        reject_unknown_override_keys(raw_toml)?;
         let partial: PartialBelltowerConfig = toml::from_str(raw_toml)?;
 
         if let Some(server) = partial.server {
@@ -693,6 +694,257 @@ impl BelltowerConfig {
         }
 
         Ok(())
+    }
+}
+
+fn reject_unknown_override_keys(raw_toml: &str) -> Result<()> {
+    let value: toml::Value = toml::from_str(raw_toml)?;
+    let Some(root) = value.as_table() else {
+        return Ok(());
+    };
+
+    let mut unknown_paths = Vec::new();
+    validate_table_keys(
+        root,
+        "",
+        &[
+            "server",
+            "context",
+            "approval",
+            "defaults",
+            "web",
+            "mcp",
+            "models",
+            "connections",
+        ],
+        &mut unknown_paths,
+    );
+
+    validate_named_table(
+        root.get("server"),
+        "server",
+        &["host", "port", "auth_token_path"],
+        &mut unknown_paths,
+    );
+    validate_named_table(
+        root.get("context"),
+        "context",
+        &[
+            "compaction_threshold",
+            "reserve_tokens",
+            "max_tool_result_lines",
+            "max_tool_result_bytes",
+            "summary_connection",
+        ],
+        &mut unknown_paths,
+    );
+    validate_named_table(
+        root.get("approval"),
+        "approval",
+        &["shell_timeout_seconds", "auto_approve_patterns"],
+        &mut unknown_paths,
+    );
+    validate_named_table(
+        root.get("defaults"),
+        "defaults",
+        &["default_connection"],
+        &mut unknown_paths,
+    );
+
+    if let Some(web) = root.get("web").and_then(toml::Value::as_table) {
+        validate_table_keys(
+            web,
+            "web",
+            &["search_backend", "fetch_backend", "backends"],
+            &mut unknown_paths,
+        );
+        validate_dynamic_tables(
+            web.get("backends"),
+            "web.backends",
+            &mut unknown_paths,
+            validate_web_backend_keys,
+        );
+    }
+
+    validate_dynamic_tables(
+        root.get("mcp"),
+        "mcp",
+        &mut unknown_paths,
+        validate_mcp_server_keys,
+    );
+
+    if let Some(models) = root.get("models").and_then(toml::Value::as_table) {
+        validate_table_keys(
+            models,
+            "models",
+            &["request_timeout_ms", "backends"],
+            &mut unknown_paths,
+        );
+        validate_dynamic_tables(
+            models.get("backends"),
+            "models.backends",
+            &mut unknown_paths,
+            validate_model_backend_keys,
+        );
+    }
+
+    validate_dynamic_tables(
+        root.get("connections"),
+        "connections",
+        &mut unknown_paths,
+        validate_connection_keys,
+    );
+
+    if unknown_paths.is_empty() {
+        Ok(())
+    } else {
+        Err(BelltowerError::Config(format!(
+            "unknown configuration key{}: {}",
+            if unknown_paths.len() == 1 { "" } else { "s" },
+            unknown_paths.join(", ")
+        )))
+    }
+}
+
+fn validate_web_backend_keys(value: &toml::Value, path: &str, unknown_paths: &mut Vec<String>) {
+    validate_value_table_keys(
+        value,
+        path,
+        &["kind", "enabled", "base_url", "auth_sources"],
+        unknown_paths,
+    );
+}
+
+fn validate_model_backend_keys(value: &toml::Value, path: &str, unknown_paths: &mut Vec<String>) {
+    validate_value_table_keys(value, path, &["enabled", "base_url"], unknown_paths);
+}
+
+fn validate_mcp_server_keys(value: &toml::Value, path: &str, unknown_paths: &mut Vec<String>) {
+    let Some(server) = value.as_table() else {
+        return;
+    };
+    validate_table_keys(server, path, &["enabled", "transport"], unknown_paths);
+
+    let transport_path = format!("{path}.transport");
+    let Some(transport) = server.get("transport").and_then(toml::Value::as_table) else {
+        return;
+    };
+    let allowed = match transport.get("kind").and_then(toml::Value::as_str) {
+        Some("stdio") => &["kind", "command", "args", "cwd", "env"][..],
+        Some("streamable_http") => &["kind", "base_url", "headers"][..],
+        _ => &["kind"][..],
+    };
+    validate_table_keys(transport, &transport_path, allowed, unknown_paths);
+}
+
+fn validate_connection_keys(value: &toml::Value, path: &str, unknown_paths: &mut Vec<String>) {
+    let Some(connection) = value.as_table() else {
+        return;
+    };
+    validate_table_keys(
+        connection,
+        path,
+        &[
+            "provider",
+            "base_url",
+            "default_model",
+            "auth_methods",
+            "auth_sources",
+            "model_fallbacks",
+            "discoverable_model_selectors",
+        ],
+        unknown_paths,
+    );
+    validate_array_tables(
+        connection.get("auth_methods"),
+        &format!("{path}.auth_methods"),
+        &["id", "kind", "label", "source_hint", "supports_refresh"],
+        unknown_paths,
+    );
+    validate_array_tables(
+        connection.get("discoverable_model_selectors"),
+        &format!("{path}.discoverable_model_selectors"),
+        &["kind", "value"],
+        unknown_paths,
+    );
+}
+
+fn validate_named_table(
+    value: Option<&toml::Value>,
+    path: &str,
+    allowed: &[&str],
+    unknown_paths: &mut Vec<String>,
+) {
+    if let Some(table) = value.and_then(toml::Value::as_table) {
+        validate_table_keys(table, path, allowed, unknown_paths);
+    }
+}
+
+fn validate_dynamic_tables(
+    value: Option<&toml::Value>,
+    path: &str,
+    unknown_paths: &mut Vec<String>,
+    validate_entry: fn(&toml::Value, &str, &mut Vec<String>),
+) {
+    let Some(entries) = value.and_then(toml::Value::as_table) else {
+        return;
+    };
+    for (name, entry) in entries {
+        validate_entry(entry, &config_key_path(path, name), unknown_paths);
+    }
+}
+
+fn validate_array_tables(
+    value: Option<&toml::Value>,
+    path: &str,
+    allowed: &[&str],
+    unknown_paths: &mut Vec<String>,
+) {
+    let Some(entries) = value.and_then(toml::Value::as_array) else {
+        return;
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        validate_value_table_keys(entry, &format!("{path}[{index}]"), allowed, unknown_paths);
+    }
+}
+
+fn validate_value_table_keys(
+    value: &toml::Value,
+    path: &str,
+    allowed: &[&str],
+    unknown_paths: &mut Vec<String>,
+) {
+    if let Some(table) = value.as_table() {
+        validate_table_keys(table, path, allowed, unknown_paths);
+    }
+}
+
+fn validate_table_keys(
+    table: &toml::map::Map<String, toml::Value>,
+    path: &str,
+    allowed: &[&str],
+    unknown_paths: &mut Vec<String>,
+) {
+    for key in table.keys() {
+        if !allowed.contains(&key.as_str()) {
+            unknown_paths.push(config_key_path(path, key));
+        }
+    }
+}
+
+fn config_key_path(path: &str, key: &str) -> String {
+    let key = if key
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        key.to_owned()
+    } else {
+        format!("{key:?}")
+    };
+    if path.is_empty() {
+        key
+    } else {
+        format!("{path}.{key}")
     }
 }
 
@@ -1139,5 +1391,56 @@ auth_sources = ["env:CUSTOM_EXA_KEY"]
             .find(|backend| backend.id == "exa")
             .expect("exa backend");
         assert_eq!(exa.auth_sources, vec!["env:CUSTOM_EXA_KEY"]);
+    }
+
+    #[test]
+    fn config_overrides_reject_unknown_nested_keys_with_paths() {
+        let mut config = BelltowerConfig::from_embedded().expect("embedded config");
+        let error = config
+            .apply_overrides(
+                r#"
+[web.backends.exa]
+auth_sorces = ["env:CUSTOM_EXA_KEY"]
+
+[connections.custom]
+provider = "openai-compatible"
+base_url = "https://example.test/v1"
+default_model = "example-model"
+auth_methods = [{ id = "custom_api_key", kind = "api_key", label = "API key", support_refresh = true }]
+"#,
+            )
+            .expect_err("unknown keys must fail");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("web.backends.exa.auth_sorces"),
+            "{message}"
+        );
+        assert!(
+            message.contains("connections.custom.auth_methods[0].support_refresh"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn config_overrides_allow_dynamic_map_keys() {
+        let mut config = BelltowerConfig::from_embedded().expect("embedded config");
+        config
+            .apply_overrides(
+                r#"
+[connections."custom.connection"]
+provider = "openai-compatible"
+base_url = "https://example.test/v1"
+default_model = "example-model"
+"#,
+            )
+            .expect("dynamic connection ID should be accepted");
+
+        assert!(
+            config
+                .connections
+                .iter()
+                .any(|connection| connection.id == ConnectionId::new("custom.connection"))
+        );
     }
 }

@@ -16,7 +16,6 @@ path = "src/main.rs"
 async-stream.workspace = true
 axum.workspace = true
 base64.workspace = true
-bt-agent = { version = "0.1.0", path = "../bt-agent" }
 bt-auth = { version = "0.1.0", path = "../bt-auth" }
 bt-context = { version = "0.1.0", path = "../bt-context" }
 bt-core = { version = "0.1.0", path = "../bt-core" }

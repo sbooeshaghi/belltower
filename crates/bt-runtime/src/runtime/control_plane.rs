@@ -142,6 +142,129 @@ impl BelltowerRuntime {
         })
     }
 
+    /// Records the terminal outcome when an approved, resumed tool call cannot execute.
+    ///
+    /// The tool result, execution state, error, and failed turn form one canonical
+    /// transition so restart and inspection cannot observe a permanently requested
+    /// tool after the server has already returned an execution error.
+    pub fn record_resumed_tool_failure(
+        &self,
+        session: &SessionRecord,
+        branch: &BranchRecord,
+        connection: &ConnectionDescriptor,
+        model_id: &str,
+        turn_id: TurnId,
+        tool_call: &bt_core::ToolCall,
+        error: &bt_core::BelltowerError,
+        latency_ms: u64,
+    ) -> Result<()> {
+        let call_id = ToolCallId::new(tool_call.call_id.clone());
+        let tool_name = tool_call.tool_name.clone();
+        let result = ToolResultEnvelope {
+            call_id: call_id.clone(),
+            tool_name: tool_name.clone(),
+            is_error: true,
+            output: serde_json::json!({
+                "error": {
+                    "class": error.class().to_string(),
+                    "code": error.code(),
+                    "message": error.to_string(),
+                    "retryable": error.retryable(),
+                }
+            }),
+            duration_ms: Some(latency_ms),
+        };
+
+        let message = apply_turn_id(
+            EventEnvelope::new(
+                session.session_id,
+                branch.branch_id,
+                SpanKind::Agent,
+                EventPayload::MessageAppended {
+                    message: Message::from_part(
+                        Role::Tool,
+                        MessagePart::ToolResult {
+                            result: result.clone(),
+                        },
+                    ),
+                },
+            ),
+            Some(turn_id),
+        );
+        let tool_finished = apply_turn_id(
+            EventEnvelope::new(
+                session.session_id,
+                branch.branch_id,
+                SpanKind::Tool,
+                EventPayload::ToolExecutionFinished {
+                    call_id,
+                    tool_name,
+                    result,
+                },
+            ),
+            Some(turn_id),
+        );
+        let session_error = apply_turn_id(
+            EventEnvelope::new(
+                session.session_id,
+                branch.branch_id,
+                SpanKind::Tool,
+                EventPayload::SessionError {
+                    class: error.class(),
+                    code: error.code().to_owned(),
+                    message: error.to_string(),
+                    retryable: error.retryable(),
+                },
+            )
+            .with_attribute(
+                "error.class",
+                serde_json::Value::String(error.class().to_string()),
+            )
+            .with_attribute(
+                "error.code",
+                serde_json::Value::String(error.code().to_owned()),
+            )
+            .with_attribute(
+                "error.retryable",
+                serde_json::Value::Bool(error.retryable()),
+            ),
+            Some(turn_id),
+        );
+        let turn_finished = EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::TurnFinished {
+                turn_id,
+                provider: connection.provider.clone(),
+                model: model_id.to_owned(),
+                status: "failed".to_owned(),
+                finish_reason: Some(error.code().to_owned()),
+                latency_ms,
+            },
+        )
+        .with_turn_id(turn_id)
+        .with_attribute(
+            bt_core::oi_attrs::LLM_PROVIDER,
+            serde_json::Value::String(connection.provider.clone()),
+        )
+        .with_attribute(
+            bt_core::oi_attrs::LLM_MODEL_NAME,
+            serde_json::Value::String(model_id.to_owned()),
+        )
+        .with_attribute(
+            "turn.status",
+            serde_json::Value::String("failed".to_owned()),
+        )
+        .with_attribute(
+            "turn.finish_reason",
+            serde_json::Value::String(error.code().to_owned()),
+        );
+
+        self.append_events(vec![message, tool_finished, session_error, turn_finished])?;
+        Ok(())
+    }
+
     pub fn bootstrap_resumed_input_turn(
         &self,
         resumable: &ResumableToolCall,

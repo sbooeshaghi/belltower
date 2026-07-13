@@ -315,6 +315,7 @@ These ship with the binary and are overlaid by:
 3. project config at `.belltower/config.toml`
 
 This keeps the default provider catalog data-driven instead of hardcoding it in Rust logic.
+Override files are strict: unknown keys fail with their full configuration path rather than silently falling back to embedded defaults.
 
 ## Instructions, Prompt Assets, And Skills
 

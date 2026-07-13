@@ -118,6 +118,8 @@ boundaries from the raw event stream.
 
 `tool.operation.recorded` is the durable envelope for tool-operation metadata such as initiator, risk/read-only/execution-mode classification, and artifact references. The call and result events remain the canonical argument/result events; operation metadata exists so built-in tools, MCP tools, and human-invoked operations can converge on the same telemetry shape without overloading `tool.call.requested`.
 
+Every `tool.call.requested` must have exactly one terminal `tool.execution.finished`, including denied, cancelled, timed-out, aborted, and failed execution. The terminal tool result and the closing turn/error events are one canonical transition so restart and inspection cannot observe a tool as permanently requested after execution has ended.
+
 `tool.approval.requested` carries optional `ApprovalRequestSnapshot` evidence:
 request fingerprint, argument hash, redacted argument preview, approval
 requirement, tool metadata, initiator, surface, and optional policy/registry

@@ -146,7 +146,7 @@ jobs:
             ./belltower --version
             ./belltower doctor
 
-          Docs: https://github.com/TheBiologyCompany/belltower
+          Docs: https://github.com/sbooeshaghi/belltower
           EOF
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
 
@@ -169,7 +169,7 @@ jobs:
             .\belltower.exe --version
             .\belltower.exe doctor
 
-          Docs: https://github.com/TheBiologyCompany/belltower
+          Docs: https://github.com/sbooeshaghi/belltower
           "@
           Compress-Archive -Path "$dir/*" -DestinationPath "dist/$name.zip" -Force
 

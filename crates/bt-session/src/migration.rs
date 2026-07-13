@@ -1,5 +1,32 @@
+use bt_core::{ApprovalDecision, EventEnvelope, EventPayload};
 use rusqlite::{Connection, params};
 use serde_json::Value;
+
+const TOOL_AND_APPROVAL_PROJECTION_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS approval_projection (
+    session_id      TEXT NOT NULL,
+    call_id         TEXT NOT NULL,
+    tool_name       TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    request_fingerprint TEXT,
+    request_snapshot_json TEXT,
+    decision_json   TEXT,
+    resolution_json TEXT,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (session_id, call_id)
+);
+
+CREATE TABLE IF NOT EXISTS tool_run_projection (
+    session_id      TEXT NOT NULL,
+    call_id         TEXT NOT NULL,
+    tool_name       TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    arguments_json  TEXT,
+    result_json     TEXT,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (session_id, call_id)
+);
+"#;
 
 pub const MIGRATIONS: &[&str] = &[r#"
 CREATE TABLE IF NOT EXISTS sessions (
@@ -72,28 +99,6 @@ CREATE TABLE IF NOT EXISTS message_projection (
     role            TEXT NOT NULL,
     content_json    TEXT NOT NULL,
     created_at      TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS approval_projection (
-    call_id         TEXT PRIMARY KEY,
-    session_id      TEXT NOT NULL,
-    tool_name       TEXT NOT NULL,
-    status          TEXT NOT NULL,
-    request_fingerprint TEXT,
-    request_snapshot_json TEXT,
-    decision_json   TEXT,
-    resolution_json TEXT,
-    updated_at      TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS tool_run_projection (
-    call_id         TEXT PRIMARY KEY,
-    session_id      TEXT NOT NULL,
-    tool_name       TEXT NOT NULL,
-    status          TEXT NOT NULL,
-    arguments_json  TEXT,
-    result_json     TEXT,
-    updated_at      TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS context_manifest_projection (
@@ -209,6 +214,7 @@ pub fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
     for migration in MIGRATIONS {
         connection.execute_batch(migration)?;
     }
+    connection.execute_batch(TOOL_AND_APPROVAL_PROJECTION_TABLES)?;
     ensure_column(connection, "sessions", "model_id", "TEXT")?;
     ensure_column(
         connection,
@@ -341,7 +347,174 @@ pub fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
     drop_column_if_exists(connection, "sessions", "trace_id")?;
     drop_column_if_exists(connection, "events", "trace_id")?;
     rewrite_legacy_event_json_without_trace_id(connection)?;
+    cut_over_tool_and_approval_projection_identity(connection)?;
     Ok(())
+}
+
+fn cut_over_tool_and_approval_projection_identity(connection: &Connection) -> rusqlite::Result<()> {
+    if table_has_composite_primary_key(connection, "approval_projection")?
+        && table_has_composite_primary_key(connection, "tool_run_projection")?
+    {
+        return Ok(());
+    }
+
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        connection.execute_batch(
+            "DROP TABLE approval_projection;
+             DROP TABLE tool_run_projection;",
+        )?;
+        connection.execute_batch(TOOL_AND_APPROVAL_PROJECTION_TABLES)?;
+        rebuild_tool_and_approval_projections(connection)
+    })();
+
+    match result {
+        Ok(()) => connection.execute_batch("COMMIT"),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn table_has_composite_primary_key(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+    let mut primary_key_columns = Vec::new();
+    while let Some(row) = rows.next()? {
+        let primary_key_position: i64 = row.get(5)?;
+        if primary_key_position > 0 {
+            primary_key_columns.push((primary_key_position, row.get::<_, String>(1)?));
+        }
+    }
+    primary_key_columns.sort_unstable_by_key(|(position, _)| *position);
+    Ok(primary_key_columns == [(1, "session_id".to_owned()), (2, "call_id".to_owned())])
+}
+
+fn rebuild_tool_and_approval_projections(connection: &Connection) -> rusqlite::Result<()> {
+    let event_jsons = {
+        let mut statement =
+            connection.prepare("SELECT event_json FROM events ORDER BY seq_id ASC")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for event_json in event_jsons {
+        let event: EventEnvelope = serde_json::from_str(&event_json)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let updated_at = event
+            .occurred_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+
+        match &event.payload {
+            EventPayload::ToolApprovalRequested {
+                call_id,
+                tool_name,
+                snapshot,
+            } => {
+                let request_fingerprint = snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.request_fingerprint.as_str());
+                let request_snapshot_json = snapshot
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                connection.execute(
+                    "INSERT INTO approval_projection (session_id, call_id, tool_name, status, request_fingerprint, request_snapshot_json, decision_json, resolution_json, updated_at)
+                     VALUES (?1, ?2, ?3, 'pending', ?4, ?5, NULL, NULL, ?6)
+                     ON CONFLICT(session_id, call_id) DO UPDATE SET status = 'pending', tool_name = excluded.tool_name, request_fingerprint = excluded.request_fingerprint, request_snapshot_json = excluded.request_snapshot_json, updated_at = excluded.updated_at",
+                    params![
+                        event.session_id.to_string(),
+                        call_id.to_string(),
+                        tool_name,
+                        request_fingerprint,
+                        request_snapshot_json,
+                        updated_at,
+                    ],
+                )?;
+            }
+            EventPayload::ToolApprovalResolved {
+                call_id,
+                tool_name,
+                request_fingerprint,
+                resolution,
+                decision,
+            } => {
+                let resolved_fingerprint = resolution
+                    .as_ref()
+                    .map(|resolution| resolution.request_fingerprint.as_str())
+                    .or(request_fingerprint.as_deref());
+                let resolution_json = resolution
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                connection.execute(
+                    "INSERT INTO approval_projection (session_id, call_id, tool_name, status, request_fingerprint, decision_json, resolution_json, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(session_id, call_id) DO UPDATE SET status = excluded.status, request_fingerprint = excluded.request_fingerprint, decision_json = excluded.decision_json, resolution_json = excluded.resolution_json, updated_at = excluded.updated_at",
+                    params![
+                        event.session_id.to_string(),
+                        call_id.to_string(),
+                        tool_name,
+                        approval_status(decision),
+                        resolved_fingerprint,
+                        serde_json::to_string(decision).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+                        resolution_json,
+                        updated_at,
+                    ],
+                )?;
+            }
+            EventPayload::ToolCallRequested {
+                call_id,
+                tool_name,
+                arguments,
+            } => {
+                connection.execute(
+                    "INSERT INTO tool_run_projection (session_id, call_id, tool_name, status, arguments_json, result_json, updated_at)
+                     VALUES (?1, ?2, ?3, 'requested', ?4, NULL, ?5)
+                     ON CONFLICT(session_id, call_id) DO UPDATE SET status = 'requested', arguments_json = excluded.arguments_json, updated_at = excluded.updated_at",
+                    params![
+                        event.session_id.to_string(),
+                        call_id.to_string(),
+                        tool_name,
+                        serde_json::to_string(arguments).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+                        updated_at,
+                    ],
+                )?;
+            }
+            EventPayload::ToolExecutionFinished {
+                call_id,
+                tool_name,
+                result,
+            } => {
+                connection.execute(
+                    "INSERT INTO tool_run_projection (session_id, call_id, tool_name, status, arguments_json, result_json, updated_at)
+                     VALUES (?1, ?2, ?3, 'completed', NULL, ?4, ?5)
+                     ON CONFLICT(session_id, call_id) DO UPDATE SET status = 'completed', result_json = excluded.result_json, updated_at = excluded.updated_at",
+                    params![
+                        event.session_id.to_string(),
+                        call_id.to_string(),
+                        tool_name,
+                        serde_json::to_string(result).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+                        updated_at,
+                    ],
+                )?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn approval_status(decision: &ApprovalDecision) -> &'static str {
+    match decision {
+        ApprovalDecision::Approved { .. } => "approved",
+        ApprovalDecision::Denied { .. } => "denied",
+    }
 }
 
 fn table_has_column(connection: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {

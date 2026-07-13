@@ -431,7 +431,6 @@ dependencies = [
  "async-stream",
  "axum",
  "base64",
- "bt-agent",
  "bt-auth",
  "bt-client",
  "bt-context",
