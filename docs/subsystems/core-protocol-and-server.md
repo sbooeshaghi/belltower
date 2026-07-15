@@ -124,9 +124,10 @@ top of that shared shape without changing the consumer contract.
 
 The current server/runtime contract now uses that shape directly on session
 creation: `POST /sessions` may persist an initial `BudgetConfig`, and later
-turn completion records runtime-owned `budget.checkpoint` and
-`session.cancelled { reason: "budget_exhausted" }` events without introducing a
-server-local budget model.
+turn completion atomically records runtime-owned `budget.checkpoint`, optional
+`session.cancelled { reason: "budget_exhausted" }`, terminal evidence, and
+`turn.finished` events without introducing a server-local budget model. The
+server transports the resulting state and never owns a second budget predicate.
 
 ## 3. Local API Security
 
@@ -176,10 +177,16 @@ This removes the main `401 Unauthorized` failure mode that came from rotating on
 
 Server handlers stay thin in this flow. They may provide runtime adapters for
 tool-registry construction and provider construction, but turn semantics remain
-runtime-owned: the runtime validates the executable provider/auth/model path
-before recording model-visible context mutations for that turn. Failed provider
-construction or credential preflight is surfaced as durable runtime failure
-state, not as a server-local partial continuation.
+runtime-owned. Budget eligibility is part of the runtime/store admission or
+continuation claim, not a separate HTTP precheck, and successful admission
+returns an opaque runtime-issued turn capability bound to the admitted session
+and branch. Approval and pending-input endpoints also delegate one exact
+request-sequence claim to runtime/store; the server does not resolve the
+decision and then race a separate turn start. Budget configuration is also
+runtime/store-owned and is accepted only while the session is idle. The runtime validates the executable
+provider/auth/model path before recording model-visible context mutations for
+that turn. Failed provider construction or credential preflight is surfaced as
+durable runtime failure state, not as a server-local partial continuation.
 
 ## Design Commitments
 

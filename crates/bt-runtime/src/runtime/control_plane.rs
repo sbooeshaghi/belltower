@@ -63,7 +63,7 @@ impl BelltowerRuntime {
         resumable: &ResumableToolCall,
         approval_request: &ApprovalRequest,
         decision: ApprovalDecision,
-    ) -> Result<BootstrappedTurn> {
+    ) -> Result<AdmittedTurn> {
         let turn_id = TurnId::new();
         let (connection, model_id) = self
             .resolve_turn_settings(resumable.session.session_id, resumable.settings_revision_id)?;
@@ -119,18 +119,29 @@ impl BelltowerRuntime {
             turn_id,
             &pending_steers,
             combined_steer,
-            self.is_cancelled(resumable.session.session_id)?,
         );
-        self.append_events(events)?;
+        require_resumed_continuation_claim(self.commit_resumed_continuation(
+            resumable.session.session_id,
+            resumable.branch.branch_id,
+            &approval_request.call_id,
+            &approval_request.tool_name,
+            resumable.turn_id,
+            resumable.requested_seq_id,
+            resumable.settings_revision_id,
+            bt_session::ResumedContinuationKind::Approval,
+            events,
+        )?)?;
         self.approvals.seed_reusable_decision(
             approval_request.session_id,
             approval_request_fingerprint(approval_request),
             decision,
         )?;
-        Ok(BootstrappedTurn {
+        Ok(AdmittedTurn::new(
+            resumable.session.session_id,
+            resumable.branch.branch_id,
             turn_id,
-            settings_revision_id: resumable.settings_revision_id,
-        })
+            resumable.settings_revision_id,
+        ))
     }
 
     pub fn record_tool_terminal_transition(
@@ -141,9 +152,12 @@ impl BelltowerRuntime {
         result: ToolResultEnvelope,
         message: Message,
     ) -> Result<()> {
-        self.append_events(tool_terminal_events(
-            session_id, branch_id, turn_id, result, message,
-        ))?;
+        self.append_active_turn_events(
+            session_id,
+            branch_id,
+            turn_id,
+            tool_terminal_events(session_id, branch_id, turn_id, result, message),
+        )?;
         Ok(())
     }
 
@@ -158,9 +172,14 @@ impl BelltowerRuntime {
         operation: bt_core::ToolOperationContext,
         message: Message,
     ) -> Result<()> {
-        self.append_events(tool_request_events(
-            session_id, branch_id, turn_id, call_id, tool_name, arguments, operation, message,
-        ))?;
+        self.append_active_turn_events(
+            session_id,
+            branch_id,
+            turn_id,
+            tool_request_events(
+                session_id, branch_id, turn_id, call_id, tool_name, arguments, operation, message,
+            ),
+        )?;
         Ok(())
     }
 
@@ -274,6 +293,7 @@ impl BelltowerRuntime {
         finish_reason: &str,
         latency_ms: u64,
     ) -> Result<()> {
+        let terminal_at = time::OffsetDateTime::now_utc();
         let mut events = terminal_results
             .into_iter()
             .flat_map(|result| {
@@ -344,7 +364,13 @@ impl BelltowerRuntime {
                 serde_json::Value::String(finish_reason.to_owned()),
             ),
         );
-        self.append_events(events)?;
+        self.commit_active_turn_terminal_events(
+            session_id,
+            branch_id,
+            turn_id,
+            terminal_at,
+            events,
+        )?;
         Ok(())
     }
 
@@ -390,7 +416,7 @@ impl BelltowerRuntime {
         &self,
         resumable: &ResumableToolCall,
         tool_result: ToolResultEnvelope,
-    ) -> Result<BootstrappedTurn> {
+    ) -> Result<AdmittedTurn> {
         let turn_id = TurnId::new();
         let (connection, model_id) = self
             .resolve_turn_settings(resumable.session.session_id, resumable.settings_revision_id)?;
@@ -433,13 +459,24 @@ impl BelltowerRuntime {
             turn_id,
             &pending_steers,
             combined_steer,
-            self.is_cancelled(resumable.session.session_id)?,
         );
-        self.append_events(events)?;
-        Ok(BootstrappedTurn {
+        require_resumed_continuation_claim(self.commit_resumed_continuation(
+            resumable.session.session_id,
+            resumable.branch.branch_id,
+            &ToolCallId::new(resumable.tool_call.call_id.clone()),
+            &resumable.tool_call.tool_name,
+            resumable.turn_id,
+            resumable.requested_seq_id,
+            resumable.settings_revision_id,
+            bt_session::ResumedContinuationKind::Input,
+            events,
+        )?)?;
+        Ok(AdmittedTurn::new(
+            resumable.session.session_id,
+            resumable.branch.branch_id,
             turn_id,
-            settings_revision_id: resumable.settings_revision_id,
-        })
+            resumable.settings_revision_id,
+        ))
     }
 
     pub fn queue_message(
@@ -534,10 +571,12 @@ impl BelltowerRuntime {
                 vec![queued_event, queued_audit_event],
             )? {
                 SessionTurnAdmission::Started { .. } => {
-                    return Ok(UserMessageAdmission::Started(BootstrappedTurn {
+                    return Ok(UserMessageAdmission::Started(AdmittedTurn::new(
+                        session.session_id,
+                        branch.branch_id,
                         turn_id,
                         settings_revision_id,
-                    }));
+                    )));
                 }
                 SessionTurnAdmission::Queued { position, .. } => {
                     return Ok(UserMessageAdmission::Queued { position });
@@ -546,6 +585,12 @@ impl BelltowerRuntime {
                     settings_revision_id: current_settings_revision_id,
                 } => {
                     settings_revision_id = current_settings_revision_id;
+                }
+                SessionTurnAdmission::BudgetExhausted => {
+                    return Err(bt_core::BelltowerError::Protocol(
+                        "session budget exhausted; adjust the session budget before sending more work"
+                            .to_owned(),
+                    ));
                 }
             }
         }
@@ -703,6 +748,7 @@ impl BelltowerRuntime {
                 settings_revision_id,
             })),
             ContinuationClaim::Busy
+            | ContinuationClaim::BudgetExhausted
             | ContinuationClaim::CancelPending
             | ContinuationClaim::Stale => Ok(None),
         }
@@ -790,6 +836,7 @@ impl BelltowerRuntime {
                 settings_revision_id: queued.settings_revision_id,
             })),
             ContinuationClaim::Busy
+            | ContinuationClaim::BudgetExhausted
             | ContinuationClaim::CancelPending
             | ContinuationClaim::Stale => Ok(None),
         }
@@ -1038,17 +1085,58 @@ impl BelltowerRuntime {
         let session = self
             .load_session(session_id)?
             .ok_or_else(|| bt_core::BelltowerError::InvalidState("session not found".to_owned()))?;
-        let branch_id = inspection.branch_id.ok_or_else(|| {
+        let request_identity = {
+            let store = self.store.lock().map_err(|_| {
+                bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned())
+            })?;
+            match kind {
+                ResumableToolCallKind::Approval => store
+                    .load_approvals(session_id)?
+                    .into_iter()
+                    .find(|approval| {
+                        approval.call_id == call_id
+                            && approval.tool_name == tool_name
+                            && approval.status == "pending"
+                    })
+                    .map(|approval| {
+                        (
+                            approval.branch_id,
+                            approval.turn_id,
+                            approval.requested_seq_id,
+                        )
+                    }),
+                ResumableToolCallKind::Input => store
+                    .load_tool_runs(session_id)?
+                    .into_iter()
+                    .find(|run| {
+                        run.call_id == call_id
+                            && run.tool_name == tool_name
+                            && run.status == "requested"
+                    })
+                    .map(|run| (run.branch_id, run.turn_id, run.requested_seq_id)),
+            }
+        }
+        .ok_or_else(|| {
+            bt_core::BelltowerError::InvalidState(format!(
+                "tool call `{call_id}` changed before resume identity could be loaded"
+            ))
+        })?;
+        let branch_id = request_identity.0.ok_or_else(|| {
             bt_core::BelltowerError::InvalidState(format!(
                 "tool call `{call_id}` is missing canonical branch metadata"
             ))
         })?;
-        let turn_id = inspection.turn_id.ok_or_else(|| {
+        let turn_id = request_identity.1.ok_or_else(|| {
             bt_core::BelltowerError::InvalidState(format!(
                 "tool call `{call_id}` is missing canonical turn metadata"
             ))
         })?;
         let settings_revision_id = self.settings_revision_for_turn(session_id, turn_id)?;
+        let requested_seq_id = request_identity.2.ok_or_else(|| {
+            bt_core::BelltowerError::InvalidState(format!(
+                "tool call `{call_id}` is missing canonical request sequence metadata"
+            ))
+        })?;
         let arguments = inspection.arguments.ok_or_else(|| {
             bt_core::BelltowerError::InvalidState(format!(
                 "tool call `{call_id}` is missing canonical arguments"
@@ -1065,6 +1153,7 @@ impl BelltowerRuntime {
             session,
             branch,
             turn_id,
+            requested_seq_id,
             settings_revision_id,
             tool_call: ToolCall {
                 tool_name: inspection.tool_name,
@@ -1114,7 +1203,6 @@ impl BelltowerRuntime {
         turn_id: TurnId,
         pending_steers: &[SteerProjection],
         combined_steer: Option<String>,
-        cancel_requested: bool,
     ) {
         if !pending_steers.is_empty() {
             events.push(apply_turn_id(
@@ -1148,25 +1236,30 @@ impl BelltowerRuntime {
                 ));
             }
         }
-        if cancel_requested {
-            events.push(apply_turn_id(
-                EventEnvelope::new(
-                    session_id,
-                    branch_id,
-                    SpanKind::Agent,
-                    EventPayload::SessionCancelCleared {
-                        reason: "cleared by resumed turn bootstrap".to_owned(),
-                    },
-                ),
-                Some(turn_id),
-            ));
-        }
     }
 
     pub fn is_cancelled(&self, session_id: SessionId) -> Result<bool> {
         Ok(self
             .load_session_control(session_id)?
             .is_some_and(|state| state.cancel_requested))
+    }
+}
+
+fn require_resumed_continuation_claim(outcome: ContinuationClaim) -> Result<()> {
+    match outcome {
+        ContinuationClaim::Claimed { .. } => Ok(()),
+        ContinuationClaim::BudgetExhausted => Err(bt_core::BelltowerError::Protocol(
+            "session budget exhausted; adjust the session budget before resuming work".to_owned(),
+        )),
+        ContinuationClaim::CancelPending => Err(bt_core::BelltowerError::Protocol(
+            "session cancellation is pending; resumed work was not started".to_owned(),
+        )),
+        ContinuationClaim::Busy => Err(bt_core::BelltowerError::InvalidState(
+            "session already has an active turn; resumed work was not started".to_owned(),
+        )),
+        ContinuationClaim::Stale => Err(bt_core::BelltowerError::InvalidState(
+            "pending tool call changed before resumed work could start".to_owned(),
+        )),
     }
 }
 

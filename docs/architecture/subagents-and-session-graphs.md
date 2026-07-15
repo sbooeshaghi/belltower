@@ -173,6 +173,12 @@ The important rule is:
 - session lineage must be represented as canonical events and canonical session metadata
 - never as a hidden runtime side channel
 
+Current manual spawn preserves that rule atomically. The child session row,
+initial settings snapshot, root branch, parent `session.spawn.requested`, child
+`session.started` and `session.handoff.recorded`, and parent `session.spawned`
+either all commit or all roll back. The parent turn id is causal provenance and
+does not grant permission to append new live evidence to a completed turn.
+
 ## Spawn Contract
 
 Spawning a child session should require a structured contract, not just a free-form prompt.

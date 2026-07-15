@@ -8,9 +8,10 @@ use super::{
     steer_resolution_status, storage_error,
 };
 use bt_core::{
-    BudgetConfig, CostBreakdown, EventEnvelope, EventPayload, Result, SessionId, TokenUsage,
+    BelltowerError, BudgetConfig, CostBreakdown, EventEnvelope, EventPayload, Result, SessionId,
+    TokenUsage,
 };
-use rusqlite::{Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use time::OffsetDateTime;
 
 impl SqliteSessionStore {
@@ -56,7 +57,7 @@ impl SqliteSessionStore {
             "INSERT INTO session_budget_projection (
                 session_id, max_wall_clock_seconds, max_tokens, max_turns, max_cost_usd,
                 tokens_used, turns_used, elapsed_seconds, cost_used_usd, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 0, NULL, ?6)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 0, 0.0, ?6)
             ON CONFLICT(session_id) DO UPDATE SET
                 max_wall_clock_seconds = excluded.max_wall_clock_seconds,
                 max_tokens = excluded.max_tokens,
@@ -80,41 +81,63 @@ impl SqliteSessionStore {
         tx: &Transaction<'_>,
         session_id: SessionId,
         occurred_at: OffsetDateTime,
-        budget: &BudgetConfig,
         tokens_used: u64,
         turns_used: u32,
         elapsed_seconds: u64,
         cost_used_usd: Option<f64>,
     ) -> Result<()> {
-        tx.execute(
-            "INSERT INTO session_budget_projection (
-                session_id, max_wall_clock_seconds, max_tokens, max_turns, max_cost_usd,
-                tokens_used, turns_used, elapsed_seconds, cost_used_usd, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            ON CONFLICT(session_id) DO UPDATE SET
-                max_wall_clock_seconds = excluded.max_wall_clock_seconds,
-                max_tokens = excluded.max_tokens,
-                max_turns = excluded.max_turns,
-                max_cost_usd = excluded.max_cost_usd,
-                tokens_used = excluded.tokens_used,
-                turns_used = excluded.turns_used,
-                elapsed_seconds = excluded.elapsed_seconds,
-                cost_used_usd = excluded.cost_used_usd,
-                updated_at = excluded.updated_at",
-            params![
-                session_id.to_string(),
-                budget.max_wall_clock_seconds.map(|value| value as i64),
-                budget.max_tokens.map(|value| value as i64),
-                budget.max_turns.map(i64::from),
-                budget.max_cost_usd,
-                tokens_used as i64,
-                i64::from(turns_used),
-                elapsed_seconds as i64,
-                cost_used_usd,
-                format_time(occurred_at)?,
-            ],
-        )
-        .map_err(storage_error)?;
+        let current = tx
+            .query_row(
+                "SELECT tokens_used, turns_used, elapsed_seconds, cost_used_usd
+                 FROM session_budget_projection WHERE session_id = ?1",
+                params![session_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?.max(0) as u64,
+                        row.get::<_, i64>(1)?.max(0) as u32,
+                        row.get::<_, i64>(2)?.max(0) as u64,
+                        row.get::<_, Option<f64>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| {
+                BelltowerError::InvalidState(
+                    "budget checkpoint requires a prior budget configuration".to_owned(),
+                )
+            })?;
+        let cost_regressed = match (current.3, cost_used_usd) {
+            (Some(current), Some(next)) => next < current,
+            (None, Some(_)) => true,
+            (Some(_), None) | (None, None) => false,
+        };
+        if tokens_used < current.0
+            || turns_used < current.1
+            || elapsed_seconds < current.2
+            || cost_regressed
+        {
+            return Err(BelltowerError::InvalidState(
+                "budget checkpoint counters must be monotonic".to_owned(),
+            ));
+        }
+        let updated = tx
+            .execute(
+                "UPDATE session_budget_projection
+                 SET tokens_used = ?1, turns_used = ?2, elapsed_seconds = ?3,
+                     cost_used_usd = ?4, updated_at = ?5
+                 WHERE session_id = ?6",
+                params![
+                    tokens_used as i64,
+                    i64::from(turns_used),
+                    elapsed_seconds as i64,
+                    cost_used_usd,
+                    format_time(occurred_at)?,
+                    session_id.to_string(),
+                ],
+            )
+            .map_err(storage_error)?;
+        debug_assert_eq!(updated, 1);
         Ok(())
     }
 
@@ -245,13 +268,16 @@ impl SqliteSessionStore {
                 let request_snapshot_json =
                     snapshot.as_ref().map(serde_json::to_string).transpose()?;
                 tx.execute(
-                    "INSERT INTO approval_projection (session_id, call_id, tool_name, status, request_fingerprint, request_snapshot_json, decision_json, resolution_json, updated_at)
-                     VALUES (?1, ?2, ?3, 'pending', ?4, ?5, NULL, NULL, ?6)
-                     ON CONFLICT(session_id, call_id) DO UPDATE SET status = 'pending', tool_name = excluded.tool_name, request_fingerprint = excluded.request_fingerprint, request_snapshot_json = excluded.request_snapshot_json, decision_json = NULL, resolution_json = NULL, updated_at = excluded.updated_at",
+                    "INSERT INTO approval_projection (session_id, call_id, tool_name, status, branch_id, turn_id, requested_seq_id, request_fingerprint, request_snapshot_json, decision_json, resolution_json, updated_at)
+                     VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9)
+                     ON CONFLICT(session_id, call_id) DO UPDATE SET status = 'pending', tool_name = excluded.tool_name, branch_id = excluded.branch_id, turn_id = excluded.turn_id, requested_seq_id = excluded.requested_seq_id, request_fingerprint = excluded.request_fingerprint, request_snapshot_json = excluded.request_snapshot_json, decision_json = NULL, resolution_json = NULL, updated_at = excluded.updated_at",
                     params![
                         event.session_id.to_string(),
                         call_id.to_string(),
                         tool_name,
+                        event.branch_id.to_string(),
+                        event.turn_id.map(|turn_id| turn_id.to_string()),
+                        seq_id,
                         request_fingerprint,
                         request_snapshot_json,
                         format_time(event.occurred_at)?
@@ -299,13 +325,16 @@ impl SqliteSessionStore {
                 )
                 .map_err(storage_error)?;
                 tx.execute(
-                    "INSERT INTO tool_run_projection (session_id, call_id, tool_name, status, arguments_json, result_json, updated_at)
-                     VALUES (?1, ?2, ?3, 'requested', ?4, NULL, ?5)
-                     ON CONFLICT(session_id, call_id) DO UPDATE SET tool_name = excluded.tool_name, status = 'requested', arguments_json = excluded.arguments_json, result_json = NULL, updated_at = excluded.updated_at",
+                    "INSERT INTO tool_run_projection (session_id, call_id, tool_name, status, branch_id, turn_id, requested_seq_id, arguments_json, result_json, updated_at)
+                     VALUES (?1, ?2, ?3, 'requested', ?4, ?5, ?6, ?7, NULL, ?8)
+                     ON CONFLICT(session_id, call_id) DO UPDATE SET tool_name = excluded.tool_name, status = 'requested', branch_id = excluded.branch_id, turn_id = excluded.turn_id, requested_seq_id = excluded.requested_seq_id, arguments_json = excluded.arguments_json, result_json = NULL, updated_at = excluded.updated_at",
                     params![
                         event.session_id.to_string(),
                         call_id.to_string(),
                         tool_name,
+                        event.branch_id.to_string(),
+                        event.turn_id.map(|turn_id| turn_id.to_string()),
+                        seq_id,
                         serde_json::to_string(arguments)?,
                         format_time(event.occurred_at)?
                     ],
@@ -353,12 +382,30 @@ impl SqliteSessionStore {
                 model_id,
                 tool_mode,
             } => {
-                let current = tx
+                if *settings_revision_id == 0 {
+                    return Err(BelltowerError::InvalidState(
+                        "session settings revision must be positive".to_owned(),
+                    ));
+                }
+                let current_settings_revision_id = tx
                     .query_row(
-                        "SELECT connection_id, model_id, tool_mode
+                        "SELECT settings_revision_id
                          FROM sessions
                          WHERE session_id = ?1",
                         params![event.session_id.to_string()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(storage_error)?
+                    .max(1) as u64;
+                let connection_id = connection_id.clone();
+                let model_id = model_id.clone();
+                let tool_mode = tool_mode.clone();
+                let existing = tx
+                    .query_row(
+                        "SELECT connection_id, model_id, tool_mode
+                         FROM session_settings_revision_projection
+                         WHERE session_id = ?1 AND settings_revision_id = ?2",
+                        params![event.session_id.to_string(), *settings_revision_id as i64,],
                         |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
@@ -367,43 +414,48 @@ impl SqliteSessionStore {
                             ))
                         },
                     )
+                    .optional()
                     .map_err(storage_error)?;
-                let connection_id = connection_id.clone().unwrap_or(current.0);
-                let model_id = model_id.clone();
-                let tool_mode = tool_mode.clone().unwrap_or(current.2);
-                tx.execute(
-                    "UPDATE sessions
-                     SET connection_id = ?1, model_id = ?2, tool_mode = ?3, settings_revision_id = ?4, updated_at = ?5
-                     WHERE session_id = ?6",
-                    params![
-                        connection_id,
-                        model_id,
-                        tool_mode,
-                        *settings_revision_id as i64,
-                        format_time(event.occurred_at)?,
-                        event.session_id.to_string(),
-                    ],
-                )
-                .map_err(storage_error)?;
-                tx.execute(
-                    "INSERT INTO session_settings_revision_projection (
-                        session_id, settings_revision_id, connection_id, model_id, tool_mode, updated_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                    ON CONFLICT(session_id, settings_revision_id) DO UPDATE SET
-                        connection_id = excluded.connection_id,
-                        model_id = excluded.model_id,
-                        tool_mode = excluded.tool_mode,
-                        updated_at = excluded.updated_at",
-                    params![
-                        event.session_id.to_string(),
-                        *settings_revision_id as i64,
-                        connection_id,
-                        model_id,
-                        tool_mode,
-                        format_time(event.occurred_at)?,
-                    ],
-                )
-                .map_err(storage_error)?;
+                if let Some(existing) = existing {
+                    if existing != (connection_id.clone(), model_id.clone(), tool_mode.clone()) {
+                        return Err(BelltowerError::InvalidState(format!(
+                            "session settings revision {} is immutable",
+                            settings_revision_id
+                        )));
+                    }
+                } else {
+                    tx.execute(
+                        "INSERT INTO session_settings_revision_projection (
+                            session_id, settings_revision_id, connection_id, model_id, tool_mode, updated_at
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            event.session_id.to_string(),
+                            *settings_revision_id as i64,
+                            connection_id,
+                            model_id,
+                            tool_mode,
+                            format_time(event.occurred_at)?,
+                        ],
+                    )
+                    .map_err(storage_error)?;
+                }
+                if *settings_revision_id > current_settings_revision_id {
+                    tx.execute(
+                        "UPDATE sessions
+                         SET connection_id = ?1, model_id = ?2, tool_mode = ?3,
+                             settings_revision_id = ?4, updated_at = ?5
+                         WHERE session_id = ?6",
+                        params![
+                            connection_id,
+                            model_id,
+                            tool_mode,
+                            *settings_revision_id as i64,
+                            format_time(event.occurred_at)?,
+                            event.session_id.to_string(),
+                        ],
+                    )
+                    .map_err(storage_error)?;
+                }
             }
             EventPayload::SessionQueuedMessageEnqueued {
                 message,
@@ -467,24 +519,14 @@ impl SqliteSessionStore {
             }
             EventPayload::BudgetCheckpoint {
                 tokens_used,
-                max_tokens,
                 turns_used,
-                max_turns,
                 elapsed_seconds,
-                max_wall_clock_seconds,
                 cost_used_usd,
-                max_cost_usd,
             } => {
                 Self::refresh_budget_projection_from_checkpoint(
                     tx,
                     event.session_id,
                     event.occurred_at,
-                    &BudgetConfig {
-                        max_wall_clock_seconds: *max_wall_clock_seconds,
-                        max_tokens: *max_tokens,
-                        max_turns: *max_turns,
-                        max_cost_usd: *max_cost_usd,
-                    },
                     *tokens_used,
                     *turns_used,
                     *elapsed_seconds,

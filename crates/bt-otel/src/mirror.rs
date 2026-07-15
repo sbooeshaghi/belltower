@@ -252,7 +252,7 @@ pub(crate) fn mirrored_event_fields(event: &EventEnvelope) -> MirroredEventField
             ..
         } => {
             fields.settings_revision_id = Some(*settings_revision_id);
-            fields.provider = connection_id.clone();
+            fields.provider = Some(connection_id.clone());
             fields.model = model_id.clone();
         }
         EventPayload::SessionEnded { reason }
@@ -522,23 +522,15 @@ pub(crate) fn mirrored_event_fields(event: &EventEnvelope) -> MirroredEventField
         }
         EventPayload::BudgetCheckpoint {
             tokens_used,
-            max_tokens,
             turns_used,
-            max_turns,
             elapsed_seconds,
-            max_wall_clock_seconds,
             cost_used_usd,
-            max_cost_usd,
         } => {
             fields.tokens_after = Some(*tokens_used);
             fields.text_preview = Some(truncate_string(&format!(
-                "turns_used={turns_used} max_turns={max_turns:?} elapsed_seconds={elapsed_seconds} max_wall_clock_seconds={max_wall_clock_seconds:?}"
+                "turns_used={turns_used} elapsed_seconds={elapsed_seconds}"
             )));
             fields.cost_total_usd = *cost_used_usd;
-            fields.status = max_tokens.map(|max_tokens| format!("max_tokens={max_tokens}"));
-            if let Some(max_cost_usd) = max_cost_usd {
-                fields.finish_reason = Some(format!("max_cost_usd={max_cost_usd}"));
-            }
         }
         EventPayload::SessionSteersResolved {
             steer_event_ids,

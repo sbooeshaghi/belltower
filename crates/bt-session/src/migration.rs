@@ -11,6 +11,9 @@ CREATE TABLE IF NOT EXISTS approval_projection (
     call_id         TEXT NOT NULL,
     tool_name       TEXT NOT NULL,
     status          TEXT NOT NULL,
+    branch_id       TEXT,
+    turn_id         TEXT,
+    requested_seq_id INTEGER,
     request_fingerprint TEXT,
     request_snapshot_json TEXT,
     decision_json   TEXT,
@@ -24,6 +27,9 @@ CREATE TABLE IF NOT EXISTS tool_run_projection (
     call_id         TEXT NOT NULL,
     tool_name       TEXT NOT NULL,
     status          TEXT NOT NULL,
+    branch_id       TEXT,
+    turn_id         TEXT,
+    requested_seq_id INTEGER,
     arguments_json  TEXT,
     result_json     TEXT,
     updated_at      TEXT NOT NULL,
@@ -360,6 +366,15 @@ pub fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
          FROM sessions",
         [],
     )?;
+    connection.execute(
+        "UPDATE session_budget_projection
+         SET cost_used_usd = 0.0
+         WHERE cost_used_usd IS NULL
+           AND tokens_used = 0
+           AND turns_used = 0
+           AND elapsed_seconds = 0",
+        [],
+    )?;
     drop_column_if_exists(connection, "sessions", "trace_id")?;
     drop_column_if_exists(connection, "events", "trace_id")?;
     rewrite_legacy_event_json_without_trace_id(connection)?;
@@ -458,6 +473,16 @@ fn rebuild_active_turn_projection(connection: &Connection) -> rusqlite::Result<(
 fn cut_over_tool_and_approval_projection_identity(connection: &Connection) -> rusqlite::Result<()> {
     if table_has_composite_primary_key(connection, "approval_projection")?
         && table_has_composite_primary_key(connection, "tool_run_projection")?
+        && table_has_columns(
+            connection,
+            "approval_projection",
+            &["branch_id", "turn_id", "requested_seq_id"],
+        )?
+        && table_has_columns(
+            connection,
+            "tool_run_projection",
+            &["branch_id", "turn_id", "requested_seq_id"],
+        )?
     {
         return Ok(());
     }
@@ -481,6 +506,20 @@ fn cut_over_tool_and_approval_projection_identity(connection: &Connection) -> ru
     }
 }
 
+fn table_has_columns(
+    connection: &Connection,
+    table: &str,
+    required: &[&str],
+) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(required
+        .iter()
+        .all(|required| columns.iter().any(|column| column == required)))
+}
+
 fn table_has_composite_primary_key(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = statement.query([])?;
@@ -498,12 +537,14 @@ fn table_has_composite_primary_key(connection: &Connection, table: &str) -> rusq
 fn rebuild_tool_and_approval_projections(connection: &Connection) -> rusqlite::Result<()> {
     let event_jsons = {
         let mut statement =
-            connection.prepare("SELECT event_json FROM events ORDER BY seq_id ASC")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            connection.prepare("SELECT seq_id, event_json FROM events ORDER BY seq_id ASC")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    for event_json in event_jsons {
+    for (seq_id, event_json) in event_jsons {
         let event: EventEnvelope = serde_json::from_str(&event_json)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         let updated_at = event
@@ -526,13 +567,16 @@ fn rebuild_tool_and_approval_projections(connection: &Connection) -> rusqlite::R
                     .transpose()
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
                 connection.execute(
-                    "INSERT INTO approval_projection (session_id, call_id, tool_name, status, request_fingerprint, request_snapshot_json, decision_json, resolution_json, updated_at)
-                     VALUES (?1, ?2, ?3, 'pending', ?4, ?5, NULL, NULL, ?6)
-                     ON CONFLICT(session_id, call_id) DO UPDATE SET status = 'pending', tool_name = excluded.tool_name, request_fingerprint = excluded.request_fingerprint, request_snapshot_json = excluded.request_snapshot_json, updated_at = excluded.updated_at",
+                    "INSERT INTO approval_projection (session_id, call_id, tool_name, status, branch_id, turn_id, requested_seq_id, request_fingerprint, request_snapshot_json, decision_json, resolution_json, updated_at)
+                     VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9)
+                     ON CONFLICT(session_id, call_id) DO UPDATE SET status = 'pending', tool_name = excluded.tool_name, branch_id = excluded.branch_id, turn_id = excluded.turn_id, requested_seq_id = excluded.requested_seq_id, request_fingerprint = excluded.request_fingerprint, request_snapshot_json = excluded.request_snapshot_json, decision_json = NULL, resolution_json = NULL, updated_at = excluded.updated_at",
                     params![
                         event.session_id.to_string(),
                         call_id.to_string(),
                         tool_name,
+                        event.branch_id.to_string(),
+                        event.turn_id.map(|turn_id| turn_id.to_string()),
+                        seq_id,
                         request_fingerprint,
                         request_snapshot_json,
                         updated_at,
@@ -577,13 +621,16 @@ fn rebuild_tool_and_approval_projections(connection: &Connection) -> rusqlite::R
                 arguments,
             } => {
                 connection.execute(
-                    "INSERT INTO tool_run_projection (session_id, call_id, tool_name, status, arguments_json, result_json, updated_at)
-                     VALUES (?1, ?2, ?3, 'requested', ?4, NULL, ?5)
-                     ON CONFLICT(session_id, call_id) DO UPDATE SET status = 'requested', arguments_json = excluded.arguments_json, updated_at = excluded.updated_at",
+                    "INSERT INTO tool_run_projection (session_id, call_id, tool_name, status, branch_id, turn_id, requested_seq_id, arguments_json, result_json, updated_at)
+                     VALUES (?1, ?2, ?3, 'requested', ?4, ?5, ?6, ?7, NULL, ?8)
+                     ON CONFLICT(session_id, call_id) DO UPDATE SET tool_name = excluded.tool_name, status = 'requested', branch_id = excluded.branch_id, turn_id = excluded.turn_id, requested_seq_id = excluded.requested_seq_id, arguments_json = excluded.arguments_json, result_json = NULL, updated_at = excluded.updated_at",
                     params![
                         event.session_id.to_string(),
                         call_id.to_string(),
                         tool_name,
+                        event.branch_id.to_string(),
+                        event.turn_id.map(|turn_id| turn_id.to_string()),
+                        seq_id,
                         serde_json::to_string(arguments).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
                         updated_at,
                     ],

@@ -104,9 +104,9 @@ pub enum EventPayload {
     SessionSettingsUpdated {
         #[serde(default = "default_settings_revision_id")]
         settings_revision_id: u64,
-        connection_id: Option<String>,
+        connection_id: String,
         model_id: Option<String>,
-        tool_mode: Option<String>,
+        tool_mode: String,
     },
     SessionEnded {
         reason: String,
@@ -252,13 +252,9 @@ pub enum EventPayload {
     },
     BudgetCheckpoint {
         tokens_used: u64,
-        max_tokens: Option<u64>,
         turns_used: u32,
-        max_turns: Option<u32>,
         elapsed_seconds: u64,
-        max_wall_clock_seconds: Option<u64>,
         cost_used_usd: Option<f64>,
-        max_cost_usd: Option<f64>,
     },
     SessionQueuedMessageEnqueued {
         message: Message,

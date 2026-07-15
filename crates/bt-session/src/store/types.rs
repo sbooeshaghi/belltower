@@ -5,8 +5,8 @@
 
 use bt_core::{
     ApprovalDecision, ApprovalRequestSnapshot, ApprovalResolution, BranchId, BudgetConfig,
-    ContextManifest, EventId, Message, PlanItem, SessionId, SessionToolMode, ToolCallId, TurnId,
-    TurnStartSource,
+    ContextManifest, EventEnvelope, EventId, Message, PlanItem, SessionId, SessionRecord,
+    SessionToolMode, ToolCallId, TurnId, TurnStartSource,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -44,6 +44,9 @@ pub struct ApprovalProjection {
     pub session_id: SessionId,
     pub tool_name: String,
     pub status: String,
+    pub branch_id: Option<BranchId>,
+    pub turn_id: Option<TurnId>,
+    pub requested_seq_id: Option<i64>,
     pub request_fingerprint: Option<String>,
     pub request_snapshot: Option<ApprovalRequestSnapshot>,
     pub decision: Option<ApprovalDecision>,
@@ -107,6 +110,9 @@ pub struct ToolRunProjection {
     pub session_id: SessionId,
     pub tool_name: String,
     pub status: String,
+    pub branch_id: Option<BranchId>,
+    pub turn_id: Option<TurnId>,
+    pub requested_seq_id: Option<i64>,
     pub arguments: Option<Value>,
     pub result: Option<Value>,
     pub updated_at: OffsetDateTime,
@@ -172,6 +178,28 @@ pub struct SessionSettingsRevisionProjection {
     pub updated_at: OffsetDateTime,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommittedSessionSettingsUpdate {
+    pub session: SessionRecord,
+    pub event: EventEnvelope,
+    pub seq_id: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedBudgetCheckpoint {
+    pub checkpoint_seq_id: i64,
+    pub cancellation_seq_id: Option<i64>,
+    pub terminal_seq_ids: Vec<i64>,
+    pub exhausted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedBudgetConfiguration {
+    pub configuration_seq_id: i64,
+    pub cancellation_seq_id: Option<i64>,
+    pub exhausted: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnRecoveryRecord {
     pub session_id: SessionId,
@@ -211,14 +239,22 @@ pub enum SessionTurnAdmission {
     Started { seq_ids: Vec<i64> },
     Queued { seq_ids: Vec<i64>, position: usize },
     RetryWithSettings { settings_revision_id: u64 },
+    BudgetExhausted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContinuationClaim {
     Claimed { seq_ids: Vec<i64> },
     Busy,
+    BudgetExhausted,
     CancelPending,
     Stale,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumedContinuationKind {
+    Approval,
+    Input,
 }
 
 #[derive(Clone, Debug, PartialEq)]

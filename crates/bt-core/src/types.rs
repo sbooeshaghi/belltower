@@ -84,6 +84,29 @@ pub struct BudgetConfig {
     pub max_cost_usd: Option<f64>,
 }
 
+impl BudgetConfig {
+    #[must_use]
+    pub fn is_exhausted(
+        &self,
+        tokens_used: u64,
+        turns_used: u32,
+        elapsed_seconds: u64,
+        cost_used_usd: Option<f64>,
+    ) -> bool {
+        self.max_tokens
+            .is_some_and(|max_tokens| tokens_used >= max_tokens)
+            || self
+                .max_turns
+                .is_some_and(|max_turns| turns_used >= max_turns)
+            || self
+                .max_wall_clock_seconds
+                .is_some_and(|max_elapsed| elapsed_seconds >= max_elapsed)
+            || self
+                .max_cost_usd
+                .is_some_and(|max_cost| cost_used_usd.is_none_or(|used| used >= max_cost))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StructuredOutputSpec {
     pub schema_name: Option<String>,

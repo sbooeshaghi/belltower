@@ -584,18 +584,7 @@ pub(super) fn budget_exhausted(
     elapsed_seconds: u64,
     cost_used_usd: Option<f64>,
 ) -> bool {
-    budget
-        .max_tokens
-        .is_some_and(|max_tokens| tokens_used >= max_tokens)
-        || budget
-            .max_turns
-            .is_some_and(|max_turns| turns_used >= max_turns)
-        || budget
-            .max_wall_clock_seconds
-            .is_some_and(|max_elapsed| elapsed_seconds >= max_elapsed)
-        || budget
-            .max_cost_usd
-            .is_some_and(|max_cost| cost_used_usd.is_none_or(|used| used >= max_cost))
+    budget.is_exhausted(tokens_used, turns_used, elapsed_seconds, cost_used_usd)
 }
 
 pub(super) fn ensure_trace_turn<'a>(

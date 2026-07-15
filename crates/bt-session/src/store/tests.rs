@@ -1,6 +1,6 @@
 //! Tests for SQLite session store persistence, projections, replay, and export fidelity.
 
-use super::{ContinuationClaim, SessionTurnAdmission, SqliteSessionStore};
+use super::{ContinuationClaim, ResumedContinuationKind, SessionTurnAdmission, SqliteSessionStore};
 use crate::{
     LEGACY_SESSION_EXPORT_BUNDLE_SCHEMA_VERSION, LegacySessionExporter,
     PortableSessionBundleExporter, PortableSessionBundleImporter, SESSION_BT_ARTIFACTS_DIR,
@@ -11,12 +11,12 @@ use crate::{
     validate_session_bundle_directory,
 };
 use bt_core::{
-    ApprovalDecision, ApprovalDecisionSource, ApprovalScope, BranchRecord, BudgetConfig,
-    CompletionRequest, ConnectionId, ContextManifest, ContextMessageSourceRef, EventEnvelope,
-    EventPayload, InstructionDocument, Message, PortableHash, Role, SessionBundleArtifactMode,
-    SessionBundleManifest, SessionNodeRef, SessionRecord, SessionStatus, SessionToolMode, SpanKind,
-    ToolCallId, ToolResultEnvelope, TurnId, TurnInstructionProvenance, TurnStartSource,
-    default_settings_revision_id,
+    ApprovalDecision, ApprovalDecisionSource, ApprovalScope, BelltowerError, BranchRecord,
+    BudgetConfig, CompletionRequest, ConnectionId, ContextManifest, ContextMessageSourceRef,
+    EventEnvelope, EventPayload, InstructionDocument, Message, PortableHash, Role,
+    SessionBundleArtifactMode, SessionBundleManifest, SessionNodeRef, SessionRecord, SessionStatus,
+    SessionToolMode, SpanKind, ToolCallId, ToolOperationContext, ToolResultEnvelope, TurnId,
+    TurnInstructionProvenance, TurnStartSource, default_settings_revision_id,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -168,6 +168,93 @@ fn migrations_and_session_creation_work() {
         !store
             .session_has_events(session.session_id)
             .expect("event presence")
+    );
+}
+
+#[test]
+fn failed_child_spawn_rolls_back_child_and_workflow_events() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (parent_session, parent_branch) = sample_session();
+    store
+        .create_session(&parent_session, &parent_branch)
+        .expect("create parent session");
+    let (mut child_session, child_branch) = sample_session();
+    child_session.parent_session_id = Some(parent_session.session_id);
+    child_session.parent_branch_id = Some(parent_branch.branch_id);
+    child_session.objective = Some("inspect the evidence".to_owned());
+
+    let spawn_requested = EventEnvelope::new(
+        parent_session.session_id,
+        parent_branch.branch_id,
+        SpanKind::Chain,
+        EventPayload::SessionSpawnRequested {
+            child_session_id: child_session.session_id,
+            objective: "inspect the evidence".to_owned(),
+            connection_id: child_session.connection_id.to_string(),
+            model_id: child_session.model_id.clone(),
+        },
+    );
+    let child_started = EventEnvelope::new(
+        child_session.session_id,
+        child_branch.branch_id,
+        SpanKind::Session,
+        EventPayload::SessionStarted {
+            project_root: child_session.project_root.to_string(),
+            connection_id: child_session.connection_id.to_string(),
+        },
+    );
+    let child_handoff = EventEnvelope::new(
+        child_session.session_id,
+        child_branch.branch_id,
+        SpanKind::Chain,
+        EventPayload::SessionHandoffRecorded {
+            parent_session_id: parent_session.session_id,
+            parent_branch_id: parent_branch.branch_id,
+            parent_turn_id: None,
+            objective: "inspect the evidence".to_owned(),
+            summary: "inspect the evidence".to_owned(),
+        },
+    );
+    let mut spawn_completed = EventEnvelope::new(
+        parent_session.session_id,
+        parent_branch.branch_id,
+        SpanKind::Chain,
+        EventPayload::SessionSpawned {
+            child_session_id: child_session.session_id,
+            child_branch_id: child_branch.branch_id,
+            objective: "inspect the evidence".to_owned(),
+        },
+    );
+    spawn_completed.event_id = spawn_requested.event_id;
+
+    let error = store
+        .commit_child_session_spawn(
+            &child_session,
+            &child_branch,
+            &spawn_requested,
+            &child_started,
+            &child_handoff,
+            &spawn_completed,
+        )
+        .expect_err("duplicate event id must fail the spawn transaction");
+    assert!(matches!(error, BelltowerError::Storage(_)));
+    assert!(
+        store
+            .load_session(child_session.session_id)
+            .expect("child lookup")
+            .is_none()
+    );
+    assert!(
+        store
+            .load_all_events(parent_session.session_id)
+            .expect("parent events")
+            .is_empty()
+    );
+    assert!(
+        store
+            .load_all_events(child_session.session_id)
+            .expect("child events")
+            .is_empty()
     );
 }
 
@@ -677,6 +764,249 @@ fn turn_admission_retries_stale_settings_without_appending_events() {
             .session_has_events(session.session_id)
             .expect("event presence")
     );
+}
+
+#[test]
+fn exhausted_budget_blocks_direct_and_continuation_claims_without_consuming_work() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    store
+        .append_event(&EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Session,
+            EventPayload::BudgetConfigured {
+                budget: BudgetConfig {
+                    max_wall_clock_seconds: None,
+                    max_tokens: None,
+                    max_turns: Some(0),
+                    max_cost_usd: None,
+                },
+            },
+        ))
+        .expect("configure exhausted budget");
+
+    let direct_turn_id = TurnId::new();
+    let admission = store
+        .admit_turn_or_queue(
+            session.session_id,
+            session.settings_revision_id,
+            &cancel_clear_event(&session, &branch),
+            &[
+                EventEnvelope::new(
+                    session.session_id,
+                    branch.branch_id,
+                    SpanKind::Agent,
+                    EventPayload::MessageAppended {
+                        message: Message::text(Role::User, "blocked direct work"),
+                    },
+                )
+                .with_turn_id(direct_turn_id),
+                turn_started_event(&session, &branch, direct_turn_id),
+            ],
+            &[queued_message_event(
+                &session,
+                &branch,
+                "blocked direct work",
+            )],
+        )
+        .expect("evaluate direct admission");
+    assert_eq!(admission, SessionTurnAdmission::BudgetExhausted);
+
+    let queued = queued_message_event(&session, &branch, "queued work");
+    let queue_event_id = queued.event_id;
+    store.append_event(&queued).expect("queue work");
+    let queued_turn_id = TurnId::new();
+    let queued_claim = store
+        .claim_queued_continuation(
+            session.session_id,
+            queue_event_id,
+            &[
+                EventEnvelope::new(
+                    session.session_id,
+                    branch.branch_id,
+                    SpanKind::Agent,
+                    EventPayload::SessionQueuedMessageResolved {
+                        queue_event_id,
+                        outcome: bt_core::QueuedMessageResolutionOutcome::Dispatched,
+                        reason: Some("test dispatch".to_owned()),
+                    },
+                ),
+                EventEnvelope::new(
+                    session.session_id,
+                    branch.branch_id,
+                    SpanKind::Agent,
+                    EventPayload::MessageAppended {
+                        message: Message::text(Role::User, "queued work"),
+                    },
+                )
+                .with_turn_id(queued_turn_id),
+                turn_started_event_with_source(
+                    &session,
+                    &branch,
+                    queued_turn_id,
+                    TurnStartSource::QueuedFollowUp,
+                ),
+            ],
+        )
+        .expect("evaluate queue claim");
+    assert_eq!(queued_claim, ContinuationClaim::BudgetExhausted);
+
+    let steer = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::SessionSteered {
+            message: "steered work".to_owned(),
+            settings_revision_id: session.settings_revision_id,
+        },
+    );
+    let steer_event_id = steer.event_id;
+    store.append_event(&steer).expect("steer work");
+    let steer_turn_id = TurnId::new();
+    let steer_claim = store
+        .claim_steer_continuation(
+            session.session_id,
+            branch.branch_id,
+            &[steer_event_id],
+            &[
+                EventEnvelope::new(
+                    session.session_id,
+                    branch.branch_id,
+                    SpanKind::Agent,
+                    EventPayload::SessionSteersResolved {
+                        steer_event_ids: vec![steer_event_id],
+                        outcome: bt_core::SteerResolutionOutcome::Applied,
+                        combined_message: Some("steered work".to_owned()),
+                        reason: None,
+                    },
+                ),
+                EventEnvelope::new(
+                    session.session_id,
+                    branch.branch_id,
+                    SpanKind::Agent,
+                    EventPayload::MessageAppended {
+                        message: Message::text(Role::User, "steered work"),
+                    },
+                )
+                .with_turn_id(steer_turn_id),
+                turn_started_event_with_source(
+                    &session,
+                    &branch,
+                    steer_turn_id,
+                    TurnStartSource::SteerFollowUp,
+                ),
+            ],
+        )
+        .expect("evaluate steer claim");
+    assert_eq!(steer_claim, ContinuationClaim::BudgetExhausted);
+
+    assert_eq!(
+        store
+            .load_pending_queued_messages(session.session_id)
+            .expect("pending queue")
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .load_pending_steers(session.session_id)
+            .expect("pending steers")
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .load_session_inspection_metrics(session.session_id)
+            .expect("metrics")
+            .active_turn_count,
+        0
+    );
+}
+
+#[test]
+fn committed_settings_updates_allocate_immutable_revisions() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+
+    let first = store
+        .commit_session_settings_update(
+            session.session_id,
+            branch.branch_id,
+            Some(ConnectionId::new("remote")),
+            Some(Some("model-a".to_owned())),
+            None,
+        )
+        .expect("first settings update");
+    assert_eq!(first.session.settings_revision_id, 2);
+    assert_eq!(first.event.seq_id, None);
+
+    let conflicting = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Session,
+        EventPayload::SessionSettingsUpdated {
+            settings_revision_id: 2,
+            connection_id: "different".to_owned(),
+            model_id: Some("different-model".to_owned()),
+            tool_mode: "minimal".to_owned(),
+        },
+    );
+    let error = store
+        .append_event(&conflicting)
+        .expect_err("revision snapshots are immutable");
+    assert!(error.to_string().contains("immutable"));
+
+    let snapshot = store
+        .load_session_settings_revision(session.session_id, 2)
+        .expect("load revision")
+        .expect("revision exists");
+    assert_eq!(snapshot.connection_id, ConnectionId::new("remote"));
+    assert_eq!(snapshot.model_id.as_deref(), Some("model-a"));
+    assert_eq!(snapshot.tool_mode, SessionToolMode::Extended);
+
+    let second = store
+        .commit_session_settings_update(
+            session.session_id,
+            branch.branch_id,
+            None,
+            Some(Some("model-b".to_owned())),
+            Some(SessionToolMode::Standard),
+        )
+        .expect("second settings update");
+    assert_eq!(second.session.settings_revision_id, 3);
+    assert_eq!(second.session.connection_id, ConnectionId::new("remote"));
+    assert_eq!(second.session.model_id.as_deref(), Some("model-b"));
+    assert_eq!(second.session.tool_mode, SessionToolMode::Standard);
+
+    let identical_revision_replay = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Session,
+        first.event.payload.clone(),
+    );
+    store
+        .append_event(&identical_revision_replay)
+        .expect("identical historical revision replay");
+    let current = store
+        .load_session(session.session_id)
+        .expect("load current session")
+        .expect("session exists");
+    assert_eq!(current.settings_revision_id, 3);
+    assert_eq!(current.model_id.as_deref(), Some("model-b"));
+    let replayed = store
+        .load_session_settings_revision(session.session_id, 2)
+        .expect("load replayed revision")
+        .expect("replayed revision exists");
+    assert_eq!(replayed.connection_id, ConnectionId::new("remote"));
+    assert_eq!(replayed.model_id.as_deref(), Some("model-a"));
+    assert_eq!(replayed.tool_mode, SessionToolMode::Extended);
 }
 
 #[test]
@@ -1231,6 +1561,135 @@ fn reused_call_id_projects_only_the_latest_request_instance() {
 }
 
 #[test]
+fn stale_resume_cannot_claim_a_newer_request_with_the_same_call_id() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    let call_id = ToolCallId::new("reused-call-id");
+    let mut request_sequences = Vec::new();
+    let request_turns = [TurnId::new(), TurnId::new()];
+
+    for (turn_id, command) in request_turns.into_iter().zip(["pwd", "ls"]) {
+        store
+            .append_event(&turn_started_event(&session, &branch, turn_id))
+            .expect("start request turn");
+        store
+            .append_event(
+                &EventEnvelope::new(
+                    session.session_id,
+                    branch.branch_id,
+                    SpanKind::Tool,
+                    EventPayload::ToolCallRequested {
+                        call_id: call_id.clone(),
+                        tool_name: "shell".to_owned(),
+                        arguments: serde_json::json!({"command": command}),
+                    },
+                )
+                .with_turn_id(turn_id),
+            )
+            .expect("append tool request");
+        request_sequences.push(
+            store
+                .append_event(
+                    &EventEnvelope::new(
+                        session.session_id,
+                        branch.branch_id,
+                        SpanKind::Tool,
+                        EventPayload::ToolApprovalRequested {
+                            call_id: call_id.clone(),
+                            tool_name: "shell".to_owned(),
+                            snapshot: None,
+                        },
+                    )
+                    .with_turn_id(turn_id),
+                )
+                .expect("append approval request"),
+        );
+        store
+            .append_event(&turn_finished_event(&session, &branch, turn_id))
+            .expect("finish request turn");
+    }
+
+    let approvals = store
+        .load_approvals(session.session_id)
+        .expect("load approvals");
+    let latest = approvals.first().expect("latest approval");
+    assert_eq!(latest.turn_id, Some(request_turns[1]));
+    assert_eq!(latest.requested_seq_id, Some(request_sequences[1]));
+    let event_count = store
+        .load_all_events(session.session_id)
+        .expect("events before stale claim")
+        .len();
+    let resumed_turn_id = TurnId::new();
+    let resume_events = vec![
+        EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::TurnStarted {
+                turn_id: resumed_turn_id,
+                provider: "test".to_owned(),
+                model: "test-model".to_owned(),
+                message_count: 1,
+                settings_revision_id: session.settings_revision_id,
+                source: TurnStartSource::ApprovalResume,
+                resumed_from_call_id: Some(call_id.clone()),
+            },
+        )
+        .with_turn_id(resumed_turn_id),
+        EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Tool,
+            EventPayload::ToolApprovalResolved {
+                call_id: call_id.clone(),
+                tool_name: "shell".to_owned(),
+                request_fingerprint: None,
+                resolution: None,
+                decision: ApprovalDecision::Approved {
+                    decided_at: OffsetDateTime::now_utc(),
+                    decided_by: "operator".to_owned(),
+                    scope: ApprovalScope::Once,
+                    source: ApprovalDecisionSource::Human,
+                },
+            },
+        )
+        .with_turn_id(resumed_turn_id),
+    ];
+
+    let outcome = store
+        .claim_resumed_continuation(
+            session.session_id,
+            branch.branch_id,
+            &call_id,
+            "shell",
+            request_turns[0],
+            request_sequences[0],
+            session.settings_revision_id,
+            ResumedContinuationKind::Approval,
+            &resume_events,
+        )
+        .expect("stale claim result");
+    assert_eq!(outcome, ContinuationClaim::Stale);
+    assert_eq!(
+        store
+            .load_all_events(session.session_id)
+            .expect("events after stale claim")
+            .len(),
+        event_count
+    );
+    let latest = store
+        .load_approvals(session.session_id)
+        .expect("load approval after claim")
+        .pop()
+        .expect("latest approval remains");
+    assert_eq!(latest.status, "pending");
+    assert_eq!(latest.requested_seq_id, Some(request_sequences[1]));
+}
+
+#[test]
 fn migration_rebuilds_tool_and_approval_projections_with_composite_identity() {
     let file = NamedTempFile::new().expect("tempfile");
     let (first_session, first_branch) = sample_session();
@@ -1332,6 +1791,14 @@ fn migration_rebuilds_tool_and_approval_projections_with_composite_identity() {
             .expect("collect primary key columns");
         assert!(primary_key_columns.contains(&("session_id".to_owned(), 1)));
         assert!(primary_key_columns.contains(&("call_id".to_owned(), 2)));
+        for identity_column in ["branch_id", "turn_id", "requested_seq_id"] {
+            assert!(
+                primary_key_columns
+                    .iter()
+                    .any(|(column, _)| column == identity_column),
+                "{table} is missing {identity_column}"
+            );
+        }
     }
 }
 
@@ -1827,13 +2294,9 @@ fn budget_events_update_budget_projection() {
             SpanKind::Session,
             EventPayload::BudgetCheckpoint {
                 tokens_used: 7_500,
-                max_tokens: budget.max_tokens,
                 turns_used: 2,
-                max_turns: budget.max_turns,
                 elapsed_seconds: 45,
-                max_wall_clock_seconds: budget.max_wall_clock_seconds,
                 cost_used_usd: Some(1.25),
-                max_cost_usd: budget.max_cost_usd,
             },
         ))
         .expect("append budget checkpoint");
@@ -1847,6 +2310,598 @@ fn budget_events_update_budget_projection() {
     assert_eq!(projection.turns_used, 2);
     assert_eq!(projection.elapsed_seconds, 45);
     assert_eq!(projection.cost_used_usd, Some(1.25));
+
+    let reconfigured_budget = BudgetConfig {
+        max_turns: Some(12),
+        ..budget
+    };
+    let mut reconfigured = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Session,
+        EventPayload::BudgetConfigured {
+            budget: reconfigured_budget.clone(),
+        },
+    );
+    reconfigured.occurred_at = projection.updated_at + time::Duration::seconds(1);
+    store
+        .append_event(&reconfigured)
+        .expect("append reconfigured budget");
+
+    let reprojected = store
+        .load_session_budget(session.session_id)
+        .expect("reconfigured projection lookup")
+        .expect("reconfigured projection exists");
+    assert_eq!(reprojected.budget, reconfigured_budget);
+    assert_eq!(reprojected.tokens_used, projection.tokens_used);
+    assert_eq!(reprojected.turns_used, projection.turns_used);
+    assert_eq!(reprojected.elapsed_seconds, projection.elapsed_seconds);
+    assert_eq!(reprojected.cost_used_usd, projection.cost_used_usd);
+    assert_eq!(reprojected.updated_at, reconfigured.occurred_at);
+}
+
+#[test]
+fn fresh_cost_budget_starts_at_known_zero_without_cancelling() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    let configuration = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Session,
+        EventPayload::BudgetConfigured {
+            budget: BudgetConfig {
+                max_cost_usd: Some(5.0),
+                ..BudgetConfig::default()
+            },
+        },
+    );
+    let cancellation = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::SessionCancelled {
+            reason: "budget_exhausted".to_owned(),
+        },
+    );
+
+    let committed = store
+        .commit_budget_configuration(&configuration, &cancellation)
+        .expect("configure cost budget");
+    assert!(!committed.exhausted);
+    assert!(committed.cancellation_seq_id.is_none());
+    let projection = store
+        .load_session_budget(session.session_id)
+        .expect("budget lookup")
+        .expect("budget projection");
+    assert_eq!(projection.cost_used_usd, Some(0.0));
+}
+
+#[test]
+fn migration_normalizes_only_fresh_legacy_cost_budgets() {
+    let file = NamedTempFile::new().expect("tempfile");
+    let (fresh_session, fresh_branch) = sample_session();
+    let (used_session, used_branch) = sample_session();
+    {
+        let mut store = SqliteSessionStore::open(file.path()).expect("open store");
+        for (session, branch) in [
+            (&fresh_session, &fresh_branch),
+            (&used_session, &used_branch),
+        ] {
+            store
+                .create_session(session, branch)
+                .expect("create session");
+            store
+                .append_event(&EventEnvelope::new(
+                    session.session_id,
+                    branch.branch_id,
+                    SpanKind::Session,
+                    EventPayload::BudgetConfigured {
+                        budget: BudgetConfig {
+                            max_cost_usd: Some(5.0),
+                            ..BudgetConfig::default()
+                        },
+                    },
+                ))
+                .expect("configure cost budget");
+        }
+        store
+            .connection
+            .execute(
+                "UPDATE session_budget_projection SET cost_used_usd = NULL WHERE session_id = ?1",
+                [fresh_session.session_id.to_string()],
+            )
+            .expect("restore fresh legacy cost state");
+        store
+            .connection
+            .execute(
+                "UPDATE session_budget_projection
+                 SET cost_used_usd = NULL, turns_used = 1
+                 WHERE session_id = ?1",
+                [used_session.session_id.to_string()],
+            )
+            .expect("restore used legacy cost state");
+    }
+
+    let store = SqliteSessionStore::open(file.path()).expect("reopen migrated store");
+    let fresh = store
+        .load_session_budget(fresh_session.session_id)
+        .expect("fresh budget lookup")
+        .expect("fresh budget projection");
+    assert_eq!(fresh.cost_used_usd, Some(0.0));
+    assert!(!fresh.budget.is_exhausted(
+        fresh.tokens_used,
+        fresh.turns_used,
+        fresh.elapsed_seconds,
+        fresh.cost_used_usd,
+    ));
+
+    let used = store
+        .load_session_budget(used_session.session_id)
+        .expect("used budget lookup")
+        .expect("used budget projection");
+    assert_eq!(used.cost_used_usd, None);
+    assert!(used.budget.is_exhausted(
+        used.tokens_used,
+        used.turns_used,
+        used.elapsed_seconds,
+        used.cost_used_usd,
+    ));
+}
+
+#[test]
+fn stale_budget_checkpoint_cannot_regress_durable_counters() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    store
+        .append_event(&EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Session,
+            EventPayload::BudgetConfigured {
+                budget: BudgetConfig::default(),
+            },
+        ))
+        .expect("configure budget");
+    store
+        .append_event(&EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::BudgetCheckpoint {
+                tokens_used: 20,
+                turns_used: 2,
+                elapsed_seconds: 10,
+                cost_used_usd: Some(1.0),
+            },
+        ))
+        .expect("current checkpoint");
+    let event_count = store
+        .load_all_events(session.session_id)
+        .expect("events")
+        .len();
+
+    let error = store
+        .append_event(&EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::BudgetCheckpoint {
+                tokens_used: 10,
+                turns_used: 1,
+                elapsed_seconds: 5,
+                cost_used_usd: Some(0.5),
+            },
+        ))
+        .expect_err("stale checkpoint must fail");
+    assert!(matches!(error, BelltowerError::InvalidState(_)));
+    assert_eq!(
+        store
+            .load_all_events(session.session_id)
+            .expect("events")
+            .len(),
+        event_count
+    );
+    let projection = store
+        .load_session_budget(session.session_id)
+        .expect("budget lookup")
+        .expect("budget projection");
+    assert_eq!(projection.tokens_used, 20);
+    assert_eq!(projection.turns_used, 2);
+    assert_eq!(projection.elapsed_seconds, 10);
+    assert_eq!(projection.cost_used_usd, Some(1.0));
+}
+
+#[test]
+fn budget_checkpoint_uses_current_limits_and_cancels_atomically() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+
+    store
+        .append_event(&EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Session,
+            EventPayload::BudgetConfigured {
+                budget: BudgetConfig {
+                    max_tokens: Some(100),
+                    ..BudgetConfig::default()
+                },
+            },
+        ))
+        .expect("initial budget");
+    let turn_id = TurnId::new();
+    let checkpoint = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::BudgetCheckpoint {
+            tokens_used: 10,
+            turns_used: 1,
+            elapsed_seconds: 1,
+            cost_used_usd: None,
+        },
+    )
+    .with_turn_id(turn_id);
+
+    store
+        .append_event(&EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Session,
+            EventPayload::BudgetConfigured {
+                budget: BudgetConfig {
+                    max_tokens: Some(5),
+                    ..BudgetConfig::default()
+                },
+            },
+        ))
+        .expect("lower budget before checkpoint commit");
+    store
+        .append_event(&turn_started_event(&session, &branch, turn_id))
+        .expect("start owning turn");
+    let cancellation = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::SessionCancelled {
+            reason: "budget_exhausted".to_owned(),
+        },
+    );
+    let committed = store
+        .commit_budget_checkpoint(&checkpoint, &cancellation)
+        .expect("commit checkpoint");
+
+    assert!(committed.exhausted);
+    assert!(committed.cancellation_seq_id.is_some());
+    let projection = store
+        .load_session_budget(session.session_id)
+        .expect("load budget")
+        .expect("budget exists");
+    assert_eq!(projection.budget.max_tokens, Some(5));
+    assert_eq!(projection.tokens_used, 10);
+    assert!(
+        store
+            .load_session_control(session.session_id)
+            .expect("load control")
+            .is_some_and(|control| control.cancel_requested)
+    );
+}
+
+#[test]
+fn budget_terminal_transition_commits_checkpoint_cancel_and_finish_in_order() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    store
+        .append_event(&EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Session,
+            EventPayload::BudgetConfigured {
+                budget: BudgetConfig {
+                    max_turns: Some(1),
+                    ..BudgetConfig::default()
+                },
+            },
+        ))
+        .expect("configure budget");
+    let turn_id = TurnId::new();
+    store
+        .append_event(&turn_started_event(&session, &branch, turn_id))
+        .expect("start turn");
+    let checkpoint = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::BudgetCheckpoint {
+            tokens_used: 20,
+            turns_used: 1,
+            elapsed_seconds: 2,
+            cost_used_usd: Some(0.0),
+        },
+    )
+    .with_turn_id(turn_id);
+    let cancellation = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::SessionCancelled {
+            reason: "budget_exhausted".to_owned(),
+        },
+    );
+    let finish = turn_finished_event(&session, &branch, turn_id);
+
+    let committed = store
+        .commit_budget_terminal_transition(&checkpoint, &cancellation, &[finish])
+        .expect("commit terminal transition");
+
+    let cancellation_seq_id = committed
+        .cancellation_seq_id
+        .expect("budget cancellation must be committed");
+    assert!(committed.checkpoint_seq_id < cancellation_seq_id);
+    assert_eq!(committed.terminal_seq_ids.len(), 1);
+    assert!(cancellation_seq_id < committed.terminal_seq_ids[0]);
+    assert_eq!(
+        store
+            .load_session_inspection_metrics(session.session_id)
+            .expect("metrics")
+            .active_turn_count,
+        0
+    );
+    let events = store
+        .load_all_events(session.session_id)
+        .expect("load events");
+    let terminal_kinds = events
+        .iter()
+        .rev()
+        .take(3)
+        .map(|event| event.kind().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal_kinds,
+        vec![
+            "turn.finished".to_owned(),
+            "session.cancelled".to_owned(),
+            "budget.checkpoint".to_owned(),
+        ]
+    );
+
+    let event_count = events.len();
+    let duplicate_finish = turn_finished_event(&session, &branch, turn_id);
+    let error = store
+        .commit_budget_terminal_transition(&checkpoint, &cancellation, &[duplicate_finish])
+        .expect_err("finished turn cannot commit a second terminal transition");
+    assert!(error.to_string().contains("does not own the active turn"));
+    assert_eq!(
+        store
+            .load_all_events(session.session_id)
+            .expect("load events after rejected duplicate")
+            .len(),
+        event_count
+    );
+
+    let stale_checkpoint_error = store
+        .commit_budget_checkpoint(&checkpoint, &cancellation)
+        .expect_err("finished turn cannot commit a later budget checkpoint");
+    assert!(
+        stale_checkpoint_error
+            .to_string()
+            .contains("does not own the active turn")
+    );
+    assert_eq!(
+        store
+            .load_all_events(session.session_id)
+            .expect("load events after rejected checkpoint")
+            .len(),
+        event_count
+    );
+}
+
+#[test]
+fn unbudgeted_terminal_transition_requires_the_exact_active_turn() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    let turn_id = TurnId::new();
+    store
+        .append_event(&turn_started_event(&session, &branch, turn_id))
+        .expect("start turn");
+    let active_event = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Tool,
+        EventPayload::ToolOperationRecorded {
+            call_id: ToolCallId::new("call-active-owner"),
+            tool_name: "read".to_owned(),
+            operation: ToolOperationContext::default(),
+        },
+    )
+    .with_turn_id(turn_id);
+    store
+        .commit_active_turn_events(
+            session.session_id,
+            branch.branch_id,
+            turn_id,
+            std::slice::from_ref(&active_event),
+        )
+        .expect("active owner can append turn evidence");
+    let finish = turn_finished_event(&session, &branch, turn_id);
+
+    let seq_ids = store
+        .commit_turn_terminal_transition(session.session_id, branch.branch_id, turn_id, &[finish])
+        .expect("commit terminal transition");
+    assert_eq!(seq_ids.len(), 1);
+
+    let duplicate_finish = turn_finished_event(&session, &branch, turn_id);
+    let error = store
+        .commit_turn_terminal_transition(
+            session.session_id,
+            branch.branch_id,
+            turn_id,
+            &[duplicate_finish],
+        )
+        .expect_err("finished turn cannot commit a second terminal transition");
+    assert!(error.to_string().contains("does not own the active turn"));
+
+    let event_count = store
+        .load_all_events(session.session_id)
+        .expect("load events before stale active append")
+        .len();
+    let stale_event = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Tool,
+        EventPayload::ToolOperationRecorded {
+            call_id: ToolCallId::new("call-stale-owner"),
+            tool_name: "shell".to_owned(),
+            operation: ToolOperationContext::default(),
+        },
+    )
+    .with_turn_id(turn_id);
+    let error = store
+        .commit_active_turn_events(
+            session.session_id,
+            branch.branch_id,
+            turn_id,
+            &[stale_event],
+        )
+        .expect_err("finished turn cannot append more active evidence");
+    assert!(error.to_string().contains("does not own the active turn"));
+    assert_eq!(
+        store
+            .load_all_events(session.session_id)
+            .expect("load events after stale active append")
+            .len(),
+        event_count
+    );
+}
+
+#[test]
+fn budget_configuration_is_an_idle_boundary_and_cancels_if_already_exhausted() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    let turn_id = TurnId::new();
+    store
+        .append_event(&turn_started_event(&session, &branch, turn_id))
+        .expect("start turn");
+    let configuration = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::BudgetConfigured {
+            budget: BudgetConfig {
+                max_turns: Some(0),
+                ..BudgetConfig::default()
+            },
+        },
+    );
+    let cancellation = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::SessionCancelled {
+            reason: "budget_exhausted".to_owned(),
+        },
+    );
+
+    let error = store
+        .commit_budget_configuration(&configuration, &cancellation)
+        .expect_err("active budget change must fail");
+    assert!(matches!(error, BelltowerError::InvalidState(_)));
+    assert!(
+        store
+            .load_session_budget(session.session_id)
+            .expect("budget lookup")
+            .is_none()
+    );
+
+    store
+        .append_event(&turn_finished_event(&session, &branch, turn_id))
+        .expect("finish turn");
+    let committed = store
+        .commit_budget_configuration(&configuration, &cancellation)
+        .expect("idle budget configuration");
+    assert!(committed.exhausted);
+    assert!(committed.cancellation_seq_id.is_some());
+    assert!(
+        store
+            .load_session_control(session.session_id)
+            .expect("control lookup")
+            .is_some_and(|control| control.cancel_requested)
+    );
+}
+
+#[test]
+fn exhausted_budget_configuration_records_its_reason_after_operator_cancel() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    store
+        .append_event(&EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::SessionCancelled {
+                reason: "operator_request".to_owned(),
+            },
+        ))
+        .expect("record operator cancellation");
+    let configuration = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::BudgetConfigured {
+            budget: BudgetConfig {
+                max_turns: Some(0),
+                ..BudgetConfig::default()
+            },
+        },
+    );
+    let budget_cancellation = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::SessionCancelled {
+            reason: "budget_exhausted".to_owned(),
+        },
+    );
+
+    let committed = store
+        .commit_budget_configuration(&configuration, &budget_cancellation)
+        .expect("configure exhausted budget");
+    assert!(committed.exhausted);
+    assert!(committed.cancellation_seq_id.is_some());
+    let cancellation_reasons = store
+        .load_all_events(session.session_id)
+        .expect("load events")
+        .into_iter()
+        .filter_map(|event| match event.payload {
+            EventPayload::SessionCancelled { reason } => Some(reason),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cancellation_reasons,
+        vec!["operator_request".to_owned(), "budget_exhausted".to_owned()]
+    );
 }
 
 #[test]
@@ -1880,13 +2935,9 @@ fn budget_reprojection_restores_projection_without_mutating_events() {
             SpanKind::Session,
             EventPayload::BudgetCheckpoint {
                 tokens_used: 4_000,
-                max_tokens: budget.max_tokens,
                 turns_used: 1,
-                max_turns: budget.max_turns,
                 elapsed_seconds: 30,
-                max_wall_clock_seconds: budget.max_wall_clock_seconds,
                 cost_used_usd: Some(0.75),
-                max_cost_usd: budget.max_cost_usd,
             },
         ))
         .expect("append budget checkpoint");
@@ -1941,11 +2992,15 @@ fn raw_chunk_round_trip_works() {
         .create_session(&session, &branch)
         .expect("create session");
 
+    let turn_id = TurnId::new();
+    store
+        .append_event(&turn_started_event(&session, &branch, turn_id))
+        .expect("start raw-chunk turn");
     let chunk_id = store
         .append_raw_chunk(
             session.session_id,
             branch.branch_id,
-            Some(TurnId::new()),
+            Some(turn_id),
             None,
             None,
             "openai-compatible",
@@ -1953,6 +3008,9 @@ fn raw_chunk_round_trip_works() {
             b"{\"hello\":\"world\"}",
         )
         .expect("append raw chunk");
+    store
+        .append_event(&turn_finished_event(&session, &branch, turn_id))
+        .expect("finish raw-chunk turn");
     assert_eq!(chunk_id, 1);
 
     let chunks = store
@@ -1976,6 +3034,9 @@ fn raw_chunk_pages_scope_to_branch_and_turn() {
 
     let turn_a = TurnId::new();
     let turn_b = TurnId::new();
+    store
+        .append_event(&turn_started_event(&session, &branch, turn_a))
+        .expect("start turn a");
 
     for (content, ordinal) in [
         (b"one".as_slice(), Some(1_u32)),
@@ -1996,6 +3057,12 @@ fn raw_chunk_pages_scope_to_branch_and_turn() {
             .expect("append turn-a raw chunk");
     }
     store
+        .append_event(&turn_finished_event(&session, &branch, turn_a))
+        .expect("finish turn a");
+    store
+        .append_event(&turn_started_event(&session, &branch, turn_b))
+        .expect("start turn b");
+    store
         .append_raw_chunk(
             session.session_id,
             branch.branch_id,
@@ -2007,6 +3074,9 @@ fn raw_chunk_pages_scope_to_branch_and_turn() {
             b"other-turn",
         )
         .expect("append turn-b raw chunk");
+    store
+        .append_event(&turn_finished_event(&session, &branch, turn_b))
+        .expect("finish turn b");
 
     let latest = store
         .load_turn_raw_chunks_page(session.session_id, branch.branch_id, turn_a, None, None, 2)
@@ -2064,11 +3134,15 @@ fn export_legacy_bundle_contains_session_branches_messages_events_and_raw_chunks
             },
         ))
         .expect("append event");
+    let turn_id = TurnId::new();
+    store
+        .append_event(&turn_started_event(&session, &branch, turn_id))
+        .expect("start legacy raw-chunk turn");
     store
         .append_raw_chunk(
             session.session_id,
             branch.branch_id,
-            Some(TurnId::new()),
+            Some(turn_id),
             None,
             None,
             "openai-compatible",
@@ -2076,6 +3150,9 @@ fn export_legacy_bundle_contains_session_branches_messages_events_and_raw_chunks
             b"chunk-bytes",
         )
         .expect("append raw chunk");
+    store
+        .append_event(&turn_finished_event(&session, &branch, turn_id))
+        .expect("finish legacy raw-chunk turn");
 
     let bundle = store
         .export_legacy_bundle(session.session_id)
@@ -2088,7 +3165,7 @@ fn export_legacy_bundle_contains_session_branches_messages_events_and_raw_chunks
     assert_eq!(bundle.branches.len(), 1);
     assert_eq!(bundle.message_branch_id, Some(branch.branch_id));
     assert_eq!(bundle.messages.len(), 1);
-    assert_eq!(bundle.events.len(), 1);
+    assert_eq!(bundle.events.len(), 3);
     assert_eq!(bundle.raw_chunks.len(), 1);
 }
 
@@ -2098,7 +3175,7 @@ fn portable_session_bundle_exports_and_validates_offline() {
 
     let report = validate_session_bundle_directory(bundle_dir.path()).expect("validate bundle");
     assert_eq!(report.session_id, session_id);
-    assert_eq!(report.event_count, 2);
+    assert_eq!(report.event_count, 4);
     assert_eq!(report.raw_chunk_count, 1);
     assert_eq!(report.content_count, 1);
 
@@ -2116,8 +3193,11 @@ fn portable_session_bundle_exports_and_validates_offline() {
     let first_event: serde_json::Value =
         serde_json::from_str(event_lines.first().expect("first event")).expect("event json");
     assert!(first_event["event"].get("seq_id").is_none());
-    let chunk_event: serde_json::Value =
-        serde_json::from_str(event_lines.get(1).expect("chunk event")).expect("chunk event json");
+    let chunk_event: serde_json::Value = event_lines
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("event json"))
+        .find(|event: &serde_json::Value| event["event_kind"] == "completion.chunk")
+        .expect("chunk event");
     let chunk_payload = &chunk_event["event"]["payload"]["CompletionChunk"];
     assert!(chunk_payload.get("raw_chunk_index").is_none());
     assert!(
@@ -2139,7 +3219,7 @@ fn portable_session_bundle_import_round_trips_canonical_evidence() {
         .expect("import portable bundle");
     assert_eq!(report.session_id, session_id);
     assert_eq!(report.branch_count, 1);
-    assert_eq!(report.event_count, 2);
+    assert_eq!(report.event_count, 4);
     assert_eq!(report.raw_chunk_count, 1);
 
     let loaded_session = imported
@@ -2154,7 +3234,7 @@ fn portable_session_bundle_import_round_trips_canonical_evidence() {
     );
     assert_eq!(
         imported.load_all_events(session_id).expect("events").len(),
-        2
+        4
     );
     assert_eq!(
         imported
@@ -2247,11 +3327,11 @@ fn portable_session_bundle_import_rolls_back_when_event_denormalization_fails() 
             .expect("manifest json");
     let bundle_hash = manifest.bundle_hash.clone();
     for branch in &mut manifest.branches {
-        if let Some(head) = &mut branch.head
-            && head.event_id == completion_event_id
-        {
+        if let Some(head) = &mut branch.head {
             head.bundle_hash = Some(bundle_hash.clone());
-            head.event_hash = completion_event_hash.clone();
+            if head.event_id == completion_event_id {
+                head.event_hash = completion_event_hash.clone();
+            }
         }
     }
     for range in &mut manifest.event_ranges {
@@ -2550,7 +3630,7 @@ fn portable_session_bundle_diff_reports_equivalent_reexport() {
         report.relationship,
         SessionBundleDiffRelationship::Equivalent
     );
-    assert_eq!(report.common_event_count, 2);
+    assert_eq!(report.common_event_count, 4);
     assert_eq!(report.left_only_event_count, 0);
     assert_eq!(report.right_only_event_count, 0);
     assert!(report.left_only_content_hashes.is_empty());
@@ -2569,7 +3649,7 @@ fn portable_session_bundle_diff_reports_same_lineage_update() {
         report.relationship,
         SessionBundleDiffRelationship::SameLineageUpdate
     );
-    assert_eq!(report.common_event_count, 2);
+    assert_eq!(report.common_event_count, 4);
     assert_eq!(report.left_only_event_count, 0);
     assert_eq!(report.right_only_event_count, 1);
 }
@@ -2587,7 +3667,7 @@ fn portable_session_bundle_diff_reports_fork_divergence() {
         report.relationship,
         SessionBundleDiffRelationship::ForkDivergence
     );
-    assert_eq!(report.common_event_count, 2);
+    assert_eq!(report.common_event_count, 4);
     assert_eq!(report.left_only_event_count, 1);
     assert_eq!(report.right_only_event_count, 1);
 }
@@ -2871,6 +3951,9 @@ fn portable_session_bundle_import_preserves_one_raw_chunk_referenced_by_multiple
         .create_session(&session, &branch)
         .expect("create session");
     let turn_id = TurnId::new();
+    store
+        .append_event(&turn_started_event(&session, &branch, turn_id))
+        .expect("start portable raw-chunk turn");
     let (chunk_id, raw_event, _) = store
         .append_raw_chunk_with_event(
             session.session_id,
@@ -2911,6 +3994,9 @@ fn portable_session_bundle_import_preserves_one_raw_chunk_referenced_by_multiple
             .with_turn_id(turn_id),
         )
         .expect("append completion chunk event");
+    store
+        .append_event(&turn_finished_event(&session, &branch, turn_id))
+        .expect("finish portable raw-chunk turn");
     drop(store);
 
     let reopened = SqliteSessionStore::open(file.path()).expect("reopen store");
@@ -3199,11 +4285,15 @@ fn export_portable_bundle_fixture() -> (tempfile::TempDir, bt_core::SessionId) {
             },
         ))
         .expect("append message");
+    let turn_id = TurnId::new();
+    store
+        .append_event(&turn_started_event(&session, &branch, turn_id))
+        .expect("start portable fixture turn");
     store
         .append_raw_chunk_with_event(
             session.session_id,
             branch.branch_id,
-            Some(TurnId::new()),
+            Some(turn_id),
             Some(1),
             "openai-compatible",
             "completion",
@@ -3218,10 +4308,14 @@ fn export_portable_bundle_fixture() -> (tempfile::TempDir, bt_core::SessionId) {
                         deltas: Vec::new(),
                         raw_chunk_index: Some(chunk_id),
                     },
-                ))
+                )
+                .with_turn_id(turn_id))
             },
         )
         .expect("append raw chunk event");
+    store
+        .append_event(&turn_finished_event(&session, &branch, turn_id))
+        .expect("finish portable fixture turn");
 
     drop(store);
     let reopened = SqliteSessionStore::open(file.path()).expect("reopen store");
@@ -3241,11 +4335,15 @@ fn export_duplicate_raw_content_portable_bundle_fixture() -> (tempfile::TempDir,
         .create_session(&session, &branch)
         .expect("create session");
     for ordinal in 1..=2 {
+        let turn_id = TurnId::new();
+        store
+            .append_event(&turn_started_event(&session, &branch, turn_id))
+            .expect("start duplicate raw-chunk turn");
         store
             .append_raw_chunk_with_event(
                 session.session_id,
                 branch.branch_id,
-                Some(TurnId::new()),
+                Some(turn_id),
                 Some(ordinal),
                 "openai-compatible",
                 "completion",
@@ -3260,10 +4358,14 @@ fn export_duplicate_raw_content_portable_bundle_fixture() -> (tempfile::TempDir,
                             deltas: Vec::new(),
                             raw_chunk_index: Some(chunk_id),
                         },
-                    ))
+                    )
+                    .with_turn_id(turn_id))
                 },
             )
             .expect("append duplicate raw chunk event");
+        store
+            .append_event(&turn_finished_event(&session, &branch, turn_id))
+            .expect("finish duplicate raw-chunk turn");
     }
     drop(store);
 

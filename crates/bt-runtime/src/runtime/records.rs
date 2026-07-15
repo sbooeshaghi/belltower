@@ -35,7 +35,7 @@ impl BelltowerRuntime {
             EventPayload::MessageAppended { message },
         );
         let event = apply_turn_id(event, turn_id);
-        self.append_event(event)
+        self.append_optional_active_turn_event(event, turn_id)
     }
 
     pub fn record_session_spawn_requested(
@@ -60,7 +60,7 @@ impl BelltowerRuntime {
             },
         );
         let event = apply_turn_id(event, turn_id);
-        self.append_event(event)
+        self.append_optional_active_turn_event(event, turn_id)
     }
 
     pub fn record_session_spawned(
@@ -83,7 +83,7 @@ impl BelltowerRuntime {
             },
         );
         let event = apply_turn_id(event, turn_id);
-        self.append_event(event)
+        self.append_optional_active_turn_event(event, turn_id)
     }
 
     pub fn record_session_handoff(
@@ -135,7 +135,7 @@ impl BelltowerRuntime {
             },
         );
         let event = apply_turn_id(event, turn_id);
-        let seq_id = self.append_event(event)?;
+        let seq_id = self.append_optional_active_turn_event(event, turn_id)?;
         self.approvals
             .record_call(session_id, call_id_for_state, decision_for_state)?;
         Ok(seq_id)
@@ -202,7 +202,14 @@ impl BelltowerRuntime {
             },
         );
         let event = apply_turn_id(event, turn_id);
-        let seq_id = self.append_event(event)?;
+        let seq_id = match turn_id {
+            Some(turn_id) => self
+                .append_active_turn_events(session_id, branch_id, turn_id, vec![event])?
+                .into_iter()
+                .next()
+                .expect("one approval resolution event"),
+            None => self.append_event(event)?,
+        };
         Ok((seq_id, request_fingerprint))
     }
 
@@ -225,7 +232,14 @@ impl BelltowerRuntime {
             },
         );
         let event = apply_turn_id(event, turn_id);
-        self.append_event(event)
+        match turn_id {
+            Some(turn_id) => Ok(self
+                .append_active_turn_events(session_id, branch_id, turn_id, vec![event])?
+                .into_iter()
+                .next()
+                .expect("one approval request event")),
+            None => self.append_event(event),
+        }
     }
 
     pub fn record_approval_requested_for_request(
@@ -251,7 +265,14 @@ impl BelltowerRuntime {
             },
         );
         let event = apply_turn_id(event, turn_id);
-        self.append_event(event)
+        match turn_id {
+            Some(turn_id) => Ok(self
+                .append_active_turn_events(session_id, branch_id, turn_id, vec![event])?
+                .into_iter()
+                .next()
+                .expect("one approval request event")),
+            None => self.append_event(event),
+        }
     }
 
     pub fn record_tool_call_requested(
@@ -284,26 +305,40 @@ impl BelltowerRuntime {
         operation: bt_core::ToolOperationContext,
         turn_id: Option<TurnId>,
     ) -> Result<i64> {
-        self.record_tool_operation(
-            session_id,
-            branch_id,
-            call_id.clone(),
-            tool_name.clone(),
-            operation,
-            turn_id,
-        )?;
-        let event = EventEnvelope::new(
-            session_id,
-            branch_id,
-            SpanKind::Tool,
-            EventPayload::ToolCallRequested {
-                call_id,
-                tool_name,
-                arguments,
-            },
-        );
-        let event = apply_turn_id(event, turn_id);
-        self.append_event(event)
+        let events = vec![
+            apply_turn_id(
+                EventEnvelope::new(
+                    session_id,
+                    branch_id,
+                    SpanKind::Tool,
+                    EventPayload::ToolOperationRecorded {
+                        call_id: call_id.clone(),
+                        tool_name: tool_name.clone(),
+                        operation,
+                    },
+                ),
+                turn_id,
+            ),
+            apply_turn_id(
+                EventEnvelope::new(
+                    session_id,
+                    branch_id,
+                    SpanKind::Tool,
+                    EventPayload::ToolCallRequested {
+                        call_id,
+                        tool_name,
+                        arguments,
+                    },
+                ),
+                turn_id,
+            ),
+        ];
+        self.append_optional_active_turn_events(session_id, branch_id, turn_id, events)
+            .map(|seq_ids| {
+                *seq_ids
+                    .last()
+                    .expect("tool request transition contains a request event")
+            })
     }
 
     pub fn record_tool_operation(
@@ -326,7 +361,7 @@ impl BelltowerRuntime {
             },
         );
         let event = apply_turn_id(event, turn_id);
-        self.append_event(event)
+        self.append_optional_active_turn_event(event, turn_id)
     }
 
     pub fn record_tool_execution(
@@ -347,7 +382,7 @@ impl BelltowerRuntime {
             },
         );
         let event = apply_turn_id(event, turn_id);
-        self.append_event(event)
+        self.append_optional_active_turn_event(event, turn_id)
     }
 
     pub fn record_plan_updated(
@@ -364,7 +399,7 @@ impl BelltowerRuntime {
             EventPayload::PlanUpdated { items },
         );
         let event = apply_turn_id(event, turn_id);
-        self.append_event(event)
+        self.append_optional_active_turn_event(event, turn_id)
     }
 
     pub fn record_context_compacted(
@@ -403,9 +438,11 @@ impl BelltowerRuntime {
         );
         let event = apply_turn_id(event, turn_id);
         let event_id = event.event_id;
-        self.append_event(event).map(|seq_id| (seq_id, event_id))
+        self.append_optional_active_turn_event(event, turn_id)
+            .map(|seq_id| (seq_id, event_id))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn append_raw_chunk(
         &self,
         session_id: SessionId,
@@ -513,7 +550,7 @@ impl BelltowerRuntime {
             },
         );
         let event = apply_turn_id(event, turn_id);
-        self.append_event(event)
+        self.append_optional_active_turn_event(event, turn_id)
     }
 
     pub fn record_raw_chunk_persisted(
@@ -538,7 +575,7 @@ impl BelltowerRuntime {
             },
         );
         let event = apply_turn_id(event, turn_id);
-        self.append_event(event)
+        self.append_optional_active_turn_event(event, turn_id)
     }
 
     pub fn record_completion_requested(
@@ -563,7 +600,7 @@ impl BelltowerRuntime {
             },
         );
         let event = event.with_turn_id(turn_id);
-        self.append_event(event)
+        self.append_optional_active_turn_event(event, Some(turn_id))
     }
 
     pub fn record_context_manifest(
@@ -595,7 +632,7 @@ impl BelltowerRuntime {
             "settings.revision_id",
             serde_json::Value::Number(settings_revision_id.into()),
         );
-        self.append_event(event)
+        self.append_optional_active_turn_event(event, Some(turn_id))
     }
 
     pub fn record_completion_finished(
@@ -633,7 +670,7 @@ impl BelltowerRuntime {
             },
         );
         let event = event.with_turn_id(turn_id);
-        self.append_event(event)
+        self.append_optional_active_turn_event(event, Some(turn_id))
     }
 
     pub fn record_session_error(
@@ -668,9 +705,10 @@ impl BelltowerRuntime {
             serde_json::Value::Bool(error.retryable()),
         );
         let event = apply_turn_id(event, turn_id);
-        self.append_event(event)
+        self.append_optional_active_turn_event(event, turn_id)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn record_turn_started(
         &self,
         session_id: SessionId,
@@ -725,9 +763,10 @@ impl BelltowerRuntime {
             "settings.revision_id",
             serde_json::Value::Number(provenance.settings_revision_id.into()),
         );
-        self.append_event(event)
+        self.append_optional_active_turn_event(event, Some(turn_id))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn record_turn_finished(
         &self,
         session_id: SessionId,
@@ -739,6 +778,29 @@ impl BelltowerRuntime {
         finish_reason: Option<String>,
         latency_ms: u64,
     ) -> Result<i64> {
+        self.append_event(self.turn_finished_event(
+            session_id,
+            branch_id,
+            turn_id,
+            provider,
+            model,
+            status,
+            finish_reason,
+            latency_ms,
+        ))
+    }
+
+    pub(super) fn turn_finished_event(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        turn_id: TurnId,
+        provider: String,
+        model: String,
+        status: String,
+        finish_reason: Option<String>,
+        latency_ms: u64,
+    ) -> EventEnvelope {
         let event = EventEnvelope::new(
             session_id,
             branch_id,
@@ -762,15 +824,14 @@ impl BelltowerRuntime {
             serde_json::Value::String(model),
         )
         .with_attribute("turn.status", serde_json::Value::String(status));
-        let event = if let Some(finish_reason) = finish_reason {
+        if let Some(finish_reason) = finish_reason {
             event.with_attribute(
                 "turn.finish_reason",
                 serde_json::Value::String(finish_reason),
             )
         } else {
             event
-        };
-        self.append_event(event)
+        }
     }
 
     pub(super) fn turn_started_event(
@@ -814,6 +875,34 @@ impl BelltowerRuntime {
         self.append_event_with_store_mutation(event, |store, event| store.append_event(event))
     }
 
+    fn append_optional_active_turn_event(
+        &self,
+        event: EventEnvelope,
+        turn_id: Option<TurnId>,
+    ) -> Result<i64> {
+        let session_id = event.session_id;
+        let branch_id = event.branch_id;
+        self.append_optional_active_turn_events(session_id, branch_id, turn_id, vec![event])
+            .map(|seq_ids| {
+                *seq_ids
+                    .first()
+                    .expect("single-event transition returns one sequence id")
+            })
+    }
+
+    fn append_optional_active_turn_events(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        turn_id: Option<TurnId>,
+        events: Vec<EventEnvelope>,
+    ) -> Result<Vec<i64>> {
+        match turn_id {
+            Some(turn_id) => self.append_active_turn_events(session_id, branch_id, turn_id, events),
+            None => self.append_events(events),
+        }
+    }
+
     pub(super) fn append_event_with_store_mutation<F>(
         &self,
         event: EventEnvelope,
@@ -835,7 +924,7 @@ impl BelltowerRuntime {
         Ok(seq_id)
     }
 
-    fn publish_committed_event(&self, mut event: EventEnvelope, seq_id: i64) {
+    pub(super) fn publish_committed_event(&self, mut event: EventEnvelope, seq_id: i64) {
         event.seq_id = Some(seq_id);
         bt_otel::mirror_event(&event);
         let _ = self.event_bus.send(event);
@@ -853,6 +942,28 @@ impl BelltowerRuntime {
             .lock()
             .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
         let seq_ids = store.append_events(&events)?;
+        for (event, seq_id) in events.into_iter().zip(seq_ids.iter().copied()) {
+            self.publish_committed_event(event, seq_id);
+        }
+        Ok(seq_ids)
+    }
+
+    pub(super) fn append_active_turn_events(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        turn_id: TurnId,
+        events: Vec<EventEnvelope>,
+    ) -> Result<Vec<i64>> {
+        for event in &events {
+            self.ensure_session_started(event)?;
+        }
+        self.take_store_append_fault_for_test()?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
+        let seq_ids = store.commit_active_turn_events(session_id, branch_id, turn_id, &events)?;
         for (event, seq_id) in events.into_iter().zip(seq_ids.iter().copied()) {
             self.publish_committed_event(event, seq_id);
         }
@@ -898,7 +1009,8 @@ impl BelltowerRuntime {
                     self.publish_committed_event(event, seq_id);
                 }
             }
-            SessionTurnAdmission::RetryWithSettings { .. } => {}
+            SessionTurnAdmission::RetryWithSettings { .. }
+            | SessionTurnAdmission::BudgetExhausted => {}
         }
         Ok(outcome)
     }
@@ -945,6 +1057,42 @@ impl BelltowerRuntime {
         Ok(outcome)
     }
 
+    pub(super) fn commit_resumed_continuation(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        call_id: &ToolCallId,
+        tool_name: &str,
+        expected_turn_id: TurnId,
+        expected_request_seq_id: i64,
+        settings_revision_id: u64,
+        kind: bt_session::ResumedContinuationKind,
+        events: Vec<EventEnvelope>,
+    ) -> Result<ContinuationClaim> {
+        self.take_store_append_fault_for_test()?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
+        let outcome = store.claim_resumed_continuation(
+            session_id,
+            branch_id,
+            call_id,
+            tool_name,
+            expected_turn_id,
+            expected_request_seq_id,
+            settings_revision_id,
+            kind,
+            &events,
+        )?;
+        if let ContinuationClaim::Claimed { seq_ids } = &outcome {
+            for (event, seq_id) in events.into_iter().zip(seq_ids.iter().copied()) {
+                self.publish_committed_event(event, seq_id);
+            }
+        }
+        Ok(outcome)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     /// Injects a one-shot storage failure for cross-crate invariant tests.
     ///
@@ -959,7 +1107,7 @@ impl BelltowerRuntime {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    fn take_store_append_fault_for_test(&self) -> Result<()> {
+    pub(super) fn take_store_append_fault_for_test(&self) -> Result<()> {
         match self
             .store_append_fault
             .lock()
@@ -972,22 +1120,30 @@ impl BelltowerRuntime {
     }
 
     #[cfg(not(any(test, feature = "test-support")))]
-    fn take_store_append_fault_for_test(&self) -> Result<()> {
+    pub(super) fn take_store_append_fault_for_test(&self) -> Result<()> {
         Ok(())
     }
 
     fn ensure_session_started(&self, event: &EventEnvelope) -> Result<()> {
+        self.ensure_session_started_for(event.session_id, event.branch_id)
+    }
+
+    pub(super) fn ensure_session_started_for(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+    ) -> Result<()> {
         let mut store = self
             .store
             .lock()
             .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
-        if !store.session_has_events(event.session_id)? {
-            let session = store.load_session(event.session_id)?.ok_or_else(|| {
+        if !store.session_has_events(session_id)? {
+            let session = store.load_session(session_id)?.ok_or_else(|| {
                 bt_core::BelltowerError::InvalidState("session not found".to_owned())
             })?;
             let mut started_event = EventEnvelope::new(
                 session.session_id,
-                event.branch_id,
+                branch_id,
                 SpanKind::Session,
                 EventPayload::SessionStarted {
                     project_root: session.project_root.to_string(),

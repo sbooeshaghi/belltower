@@ -2002,9 +2002,8 @@ async fn wall_clock_budget_exhaustion_records_checkpoint_and_persists_cancel_sta
         &event.payload,
         EventPayload::BudgetCheckpoint {
             elapsed_seconds,
-            max_wall_clock_seconds,
             ..
-        } if *elapsed_seconds >= 1 && *max_wall_clock_seconds == Some(1)
+        } if *elapsed_seconds >= 1
     )));
     assert!(events.events.iter().any(|event| matches!(
         &event.payload,
@@ -6960,6 +6959,18 @@ async fn failed_approved_tool_resume_records_one_terminal_transition() {
 
     server
         .runtime
+        .configure_session_budget(
+            session.session_id,
+            branch.branch_id,
+            BudgetConfig {
+                max_turns: Some(1),
+                ..BudgetConfig::default()
+            },
+        )
+        .expect("configure resumed-turn budget");
+
+    server
+        .runtime
         .append_message(&session, &branch, Role::User, "run the unavailable tool")
         .expect("append user message");
     server
@@ -7094,6 +7105,24 @@ async fn failed_approved_tool_resume_records_one_terminal_transition() {
             )
         })
         .expect("failed turn finish");
+    let checkpoint_index = events
+        .iter()
+        .position(|event| {
+            matches!(event.payload, EventPayload::BudgetCheckpoint { .. })
+                && event.turn_id == events[turn_finished_index].turn_id
+        })
+        .expect("resumed failure budget checkpoint");
+    let cancellation_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::SessionCancelled { reason } if reason == "budget_exhausted"
+            )
+        })
+        .expect("resumed failure budget cancellation");
+    assert!(checkpoint_index < cancellation_index);
+    assert!(cancellation_index < terminal_index);
     assert!(terminal_index < result_message_index);
     assert!(result_message_index < session_error_index);
     assert!(session_error_index < turn_finished_index);

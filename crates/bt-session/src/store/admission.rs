@@ -1,7 +1,9 @@
 use bt_core::{
-    BelltowerError, BranchId, EventEnvelope, EventPayload, Result, Role, SessionId, TurnId,
-    TurnStartSource,
+    BelltowerError, BranchId, EventEnvelope, EventPayload, Result, Role, SessionId, ToolCallId,
+    TurnId, TurnStartSource,
 };
+
+use super::types::ResumedContinuationKind;
 
 fn invalid_transition(message: impl Into<String>) -> BelltowerError {
     BelltowerError::InvalidState(message.into())
@@ -243,6 +245,74 @@ pub(super) fn validate_steer_continuation_events(
     if resolution_count != 1 {
         return Err(invalid_transition(
             "steer continuation must resolve its exact sources and start one turn",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_resumed_continuation_events(
+    session_id: SessionId,
+    branch_id: BranchId,
+    call_id: &ToolCallId,
+    expected_settings_revision_id: u64,
+    kind: ResumedContinuationKind,
+    events: &[EventEnvelope],
+) -> Result<()> {
+    validate_event_scope(session_id, branch_id, events)?;
+    let expected_source = match kind {
+        ResumedContinuationKind::Approval => TurnStartSource::ApprovalResume,
+        ResumedContinuationKind::Input => TurnStartSource::InputResume,
+    };
+    let mut turn_id = None;
+    let mut resolution_count = 0;
+    for event in events {
+        match &event.payload {
+            EventPayload::TurnStarted {
+                turn_id: started_turn_id,
+                settings_revision_id,
+                source,
+                resumed_from_call_id,
+                ..
+            } => {
+                if turn_id.replace(*started_turn_id).is_some()
+                    || event.turn_id != Some(*started_turn_id)
+                    || *settings_revision_id != expected_settings_revision_id
+                    || *source != expected_source
+                    || resumed_from_call_id.as_ref() != Some(call_id)
+                {
+                    return Err(invalid_transition(
+                        "resumed continuation has an inconsistent turn.started event",
+                    ));
+                }
+            }
+            EventPayload::ToolApprovalResolved {
+                call_id: resolved_call_id,
+                ..
+            } if kind == ResumedContinuationKind::Approval && resolved_call_id == call_id => {
+                resolution_count += 1;
+            }
+            EventPayload::ToolExecutionFinished {
+                call_id: resolved_call_id,
+                ..
+            } if kind == ResumedContinuationKind::Input && resolved_call_id == call_id => {
+                resolution_count += 1;
+            }
+            EventPayload::SessionSteersResolved { .. } | EventPayload::MessageAppended { .. } => {}
+            _ => {
+                return Err(invalid_transition(
+                    "resumed continuation contains an unexpected event",
+                ));
+            }
+        }
+    }
+    let Some(turn_id) = turn_id else {
+        return Err(invalid_transition(
+            "resumed continuation is missing its turn.started event",
+        ));
+    };
+    if resolution_count != 1 || events.iter().any(|event| event.turn_id != Some(turn_id)) {
+        return Err(invalid_transition(
+            "resumed continuation must resolve one pending call into exactly one turn",
         ));
     }
     Ok(())

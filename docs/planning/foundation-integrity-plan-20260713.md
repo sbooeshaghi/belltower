@@ -157,6 +157,8 @@ that runtime transition.
 
 **Owners:** `bt-session` transaction primitives, `bt-runtime` policy
 
+**Status:** complete (2026-07-14)
+
 **Problem:** settings revisions are currently incremented before the durable
 write transaction, and the HTTP transport checks budget separately from turn
 admission. Concurrent updates can reuse a revision, while a turn can race a
@@ -169,10 +171,32 @@ provider, auth, and tool construction outside SQLite.
 **Invariant:** every revision identifies one immutable settings snapshot, and
 exhausted sessions cannot acquire new executable work.
 
+**Implementation evidence:** the store now allocates and appends settings
+revisions under one `BEGIN IMMEDIATE` transaction, rejects conflicting replay
+of an existing full settings snapshot, and evaluates budget eligibility in
+direct, queued, and steer claims before acquiring active-turn ownership.
+`budget.configured` remains the sole limit owner; counter-only checkpoints and
+any resulting cancellation commit atomically against current limits while the
+active-turn slot is still held. Terminal transitions commit their checkpoint,
+optional cancellation, terminal evidence, and `turn.finished` together,
+after atomically proving that the exact session/branch/turn still owns the
+active slot, including interrupted-turn recovery. Duplicate or stale production
+finish attempts are rejected without appending evidence. Checkpoint counters cannot regress; fresh
+cost accounting begins at zero and unknown completion cost fails closed under a
+cost ceiling. Budget policy updates are idle-boundary operations and atomically
+record a distinct cancellation if persisted counters already exhaust the new
+limits. Non-terminal live tool request/result transitions, in-turn approval
+evidence, and standalone budget checkpoints also prove exact active-turn
+ownership in their append transaction, preventing a recovered stale runtime
+from extending the turn. Runtime issues an opaque admitted-turn capability bound to one session
+and branch for every execution path.
+
 #### 2.1b Recover idle durable continuations
 
 **Owners:** `bt-session` claim primitives, `bt-runtime` dispatcher, `bt-server`
 execution host
+
+**Status:** complete (2026-07-14)
 
 **Problem:** a crash after `turn.finished` but before post-turn dispatch can
 leave queued or steered work durable but idle. Startup recovery terminalizes
@@ -187,9 +211,18 @@ durable ownership table.
 **Invariant:** durable pending work is either blocked by explicit canonical
 control state or becomes executable exactly once after restart.
 
+**Implementation evidence:** queue and steer projections retain their exact
+source event identifiers. Runtime claims one eligible continuation under the
+active-turn and budget predicates, appends its resolution plus `turn.started`
+atomically, and startup dispatches that already-claimed capability. Restart,
+FIFO, branch, cancel, and exactly-once scenarios are covered by runtime and
+server tests.
+
 ### 2.2 Atomically claim approval and input resume
 
 **Owners:** `bt-session`, `bt-runtime`
+
+**Status:** complete (2026-07-14)
 
 **Problem:** concurrent approval requests can both pass a pending-state read
 and execute the same side effect. Cancellation can be cleared while resuming
@@ -200,6 +233,14 @@ its state. A durable cancel wins over resume until explicitly superseded by a
 new operator operation.
 
 **Invariant:** pending work is consumed once; cancelled work does not execute.
+
+**Implementation evidence:** approval and input projections retain branch,
+turn, and original request sequence. The store claim compares that full request
+identity, evaluates budget, cancellation, and active ownership, and appends the
+decision/result evidence plus resumed `turn.started` in one transaction. A
+stale reused call id, concurrent owner, exhausted budget, or pending cancel
+does not consume the request or clear cancellation. Runtime returns the same
+opaque admitted-turn capability used by direct and queued work.
 
 ### 2.3 Make cancellation interrupt real work
 
@@ -352,6 +393,7 @@ Required focused scenarios:
 - equal provider call IDs in two sessions remain isolated
 - two simultaneous sends yield one dispatched and one queued operation
 - two simultaneous approval decisions execute the tool once
+- a stale resume for a reused call id cannot claim the newer request instance
 - cancel while approval/input/provider/tool work is pending prevents execution
 - every requested tool reaches one terminal outcome through restart
 - compact, restart, and rebuild produce identical model-visible context
@@ -359,6 +401,8 @@ Required focused scenarios:
 - remote sync rejects non-descendant head replacement
 - TUI reconnect and branch activation do not duplicate or contaminate history
 - readiness returns within its deadline for a hanging endpoint
+- a failed child-session spawn leaves neither a partial child nor partial
+  parent/child lineage events
 
 ## Deliberately Deferred
 

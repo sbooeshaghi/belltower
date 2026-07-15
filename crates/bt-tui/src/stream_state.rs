@@ -724,13 +724,8 @@ impl ChatApp {
                 tool_mode,
                 ..
             } => {
-                if let Some(connection_id) = connection_id {
-                    self.connection_id = ConnectionId::new(connection_id);
-                }
-                if let Some(tool_mode) = tool_mode.as_deref() {
-                    self.tool_mode =
-                        parse_tool_mode(tool_mode).unwrap_or(SessionToolMode::Extended);
-                }
+                self.connection_id = ConnectionId::new(connection_id);
+                self.tool_mode = parse_tool_mode(&tool_mode).unwrap_or(SessionToolMode::Extended);
                 self.connection_model = model_id.or_else(|| {
                     self.connections
                         .iter()

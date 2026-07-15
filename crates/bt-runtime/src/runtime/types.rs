@@ -46,15 +46,43 @@ pub struct PreparedTurnContext {
     pub compaction: Option<ContextCompactionReport>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BootstrappedTurn {
-    pub turn_id: TurnId,
-    pub settings_revision_id: u64,
+#[derive(Debug, PartialEq, Eq)]
+pub struct AdmittedTurn {
+    pub(crate) session_id: SessionId,
+    pub(crate) branch_id: bt_core::BranchId,
+    pub(crate) turn_id: TurnId,
+    pub(crate) settings_revision_id: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl AdmittedTurn {
+    pub(crate) fn new(
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        turn_id: TurnId,
+        settings_revision_id: u64,
+    ) -> Self {
+        Self {
+            session_id,
+            branch_id,
+            turn_id,
+            settings_revision_id,
+        }
+    }
+
+    #[must_use]
+    pub fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    #[must_use]
+    pub fn settings_revision_id(&self) -> u64 {
+        self.settings_revision_id
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum UserMessageAdmission {
-    Started(BootstrappedTurn),
+    Started(AdmittedTurn),
     Queued { position: usize },
 }
 
@@ -77,6 +105,7 @@ pub struct ResumableToolCall {
     pub session: SessionRecord,
     pub branch: BranchRecord,
     pub turn_id: TurnId,
+    pub requested_seq_id: i64,
     pub settings_revision_id: u64,
     pub tool_call: ToolCall,
     pub approval_request_snapshot: Option<bt_core::ApprovalRequestSnapshot>,
@@ -105,6 +134,7 @@ pub(crate) struct TurnBudgetWindow {
     pub(crate) anchor_time: time::OffsetDateTime,
     pub(crate) delta_usage: TokenUsage,
     pub(crate) delta_cost_used_usd: Option<f64>,
+    pub(crate) delta_cost_is_unknown: bool,
     pub(crate) finished_at: Option<time::OffsetDateTime>,
     pub(crate) already_checkpointed: bool,
 }

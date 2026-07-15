@@ -55,13 +55,33 @@ impl BelltowerRuntime {
         branch_id: bt_core::BranchId,
         budget: BudgetConfig,
     ) -> Result<i64> {
-        let event = EventEnvelope::new(
+        let configuration = EventEnvelope::new(
             session_id,
             branch_id,
             SpanKind::Agent,
             EventPayload::BudgetConfigured { budget },
         );
-        self.append_event(event)
+        let cancellation = EventEnvelope::new(
+            session_id,
+            branch_id,
+            SpanKind::Agent,
+            EventPayload::SessionCancelled {
+                reason: "budget_exhausted".to_owned(),
+            },
+        );
+        self.ensure_session_started_for(session_id, branch_id)?;
+        self.take_store_append_fault_for_test()?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
+        let committed = store.commit_budget_configuration(&configuration, &cancellation)?;
+        self.publish_committed_event(configuration, committed.configuration_seq_id);
+        if let Some(seq_id) = committed.cancellation_seq_id {
+            self.publish_committed_event(cancellation, seq_id);
+        }
+        drop(store);
+        Ok(committed.configuration_seq_id)
     }
 
     pub fn session_budget(&self, session_id: SessionId) -> Result<Option<SessionBudgetProjection>> {
@@ -71,77 +91,189 @@ impl BelltowerRuntime {
             .load_session_budget(session_id)
     }
 
-    pub fn ensure_session_budget_allows_turn(&self, session_id: SessionId) -> Result<()> {
-        let Some(projection) = self.session_budget(session_id)? else {
-            return Ok(());
-        };
-        if budget_exhausted(
-            &projection.budget,
-            projection.tokens_used,
-            projection.turns_used,
-            projection.elapsed_seconds,
-            projection.cost_used_usd,
-        ) {
-            return Err(bt_core::BelltowerError::Protocol(
-                "session budget exhausted; adjust the session budget before sending more work"
-                    .to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
+    #[cfg(any(test, feature = "test-support"))]
     pub fn checkpoint_session_budget(
         &self,
         session_id: SessionId,
         branch_id: bt_core::BranchId,
         turn_id: TurnId,
     ) -> Result<BudgetEnforcementOutcome> {
-        let Some(projection) = self.session_budget(session_id)? else {
+        self.checkpoint_session_budget_at(
+            session_id,
+            branch_id,
+            turn_id,
+            Some(time::OffsetDateTime::now_utc()),
+        )
+    }
+
+    pub fn record_active_turn_finished(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        turn_id: TurnId,
+        provider: String,
+        model: String,
+        status: String,
+        finish_reason: Option<String>,
+        latency_ms: u64,
+    ) -> Result<BudgetEnforcementOutcome> {
+        self.commit_active_turn_terminal_events(
+            session_id,
+            branch_id,
+            turn_id,
+            time::OffsetDateTime::now_utc(),
+            vec![self.turn_finished_event(
+                session_id,
+                branch_id,
+                turn_id,
+                provider,
+                model,
+                status,
+                finish_reason,
+                latency_ms,
+            )],
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn checkpoint_session_budget_at(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        turn_id: TurnId,
+        terminal_at: Option<time::OffsetDateTime>,
+    ) -> Result<BudgetEnforcementOutcome> {
+        let Some((checkpoint, cancellation)) =
+            self.budget_checkpoint_transition_at(session_id, branch_id, turn_id, terminal_at)?
+        else {
             return Ok(BudgetEnforcementOutcome::NotConfigured);
         };
-        let turn_budget = self.turn_budget_window(session_id, turn_id, &projection)?;
+        self.take_store_append_fault_for_test()?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
+        let committed = store.commit_budget_checkpoint(&checkpoint, &cancellation)?;
+        self.publish_committed_event(checkpoint, committed.checkpoint_seq_id);
+        if let Some(seq_id) = committed.cancellation_seq_id {
+            self.publish_committed_event(cancellation, seq_id);
+        }
+        drop(store);
 
+        if committed.exhausted {
+            Ok(BudgetEnforcementOutcome::Exhausted)
+        } else {
+            Ok(BudgetEnforcementOutcome::WithinBudget)
+        }
+    }
+
+    pub(super) fn commit_active_turn_terminal_events(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        turn_id: TurnId,
+        terminal_at: time::OffsetDateTime,
+        terminal_events: Vec<EventEnvelope>,
+    ) -> Result<BudgetEnforcementOutcome> {
+        let Some((checkpoint, cancellation)) = self.budget_checkpoint_transition_at(
+            session_id,
+            branch_id,
+            turn_id,
+            Some(terminal_at),
+        )?
+        else {
+            self.ensure_session_started_for(session_id, branch_id)?;
+            self.take_store_append_fault_for_test()?;
+            let mut store = self.store.lock().map_err(|_| {
+                bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned())
+            })?;
+            let seq_ids = store.commit_turn_terminal_transition(
+                session_id,
+                branch_id,
+                turn_id,
+                &terminal_events,
+            )?;
+            for (event, seq_id) in terminal_events.into_iter().zip(seq_ids.iter().copied()) {
+                self.publish_committed_event(event, seq_id);
+            }
+            drop(store);
+            return Ok(BudgetEnforcementOutcome::NotConfigured);
+        };
+        self.take_store_append_fault_for_test()?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
+        let committed = store.commit_budget_terminal_transition(
+            &checkpoint,
+            &cancellation,
+            &terminal_events,
+        )?;
+        self.publish_committed_event(checkpoint, committed.checkpoint_seq_id);
+        if let Some(seq_id) = committed.cancellation_seq_id {
+            self.publish_committed_event(cancellation, seq_id);
+        }
+        for (event, seq_id) in terminal_events
+            .into_iter()
+            .zip(committed.terminal_seq_ids.iter().copied())
+        {
+            self.publish_committed_event(event, seq_id);
+        }
+        drop(store);
+
+        if committed.exhausted {
+            Ok(BudgetEnforcementOutcome::Exhausted)
+        } else {
+            Ok(BudgetEnforcementOutcome::WithinBudget)
+        }
+    }
+
+    fn budget_checkpoint_transition_at(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        turn_id: TurnId,
+        terminal_at: Option<time::OffsetDateTime>,
+    ) -> Result<Option<(EventEnvelope, EventEnvelope)>> {
+        let Some(projection) = self.session_budget(session_id)? else {
+            return Ok(None);
+        };
+        let turn_budget = self.turn_budget_window(session_id, turn_id, &projection, terminal_at)?;
         let elapsed_delta =
             rounded_elapsed_seconds(turn_budget.anchor_time, turn_budget.finished_at);
         let tokens_used = turn_budget.base_tokens_used + turn_budget.delta_usage.total_tokens;
         let turns_used = turn_budget.base_turns_used + u32::from(!turn_budget.already_checkpointed);
         let elapsed_seconds = turn_budget.base_elapsed_seconds + elapsed_delta;
-        let cost_used_usd = merge_cost_totals(
-            turn_budget.base_cost_used_usd,
-            turn_budget.delta_cost_used_usd,
-        );
-
-        let checkpoint = EventEnvelope::new(
-            session_id,
-            branch_id,
-            SpanKind::Agent,
-            EventPayload::BudgetCheckpoint {
-                tokens_used,
-                max_tokens: projection.budget.max_tokens,
-                turns_used,
-                max_turns: projection.budget.max_turns,
-                elapsed_seconds,
-                max_wall_clock_seconds: projection.budget.max_wall_clock_seconds,
-                cost_used_usd,
-                max_cost_usd: projection.budget.max_cost_usd,
-            },
-        )
-        .with_turn_id(turn_id);
-        self.append_event(checkpoint)?;
-
-        let exhausted = budget_exhausted(
-            &projection.budget,
-            tokens_used,
-            turns_used,
-            elapsed_seconds,
-            cost_used_usd,
-        );
-        if exhausted {
-            self.cancel_session(session_id, branch_id, "budget_exhausted")?;
-            Ok(BudgetEnforcementOutcome::Exhausted)
+        let cost_used_usd = if turn_budget.delta_cost_is_unknown {
+            None
         } else {
-            Ok(BudgetEnforcementOutcome::WithinBudget)
-        }
+            merge_cost_totals(
+                turn_budget.base_cost_used_usd,
+                turn_budget.delta_cost_used_usd,
+            )
+        };
+        Ok(Some((
+            EventEnvelope::new(
+                session_id,
+                branch_id,
+                SpanKind::Agent,
+                EventPayload::BudgetCheckpoint {
+                    tokens_used,
+                    turns_used,
+                    elapsed_seconds,
+                    cost_used_usd,
+                },
+            )
+            .with_turn_id(turn_id),
+            EventEnvelope::new(
+                session_id,
+                branch_id,
+                SpanKind::Agent,
+                EventPayload::SessionCancelled {
+                    reason: "budget_exhausted".to_owned(),
+                },
+            ),
+        )))
     }
 
     pub fn spawn_child_session(
@@ -225,37 +357,79 @@ impl BelltowerRuntime {
             is_default: true,
         };
 
-        self.store
-            .lock()
-            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?
-            .create_session(&child_session, &child_branch)?;
+        self.ensure_session_started_for(parent_session.session_id, parent_branch.branch_id)?;
+        let spawn_requested = apply_turn_id(
+            EventEnvelope::new(
+                parent_session.session_id,
+                parent_branch.branch_id,
+                SpanKind::Chain,
+                EventPayload::SessionSpawnRequested {
+                    child_session_id: child_session.session_id,
+                    objective: objective.clone(),
+                    connection_id: child_connection_id.to_string(),
+                    model_id: child_model_id.clone(),
+                },
+            ),
+            origin_turn_id,
+        );
+        let child_started = EventEnvelope::new(
+            child_session.session_id,
+            child_branch.branch_id,
+            SpanKind::Session,
+            EventPayload::SessionStarted {
+                project_root: child_session.project_root.to_string(),
+                connection_id: child_connection_id.to_string(),
+            },
+        );
+        let child_handoff = EventEnvelope::new(
+            child_session.session_id,
+            child_branch.branch_id,
+            SpanKind::Chain,
+            EventPayload::SessionHandoffRecorded {
+                parent_session_id: parent_session.session_id,
+                parent_branch_id: parent_branch.branch_id,
+                parent_turn_id: origin_turn_id,
+                objective: objective.clone(),
+                summary: objective.clone(),
+            },
+        );
+        let spawn_completed = apply_turn_id(
+            EventEnvelope::new(
+                parent_session.session_id,
+                parent_branch.branch_id,
+                SpanKind::Chain,
+                EventPayload::SessionSpawned {
+                    child_session_id: child_session.session_id,
+                    child_branch_id: child_branch.branch_id,
+                    objective,
+                },
+            ),
+            origin_turn_id,
+        );
 
-        self.record_session_spawn_requested(
-            parent_session.session_id,
-            parent_branch.branch_id,
-            child_session.session_id,
-            objective.clone(),
-            child_connection_id.to_string(),
-            child_model_id.clone(),
-            origin_turn_id,
+        self.take_store_append_fault_for_test()?;
+        let events = vec![
+            spawn_requested,
+            child_started,
+            child_handoff,
+            spawn_completed,
+        ];
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
+        let seq_ids = store.commit_child_session_spawn(
+            &child_session,
+            &child_branch,
+            &events[0],
+            &events[1],
+            &events[2],
+            &events[3],
         )?;
-        self.record_session_handoff(
-            child_session.session_id,
-            child_branch.branch_id,
-            parent_session.session_id,
-            parent_branch.branch_id,
-            origin_turn_id,
-            objective.clone(),
-            objective.clone(),
-        )?;
-        self.record_session_spawned(
-            parent_session.session_id,
-            parent_branch.branch_id,
-            child_session.session_id,
-            child_branch.branch_id,
-            objective,
-            origin_turn_id,
-        )?;
+        drop(store);
+        for (event, seq_id) in events.into_iter().zip(seq_ids) {
+            self.publish_committed_event(event, seq_id);
+        }
 
         Ok((child_session, child_branch))
     }
@@ -267,33 +441,35 @@ impl BelltowerRuntime {
         model_id: Option<Option<String>>,
         tool_mode: Option<SessionToolMode>,
     ) -> Result<SessionRecord> {
-        let session = self
-            .load_session(session_id)?
-            .ok_or_else(|| bt_core::BelltowerError::InvalidState("session not found".to_owned()))?;
-        let next_connection_id = connection_id.unwrap_or_else(|| session.connection_id.clone());
-        let next_model_id = model_id.unwrap_or_else(|| session.model_id.clone());
-        let next_tool_mode = tool_mode.unwrap_or(session.tool_mode);
-        let next_settings_revision_id = session.settings_revision_id.saturating_add(1);
-        self.ensure_connection_configured(&next_connection_id)?;
-
         let branch = self.default_branch(session_id)?.ok_or_else(|| {
             bt_core::BelltowerError::InvalidState("default branch not found".to_owned())
         })?;
-        let event = EventEnvelope::new(
+        let target_connection_id = match connection_id.as_ref() {
+            Some(connection_id) => connection_id.clone(),
+            None => {
+                self.load_session(session_id)?
+                    .ok_or_else(|| {
+                        bt_core::BelltowerError::InvalidState("session not found".to_owned())
+                    })?
+                    .connection_id
+            }
+        };
+        self.ensure_connection_configured(&target_connection_id)?;
+        self.ensure_session_started_for(session_id, branch.branch_id)?;
+        self.take_store_append_fault_for_test()?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
+        let committed = store.commit_session_settings_update(
             session_id,
             branch.branch_id,
-            SpanKind::Session,
-            EventPayload::SessionSettingsUpdated {
-                settings_revision_id: next_settings_revision_id,
-                connection_id: Some(next_connection_id.to_string()),
-                model_id: next_model_id.clone(),
-                tool_mode: Some(format!("{:?}", next_tool_mode).to_ascii_lowercase()),
-            },
-        );
-        self.append_event(event)?;
-
-        self.load_session(session_id)?
-            .ok_or_else(|| bt_core::BelltowerError::InvalidState("session not found".to_owned()))
+            connection_id,
+            model_id,
+            tool_mode,
+        )?;
+        self.publish_committed_event(committed.event, committed.seq_id);
+        Ok(committed.session)
     }
 
     fn ensure_connection_configured(&self, connection_id: &ConnectionId) -> Result<()> {

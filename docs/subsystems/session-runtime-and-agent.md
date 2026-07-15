@@ -89,12 +89,40 @@ clear a newer active turn.
 The budget projection is the canonical read model for session autonomy limits and
 used-so-far counters:
 
-- `budget.configured` sets or updates the durable limit shape
-- `budget.checkpoint` advances the restart-safe tokens/turns/time/cost counters
+- `budget.configured` is the sole owner of the durable limit shape
+- `budget.checkpoint` advances only restart-safe tokens/turns/time/cost counters;
+  it never copies limits from a stale runtime read
+- budget policy may change only while the session is idle. The store rejects a
+  configuration update while a turn owns the active slot; an idle update that
+  is already exhausted by persisted counters records its configuration and
+  resulting cancellation atomically. A prior cancellation for another reason
+  does not suppress the distinct `budget_exhausted` event
 - checkpoint time accounting is anchored to durable turn events and prior
   checkpoint timestamps, not a process-local timer that resets on restart
+- checkpoint counters cannot regress. Fresh cost accounting starts at a known
+  zero; if a completion has no price, cumulative cost becomes unknown and a
+  configured cost ceiling fails closed. The cutover migration normalizes a
+  legacy null cost to zero only when every persisted usage counter is also
+  zero; historical null cost remains unknown
 - runtime enforcement reads that projection rather than reconstructing budget
   state from process-local memory
+- direct user admission and queued/steered continuation claims evaluate the
+  projected budget inside the same write transaction that would acquire
+  active-turn ownership; exhausted work remains durable but cannot be claimed
+- terminal execution and interrupted-turn recovery keep active ownership until
+  the store atomically commits the checkpoint, any resulting cancellation,
+  terminal evidence, and `turn.finished`; normal completion, preflight failure,
+  resumed failure, sibling approval suspension, and interrupted-turn recovery
+  all follow this ordering. The transaction first proves that the exact
+  session/branch/turn still owns the active slot, so duplicate or stale live
+  finish attempts append nothing
+- non-terminal live tool request/result transitions and in-turn approval
+  evidence append through an exact session/branch/turn ownership transaction.
+  After another runtime recovers a turn, the stale worker cannot append those
+  lifecycle events. Deferred operator approval instead starts a newly admitted
+  resume turn before execution
+- standalone budget checkpoints also require the exact active owner; an old or
+  already-finished turn cannot mutate durable budget accounting
 - `session.cancelled { reason: "budget_exhausted" }` is the canonical stop
   marker when a configured ceiling is reached at a turn boundary
 
@@ -108,6 +136,10 @@ Important design rules:
 - reads come from projections where possible
 - replay comes from the canonical stream
 - branching stays explicit and replayable
+- each settings revision identifies one immutable, self-contained connection,
+  model, and tool-mode snapshot; the store allocates the next revision inside
+  the same write transaction that appends `session.settings.updated`, and replay
+  may only reassert identical contents
 - canonical events are committed before any SSE or tracing projection is emitted
 - if the canonical store is unavailable, canonical turn progression stops rather than silently degrading into a non-durable mode
 
@@ -123,8 +155,8 @@ rescanning raw events or inferring prompt contents from the TUI.
 The most useful thing copied from `pi-agent-core` is not the code, but the explicit event sequence.
 
 User ingress is one atomic store transition. Under one SQLite write
-transaction, runtime checks the current settings revision and session control
-state, then does exactly one of the following:
+transaction, runtime checks the current settings revision, session control
+state, and budget eligibility, then does exactly one of the following:
 
 - appends the user message and `turn.started`, acquiring active-turn ownership
 - appends `session.queued_message.enqueued` and its audit event, preserving the
@@ -134,7 +166,13 @@ The server transports this typed outcome; it does not inspect process-local
 state and independently decide whether work is busy. Two concurrent clients
 therefore cannot both start turns for the same session. Queue and steer
 continuations likewise claim their exact durable event identifiers and append
-their resumed `turn.started` transition atomically.
+their resumed `turn.started` transition atomically, and cannot acquire work
+after the session budget is exhausted. Approval and pending-input continuations
+use the same rule: the store identifies the exact original request by its
+session, branch, turn, call id, tool name, and request sequence, validates it is
+still pending, and commits the resolution plus resumed `turn.started` in one
+transaction. Cancellation remains pending and wins over resume; transport never
+approximates either decision with a precheck.
 
 For a normal prompt:
 
@@ -172,7 +210,9 @@ message are one runtime-owned atomic transition. Failure to persist that
 transition prevents execution. The terminal event and corresponding
 model-visible tool-result message form a second atomic transition; failure to
 persist it prevents the result from entering context or triggering another
-provider call. Persistence and provider context share the exact tool-call and
+provider call. Both transitions prove that the exact session/branch/turn still
+owns the active slot before appending, so an already-recovered stale runtime
+cannot add tool lifecycle evidence. Persistence and provider context share the exact tool-call and
 tool-result message identities; the following context manifest points back to
 those canonical message rows and sequence identifiers. Final turn-result
 persistence filters lifecycle-owned tool-call and tool-result messages while
@@ -262,12 +302,19 @@ silently promotes them into agent transcript context or retries them.
 
 After resolving the configured connection identity and model label required by
 `turn.started`, direct user admission records that boundary before auth,
-provider construction, model execution, or tool preflight. If a later
-preflight fails, runtime appends a turn-bound `session.error` followed by
-`turn.finished { status: "failed" }`. This ordering keeps ingress atomic
-without leaving stale active ownership. Persisting enough settings metadata to
-admit work after a connection has been removed from local configuration remains
-follow-on hardening rather than current behavior.
+provider construction, model execution, or tool preflight. Direct, queued, and
+steered admission return an opaque `AdmittedTurn` capability for that exact
+durable boundary; the turn orchestrator cannot be entered with a caller-supplied
+turn id or a boolean that claims the turn was already started, and the
+capability cannot be rebound to a different session or branch. Approval and
+pending-input resume produce the same capability only after their exact pending
+request and resumed-turn ownership commit atomically. If later preflight fails,
+runtime appends a turn-bound `session.error` followed by `turn.finished {
+status: "failed" }`. This ordering keeps ingress atomic without leaving stale
+active ownership.
+Persisting enough settings metadata to admit work after a connection has been
+removed from local configuration remains follow-on hardening rather than
+current behavior.
 
 ## Turn Contract
 
@@ -285,14 +332,19 @@ That is acceptable only if the semantics remain explicit:
 
 - the runtime persists the approval request
 - the turn suspends cleanly
-- the human decision is persisted as a canonical event
-- the runtime bootstraps canonical resumed-turn state from that decision before
-  the server execution path continues the turn
+- the runtime validates the exact pending request and persists the human
+  decision with the resumed `turn.started` boundary in one transaction
+- budget, cancellation, and active-owner predicates are evaluated in that same
+  claim; a rejected claim does not consume the pending request
 
 The agent loop should never block on server IO it does not own.
 
 Settings mutation is also part of the turn contract now:
 
+- the store allocates settings revisions transactionally and never mutates an
+  existing revision to contain different connection, model, or tool settings;
+  each settings event is a complete snapshot so replay never consults mutable
+  session-row state
 - every turn starts under an explicit `settings_revision_id`
 - paused turns resume under the revision captured by their original `turn.started`
 - queued follow-up input runs under the revision captured when it was enqueued, not whatever the session row says later

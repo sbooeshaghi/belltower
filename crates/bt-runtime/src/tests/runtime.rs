@@ -1,6 +1,7 @@
 use super::support::completion_cost_breakdown;
 use super::{
     BelltowerRuntime, BudgetEnforcementOutcome, PostTurnControlAction, ResumableToolCallKind,
+    UserMessageAdmission,
 };
 use crate::{TurnAdapterFuture, TurnExecutionAdapters, TurnRunRequest};
 use bt_core::{
@@ -8,10 +9,10 @@ use bt_core::{
     BelltowerConfig, BelltowerError, BudgetConfig, CompletionRequest, CompletionSummary,
     ConnectionDescriptor, ConnectionId, ContextCompactionPhase, ContextCompactionStatus,
     ContextCompactionTrigger, ContextManifest, ContextMessageSourceRef, EventPayload, FinishReason,
-    Message, MessagePart, PlanItem, PlanStatus, Role, SessionRuntimeState, SessionToolMode,
-    TokenUsage, ToolCallId, ToolDisplayGroup, ToolExecutionMode, ToolInterruptBehavior,
-    ToolMetadata, ToolOperationContext, ToolOperationInitiator, ToolResultEnvelope, ToolRiskClass,
-    TurnId, TurnStartSource,
+    InstructionDocument, Message, MessagePart, PlanItem, PlanStatus, Role, SessionRuntimeState,
+    SessionToolMode, TokenUsage, ToolCall, ToolCallId, ToolDisplayGroup, ToolExecutionMode,
+    ToolInterruptBehavior, ToolMetadata, ToolOperationContext, ToolOperationInitiator,
+    ToolResultEnvelope, ToolRiskClass, TurnId, TurnInstructionProvenance, TurnStartSource,
 };
 use bt_tools::BuiltInToolRegistry;
 use serde_json::json;
@@ -829,6 +830,20 @@ fn session_inspection_reports_cost_summary() {
             None,
         )
         .expect("session creation");
+    let turn_id = TurnId::new();
+    runtime
+        .record_turn_started(
+            session.session_id,
+            branch.branch_id,
+            turn_id,
+            "openai-compatible".to_owned(),
+            "gpt-5.4-mini".to_owned(),
+            1,
+            session.settings_revision_id,
+            TurnStartSource::UserMessage,
+            None,
+        )
+        .expect("start completion turn");
     runtime
         .record_completion_finished(
             session.session_id,
@@ -849,9 +864,21 @@ fn session_inspection_reports_cost_summary() {
                 latency_ms: 42,
             },
             1,
-            TurnId::new(),
+            turn_id,
         )
         .expect("record completion");
+    runtime
+        .record_turn_finished(
+            session.session_id,
+            branch.branch_id,
+            turn_id,
+            "openai-compatible".to_owned(),
+            "gpt-5.4-mini".to_owned(),
+            "completed".to_owned(),
+            Some("stop".to_owned()),
+            42,
+        )
+        .expect("finish completion turn");
 
     let inspection = runtime
         .inspect_session(session.session_id)
@@ -869,7 +896,7 @@ fn session_inspection_reports_cost_summary() {
 fn checkpoint_session_budget_is_restart_safe_and_does_not_double_count_resumed_turns() {
     let config = BelltowerConfig::from_embedded().expect("config");
     let file = NamedTempFile::new().expect("tempfile");
-    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let runtime = BelltowerRuntime::open(config.clone(), file.path()).expect("runtime");
 
     let (session, branch) = runtime
         .create_session(
@@ -939,18 +966,6 @@ fn checkpoint_session_budget_is_restart_safe_and_does_not_double_count_resumed_t
             turn_id,
         )
         .expect("first completion");
-    runtime
-        .record_turn_finished(
-            session.session_id,
-            branch.branch_id,
-            turn_id,
-            "openai-compatible".to_owned(),
-            "gpt-5.4-mini".to_owned(),
-            "awaiting_input".to_owned(),
-            Some("ToolUse".to_owned()),
-            1_100,
-        )
-        .expect("pause turn");
     assert_eq!(
         runtime
             .checkpoint_session_budget(session.session_id, branch.branch_id, turn_id)
@@ -997,6 +1012,12 @@ fn checkpoint_session_budget_is_restart_safe_and_does_not_double_count_resumed_t
             turn_id,
         )
         .expect("resumed completion");
+    assert_eq!(
+        runtime
+            .checkpoint_session_budget(session.session_id, branch.branch_id, turn_id)
+            .expect("second checkpoint"),
+        BudgetEnforcementOutcome::WithinBudget
+    );
     runtime
         .record_turn_finished(
             session.session_id,
@@ -1009,12 +1030,8 @@ fn checkpoint_session_budget_is_restart_safe_and_does_not_double_count_resumed_t
             1_150,
         )
         .expect("final turn finish");
-    assert_eq!(
-        runtime
-            .checkpoint_session_budget(session.session_id, branch.branch_id, turn_id)
-            .expect("second checkpoint"),
-        BudgetEnforcementOutcome::WithinBudget
-    );
+    drop(runtime);
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("reopened runtime");
 
     let final_budget = runtime
         .session_budget(session.session_id)
@@ -1024,6 +1041,91 @@ fn checkpoint_session_budget_is_restart_safe_and_does_not_double_count_resumed_t
     assert_eq!(final_budget.turns_used, 1);
     assert_eq!(final_budget.cost_used_usd, Some(0.06));
     assert!(final_budget.elapsed_seconds >= first_budget.elapsed_seconds);
+}
+
+#[test]
+fn cost_budget_admits_fresh_work_and_stops_on_unknown_completion_cost() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("local"),
+            Some("qwen3.5:latest".to_owned()),
+            SessionToolMode::Extended,
+            Some("cost-budget".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    runtime
+        .configure_session_budget(
+            session.session_id,
+            branch.branch_id,
+            BudgetConfig {
+                max_cost_usd: Some(5.0),
+                ..BudgetConfig::default()
+            },
+        )
+        .expect("configure budget");
+    let admitted = match runtime
+        .admit_user_message(&session, &branch, Message::text(Role::User, "run"))
+        .expect("admit work")
+    {
+        UserMessageAdmission::Started(admitted) => admitted,
+        UserMessageAdmission::Queued { .. } => panic!("fresh cost budget must admit work"),
+    };
+    runtime
+        .record_completion_finished(
+            session.session_id,
+            branch.branch_id,
+            CompletionSummary {
+                provider: "openai-compatible".to_owned(),
+                model: "qwen3.5:latest".to_owned(),
+                finish_reason: FinishReason::Stop,
+                usage: TokenUsage {
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    total_tokens: 5,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
+                cost: None,
+                latency_ms: 1,
+            },
+            1,
+            admitted.turn_id(),
+        )
+        .expect("unpriced completion");
+
+    assert_eq!(
+        runtime
+            .record_active_turn_finished(
+                session.session_id,
+                branch.branch_id,
+                admitted.turn_id(),
+                "openai-compatible".to_owned(),
+                "qwen3.5:latest".to_owned(),
+                "completed".to_owned(),
+                Some("Stop".to_owned()),
+                1,
+            )
+            .expect("finish turn"),
+        BudgetEnforcementOutcome::Exhausted
+    );
+    let budget = runtime
+        .session_budget(session.session_id)
+        .expect("budget lookup")
+        .expect("budget projection");
+    assert_eq!(budget.cost_used_usd, None);
+    assert!(
+        runtime
+            .inspect_session(session.session_id)
+            .expect("inspection")
+            .expect("session")
+            .cancel_requested
+    );
 }
 
 #[test]
@@ -1220,22 +1322,33 @@ async fn turn_preflight_builds_provider_before_recording_context_compaction() {
         .append_message(&session, &branch, Role::Assistant, "acknowledged")
         .expect("assistant message");
     runtime
-        .append_message(&session, &branch, Role::User, "latest request")
-        .expect("latest message");
+        .configure_session_budget(
+            session.session_id,
+            branch.branch_id,
+            BudgetConfig {
+                max_turns: Some(1),
+                ..BudgetConfig::default()
+            },
+        )
+        .expect("configure single-turn budget");
+    let admitted_turn = match runtime
+        .admit_user_message(
+            &session,
+            &branch,
+            Message::text(Role::User, "latest request"),
+        )
+        .expect("admit latest request")
+    {
+        UserMessageAdmission::Started(admitted_turn) => admitted_turn,
+        UserMessageAdmission::Queued { .. } => panic!("idle session should admit the turn"),
+    };
 
     let result = runtime
         .turn_orchestrator()
         .run_session_turns(
             &FailingProviderPreflightAdapters,
-            TurnRunRequest {
-                session: session.clone(),
-                branch: branch.clone(),
-                initial_turn_id: Some(TurnId::new()),
-                initial_turn_started: false,
-                initial_settings_revision_id: session.settings_revision_id,
-                initial_source: TurnStartSource::UserMessage,
-                resumed_from_call_id: None,
-            },
+            TurnRunRequest::new(session.clone(), branch.clone(), admitted_turn)
+                .expect("admitted turn request"),
         )
         .await;
 
@@ -1268,6 +1381,80 @@ async fn turn_preflight_builds_provider_before_recording_context_compaction() {
             .any(|event| matches!(event.payload, EventPayload::CompletionRequested { .. })),
         "completion request should not be recorded before provider preflight succeeds"
     );
+    let seq_for = |predicate: fn(&EventPayload) -> bool| {
+        events
+            .iter()
+            .find(|event| predicate(&event.payload))
+            .and_then(|event| event.seq_id)
+            .expect("expected durable event")
+    };
+    let checkpoint_seq =
+        seq_for(|payload| matches!(payload, EventPayload::BudgetCheckpoint { .. }));
+    let cancellation_seq =
+        seq_for(|payload| matches!(payload, EventPayload::SessionCancelled { .. }));
+    let finish_seq = seq_for(|payload| matches!(payload, EventPayload::TurnFinished { .. }));
+    assert!(checkpoint_seq < cancellation_seq);
+    assert!(cancellation_seq < finish_seq);
+    assert_eq!(
+        runtime
+            .inspect_session(session.session_id)
+            .expect("inspect session")
+            .expect("session exists")
+            .runtime_state,
+        SessionRuntimeState::Idle
+    );
+}
+
+#[test]
+fn admitted_turn_cannot_be_rebound_to_another_session_or_branch() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (session_a, branch_a) = runtime
+        .create_session(
+            "/tmp/project-a".into(),
+            ConnectionId::new("local"),
+            None,
+            SessionToolMode::Extended,
+            Some("capability-a".to_owned()),
+            None,
+        )
+        .expect("session a");
+    let (session_b, branch_b) = runtime
+        .create_session(
+            "/tmp/project-b".into(),
+            ConnectionId::new("local"),
+            None,
+            SessionToolMode::Extended,
+            Some("capability-b".to_owned()),
+            None,
+        )
+        .expect("session b");
+    let admitted_a = match runtime
+        .admit_user_message(&session_a, &branch_a, Message::text(Role::User, "task a"))
+        .expect("admit a")
+    {
+        UserMessageAdmission::Started(admitted) => admitted,
+        UserMessageAdmission::Queued { .. } => panic!("idle session should admit task a"),
+    };
+    let admitted_b = match runtime
+        .admit_user_message(&session_b, &branch_b, Message::text(Role::User, "task b"))
+        .expect("admit b")
+    {
+        UserMessageAdmission::Started(admitted) => admitted,
+        UserMessageAdmission::Queued { .. } => panic!("idle session should admit task b"),
+    };
+
+    let mut wrong_branch = branch_a.clone();
+    wrong_branch.branch_id = bt_core::BranchId::new();
+    assert!(matches!(
+        TurnRunRequest::new(session_a.clone(), wrong_branch, admitted_a),
+        Err(BelltowerError::InvalidState(_))
+    ));
+    assert!(matches!(
+        TurnRunRequest::new(session_a, branch_a, admitted_b),
+        Err(BelltowerError::InvalidState(_))
+    ));
 }
 
 #[test]
@@ -1946,6 +2133,229 @@ fn resumed_approval_turn_keeps_paused_settings_revision_after_later_change() {
 }
 
 #[test]
+fn exhausted_budget_blocks_resumed_approval_without_resolving_pending_work() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("budgeted-approval-resume".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    runtime
+        .configure_session_budget(
+            session.session_id,
+            branch.branch_id,
+            BudgetConfig {
+                max_turns: Some(1),
+                ..BudgetConfig::default()
+            },
+        )
+        .expect("configure budget");
+
+    let paused_turn_id = TurnId::new();
+    let call_id = ToolCallId::new("call-budgeted-shell");
+    runtime
+        .record_turn_started(
+            session.session_id,
+            branch.branch_id,
+            paused_turn_id,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            1,
+            session.settings_revision_id,
+            TurnStartSource::UserMessage,
+            None,
+        )
+        .expect("paused turn started");
+    runtime
+        .record_tool_call_requested(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            json!({ "command": "printf approved" }),
+            Some(paused_turn_id),
+        )
+        .expect("tool call requested");
+    runtime
+        .record_approval_requested(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            Some(paused_turn_id),
+        )
+        .expect("approval requested");
+    assert_eq!(
+        runtime
+            .record_active_turn_finished(
+                session.session_id,
+                branch.branch_id,
+                paused_turn_id,
+                "openai-compatible".to_owned(),
+                "o4-mini".to_owned(),
+                "awaiting_approval".to_owned(),
+                Some("ToolCalls".to_owned()),
+                1,
+            )
+            .expect("paused turn finished"),
+        BudgetEnforcementOutcome::Exhausted
+    );
+
+    let resumable = runtime
+        .resumable_approval_call(session.session_id, call_id.clone(), "shell")
+        .expect("resumable approval lookup")
+        .expect("resumable approval");
+    let event_count = runtime
+        .all_events(session.session_id)
+        .expect("events before rejected resume")
+        .len();
+    let error = runtime
+        .bootstrap_resumed_approval_turn(
+            &resumable,
+            &approval_request(
+                session.session_id,
+                "call-budgeted-shell",
+                "shell",
+                json!({ "command": "printf approved" }),
+            ),
+            ApprovalDecision::Approved {
+                decided_at: OffsetDateTime::now_utc(),
+                decided_by: "test".to_owned(),
+                scope: ApprovalScope::Once,
+                source: ApprovalDecisionSource::Human,
+            },
+        )
+        .expect_err("exhausted budget must reject approval resume");
+    assert!(error.to_string().contains("session budget exhausted"));
+
+    let queue = runtime
+        .inspect_queue(session.session_id)
+        .expect("queue inspection")
+        .expect("queue exists");
+    assert_eq!(queue.pending_approvals.len(), 1);
+    assert!(queue.cancel_requested);
+    assert_eq!(
+        runtime
+            .all_events(session.session_id)
+            .expect("events after rejected resume")
+            .len(),
+        event_count
+    );
+}
+
+#[test]
+fn pending_cancellation_blocks_resumed_input_without_clearing_control_state() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("cancelled-input-resume".to_owned()),
+            None,
+        )
+        .expect("session creation");
+
+    let paused_turn_id = TurnId::new();
+    let call_id = ToolCallId::new("call-cancelled-ask");
+    runtime
+        .record_turn_started(
+            session.session_id,
+            branch.branch_id,
+            paused_turn_id,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            1,
+            session.settings_revision_id,
+            TurnStartSource::UserMessage,
+            None,
+        )
+        .expect("paused turn started");
+    runtime
+        .record_tool_call_requested(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "ask".to_owned(),
+            json!({ "question": "Continue?" }),
+            Some(paused_turn_id),
+        )
+        .expect("ask requested");
+    assert_eq!(
+        runtime
+            .record_active_turn_finished(
+                session.session_id,
+                branch.branch_id,
+                paused_turn_id,
+                "openai-compatible".to_owned(),
+                "o4-mini".to_owned(),
+                "awaiting_input".to_owned(),
+                Some("ToolCalls".to_owned()),
+                1,
+            )
+            .expect("paused turn finished"),
+        BudgetEnforcementOutcome::NotConfigured
+    );
+    runtime
+        .cancel_session(
+            session.session_id,
+            branch.branch_id,
+            "operator cancelled before answering",
+        )
+        .expect("cancel session");
+
+    let resumable = runtime
+        .resumable_input_call(session.session_id, call_id.clone())
+        .expect("resumable input lookup")
+        .expect("resumable input");
+    let event_count = runtime
+        .all_events(session.session_id)
+        .expect("events before rejected resume")
+        .len();
+    let error = runtime
+        .bootstrap_resumed_input_turn(
+            &resumable,
+            ToolResultEnvelope {
+                call_id,
+                tool_name: "ask".to_owned(),
+                is_error: false,
+                output: json!({ "response": "yes" }),
+                duration_ms: Some(1),
+            },
+        )
+        .expect_err("pending cancellation must reject input resume");
+    assert!(
+        error
+            .to_string()
+            .contains("session cancellation is pending")
+    );
+
+    let queue = runtime
+        .inspect_queue(session.session_id)
+        .expect("queue inspection")
+        .expect("queue exists");
+    assert_eq!(queue.pending_inputs.len(), 1);
+    assert!(queue.cancel_requested);
+    assert_eq!(
+        runtime
+            .all_events(session.session_id)
+            .expect("events after rejected resume")
+            .len(),
+        event_count
+    );
+}
+
+#[test]
 fn reopened_runtime_closes_interrupted_resumed_approval_turns() {
     let config = BelltowerConfig::from_embedded().expect("config");
     let file = NamedTempFile::new().expect("tempfile");
@@ -2270,6 +2680,263 @@ fn reopened_runtime_closes_interrupted_user_message_turns() {
     assert_eq!(
         result.output["error"]["code"],
         "tool_outcome_unknown_after_restart"
+    );
+}
+
+#[test]
+fn stale_runtime_cannot_append_tool_lifecycle_after_recovery() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let stale = BelltowerRuntime::open(config.clone(), file.path()).expect("runtime");
+    let (session, branch) = stale
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("stale-tool-writer".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    let turn_id = TurnId::new();
+    stale
+        .record_turn_started(
+            session.session_id,
+            branch.branch_id,
+            turn_id,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            1,
+            session.settings_revision_id,
+            TurnStartSource::UserMessage,
+            None,
+        )
+        .expect("turn started");
+
+    let recovered = BelltowerRuntime::open(config, file.path()).expect("recovered runtime");
+    let event_count = recovered
+        .all_events(session.session_id)
+        .expect("events after recovery")
+        .len();
+    let raw_chunk_count = recovered
+        .raw_chunks(session.session_id, 100)
+        .expect("raw chunks after recovery")
+        .len();
+    let call_id = ToolCallId::new("call-after-recovery");
+    let arguments = json!({ "path": "README.md" });
+    let request_error = stale
+        .record_tool_request_transition(
+            session.session_id,
+            branch.branch_id,
+            turn_id,
+            call_id.clone(),
+            "read".to_owned(),
+            arguments.clone(),
+            ToolOperationContext::default(),
+            Message::from_part(
+                Role::Assistant,
+                MessagePart::ToolCall {
+                    call: ToolCall {
+                        tool_name: "read".to_owned(),
+                        call_id: call_id.to_string(),
+                        arguments,
+                    },
+                },
+            ),
+        )
+        .expect_err("recovered turn rejects a stale tool request");
+    assert!(
+        request_error
+            .to_string()
+            .contains("does not own the active turn")
+    );
+
+    let result = ToolResultEnvelope {
+        call_id,
+        tool_name: "read".to_owned(),
+        is_error: false,
+        output: json!({ "content": "stale" }),
+        duration_ms: Some(1),
+    };
+    let terminal_error = stale
+        .record_tool_terminal_transition(
+            session.session_id,
+            branch.branch_id,
+            turn_id,
+            result.clone(),
+            Message::from_part(Role::Tool, MessagePart::ToolResult { result }),
+        )
+        .expect_err("recovered turn rejects a stale tool result");
+    assert!(
+        terminal_error
+            .to_string()
+            .contains("does not own the active turn")
+    );
+
+    let approval_error = stale
+        .record_approval(
+            session.session_id,
+            branch.branch_id,
+            ToolCallId::new("approval-after-recovery"),
+            "shell".to_owned(),
+            ApprovalDecision::Denied {
+                decided_at: OffsetDateTime::now_utc(),
+                decided_by: "stale-runtime".to_owned(),
+                reason: Some("stale".to_owned()),
+                scope: ApprovalScope::Once,
+                source: ApprovalDecisionSource::Runtime,
+            },
+            Some(turn_id),
+        )
+        .expect_err("recovered turn rejects a legacy approval write");
+    assert!(
+        approval_error
+            .to_string()
+            .contains("does not own the active turn")
+    );
+
+    let legacy_request_error = stale
+        .record_tool_call_requested_with_context(
+            session.session_id,
+            branch.branch_id,
+            ToolCallId::new("legacy-request-after-recovery"),
+            "read".to_owned(),
+            json!({ "path": "README.md" }),
+            ToolOperationContext::default(),
+            Some(turn_id),
+        )
+        .expect_err("recovered turn rejects a legacy tool request write");
+    assert!(
+        legacy_request_error
+            .to_string()
+            .contains("does not own the active turn")
+    );
+
+    let legacy_execution_error = stale
+        .record_tool_execution(
+            session.session_id,
+            branch.branch_id,
+            ToolResultEnvelope {
+                call_id: ToolCallId::new("legacy-result-after-recovery"),
+                tool_name: "read".to_owned(),
+                is_error: false,
+                output: json!({ "content": "stale" }),
+                duration_ms: Some(1),
+            },
+            Some(turn_id),
+        )
+        .expect_err("recovered turn rejects a legacy tool result write");
+    assert!(
+        legacy_execution_error
+            .to_string()
+            .contains("does not own the active turn")
+    );
+
+    let completion_request_error = stale
+        .record_completion_requested(
+            session.session_id,
+            branch.branch_id,
+            1,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            1,
+            turn_id,
+        )
+        .expect_err("recovered turn rejects a completion request write");
+    assert!(
+        completion_request_error
+            .to_string()
+            .contains("does not own the active turn")
+    );
+
+    let completion_chunk_error = stale
+        .record_completion_chunk(
+            session.session_id,
+            branch.branch_id,
+            Some(1),
+            Vec::new(),
+            None,
+            Some(turn_id),
+        )
+        .expect_err("recovered turn rejects a completion chunk write");
+    assert!(
+        completion_chunk_error
+            .to_string()
+            .contains("does not own the active turn")
+    );
+
+    let raw_chunk_error = stale
+        .record_raw_chunk(
+            session.session_id,
+            branch.branch_id,
+            "openai-compatible".to_owned(),
+            "completion".to_owned(),
+            Some(1),
+            b"stale raw bytes",
+            Some(turn_id),
+        )
+        .expect_err("recovered turn rejects a raw chunk write");
+    assert!(
+        raw_chunk_error
+            .to_string()
+            .contains("does not own the active turn")
+    );
+
+    let unpaired_raw_chunk_error = stale
+        .append_raw_chunk(
+            session.session_id,
+            branch.branch_id,
+            Some(turn_id),
+            "openai-compatible",
+            "completion",
+            Some(1),
+            b"stale unpaired raw bytes",
+        )
+        .expect_err("recovered turn rejects an unpaired raw chunk write");
+    assert!(
+        unpaired_raw_chunk_error
+            .to_string()
+            .contains("does not own the active turn")
+    );
+
+    let provenance_error = stale
+        .record_turn_instruction_provenance(
+            session.session_id,
+            branch.branch_id,
+            TurnInstructionProvenance {
+                turn_id,
+                provider: "openai-compatible".to_owned(),
+                model: "o4-mini".to_owned(),
+                settings_revision_id: session.settings_revision_id,
+                core_prompt: InstructionDocument {
+                    source: "embedded".to_owned(),
+                    title: "core".to_owned(),
+                    body: "stale instructions".to_owned(),
+                },
+                provider_overlay: None,
+                instructions: Vec::new(),
+                rendered_system_prompt: "stale instructions".to_owned(),
+            },
+        )
+        .expect_err("recovered turn rejects stale instruction provenance");
+    assert!(
+        provenance_error
+            .to_string()
+            .contains("does not own the active turn")
+    );
+    assert_eq!(
+        recovered
+            .all_events(session.session_id)
+            .expect("events after stale writes")
+            .len(),
+        event_count
+    );
+    assert_eq!(
+        recovered
+            .raw_chunks(session.session_id, 100)
+            .expect("raw chunks after stale writes")
+            .len(),
+        raw_chunk_count
     );
 }
 

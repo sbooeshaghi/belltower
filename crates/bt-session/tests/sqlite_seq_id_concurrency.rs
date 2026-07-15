@@ -184,6 +184,69 @@ fn concurrent_turn_admission_starts_once_and_queues_once() {
 }
 
 #[test]
+fn concurrent_settings_updates_allocate_unique_immutable_revisions() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let database_path = temp_dir.path().join("sessions.sqlite");
+    let mut store = SqliteSessionStore::open(&database_path).expect("open store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+
+    let writer_count = 8;
+    let stores = (0..writer_count)
+        .map(|_| SqliteSessionStore::open(&database_path).expect("open writer store"))
+        .collect::<Vec<_>>();
+    let barrier = Arc::new(Barrier::new(writer_count));
+    let handles = stores
+        .into_iter()
+        .enumerate()
+        .map(|(writer_index, mut writer_store)| {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                writer_store
+                    .commit_session_settings_update(
+                        session.session_id,
+                        branch.branch_id,
+                        None,
+                        Some(Some(format!("model-{writer_index}"))),
+                        None,
+                    )
+                    .expect("commit settings update")
+                    .session
+                    .settings_revision_id
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut revisions = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("writer thread"))
+        .collect::<Vec<_>>();
+    revisions.sort_unstable();
+    assert_eq!(revisions, (2..=writer_count as u64 + 1).collect::<Vec<_>>());
+
+    for revision in revisions {
+        assert!(
+            store
+                .load_session_settings_revision(session.session_id, revision)
+                .expect("load revision")
+                .is_some(),
+            "every allocated revision remains addressable"
+        );
+    }
+    assert_eq!(
+        store
+            .load_session(session.session_id)
+            .expect("load session")
+            .expect("session exists")
+            .settings_revision_id,
+        writer_count as u64 + 1
+    );
+}
+
+#[test]
 fn turn_admission_waits_for_a_short_lived_sqlite_writer() {
     let temp_dir = TempDir::new().expect("tempdir");
     let database_path = temp_dir.path().join("sessions.sqlite");

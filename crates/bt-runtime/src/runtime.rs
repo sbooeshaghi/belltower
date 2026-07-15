@@ -50,7 +50,7 @@ mod tests;
 mod types;
 
 pub use types::{
-    BootstrappedTurn, BranchTranscriptPage, BudgetEnforcementOutcome, ContextCompactionReport,
+    AdmittedTurn, BranchTranscriptPage, BudgetEnforcementOutcome, ContextCompactionReport,
     PostTurnControlAction, PreparedTurnContext, QueuedDispatch, ResumableToolCall,
     UserMessageAdmission,
 };

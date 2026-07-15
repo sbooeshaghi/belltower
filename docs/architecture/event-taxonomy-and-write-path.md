@@ -180,6 +180,10 @@ The control-plane rule is now explicit:
   single active-turn slot by appending the user message plus `turn.started`, or
   appends a queued-input transition under the settings revision observed in
   that same transaction
+- direct admission and queued/steered continuation claims evaluate durable
+  budget state in that ownership transaction; an exhausted session cannot
+  acquire executable work even if another request races the terminal budget
+  checkpoint
 - the active-turn projection is a rebuildable coordination read model over
   canonical turn boundaries; transports must not recreate a process-local
   busy/idle heuristic
@@ -189,16 +193,61 @@ The control-plane rule is now explicit:
 - queue and steer continuation claims compare exact durable source event ids
   and append their resolution plus resumed `turn.started` transition in one
   write transaction
-- `session.settings.updated` advances a durable `settings_revision_id`, and runtime control events capture the revision they should later run under
+- `session.settings.updated` advances a durable `settings_revision_id` allocated
+  inside the append transaction; the event carries the complete connection,
+  model, and tool-mode snapshot rather than a patch, and runtime control events
+  capture the revision they should later run under
 - `session.queued_message.enqueued` and `session.steered` capture a settings revision, and runtime resolves the matching historical settings snapshot before it starts the follow-up turn
 - `turn.started` records the settings revision actually used for that turn, so paused turns can resume under their original model/connection
 - `operator.command.recorded` is audit/output context only, not the source of truth for queue or control state
-- `budget.configured` carries the canonical session autonomy limits, while `budget.checkpoint` carries the restart-safe used-so-far counters that runtime later enforces against
+- `budget.configured` is the sole canonical owner of session autonomy limits;
+  `budget.checkpoint` carries only restart-safe used-so-far counters and cannot
+  overwrite newer policy
+- budget policy changes are idle-boundary operations. The store rejects
+  `budget.configured` while a turn owns the active slot; when an idle update is
+  already exhausted by persisted counters, the configuration and resulting
+  `session.cancelled` event commit in one transaction. That budget-specific
+  stop event is retained even when a distinct operator cancellation was already
+  pending, so the event log preserves both causes
 - budget checkpoint elapsed-time accounting is derived from durable turn and
   checkpoint timestamps, not a process-local timer
+- budget checkpoint counters are monotonic. A fresh cost budget starts at a
+  known zero; observing an unpriced completion makes cumulative cost unknown,
+  which conservatively exhausts a configured cost ceiling rather than silently
+  treating unknown cost as free
+- at every terminal turn boundary, runtime keeps active-turn ownership while
+  the store commits the checkpoint, any resulting budget cancellation, all
+  terminal evidence, and the final `turn.finished` in one transaction. Event
+  publication follows committed sequence order while runtime still owns the
+  serialized store boundary. The transaction must prove that the exact
+  session/branch/turn still owns the active slot before appending any terminal
+  evidence; duplicate or stale live finish attempts fail without writes.
+  Restart recovery follows the same ordering for interrupted turns
+- live tool request/result transitions and in-turn approval evidence also use
+  an exact session/branch/turn owner check in the same transaction that appends
+  their events. A stale runtime whose turn was recovered cannot add more tool
+  lifecycle evidence
+- deferred approval and pending-input continuations claim the exact original
+  request instance, identified by session, branch, turn, call id, tool name,
+  and request sequence. The store validates that request is still pending and
+  atomically appends the resolution evidence plus resumed `turn.started` before
+  tool execution. Budget exhaustion, pending cancellation, active ownership,
+  or a stale request leaves the pending work unconsumed
+- standalone budget checkpoints require the same exact active-turn owner as
+  terminal transitions; a stale or already-finished turn cannot advance the
+  budget projection
 - budget exhaustion is recorded as `session.cancelled { reason:
   "budget_exhausted" }`, and that durable control state is what later
   inspection surfaces read
+- a successful direct, queued, steered, approval-resumed, or input-resumed
+  admission returns an opaque
+  runtime-issued turn capability; transport and execution hosts cannot forge an
+  already-started turn from a raw id or caller-supplied lifecycle flag, and the
+  capability cannot be rebound to another session or branch
+- child-session creation, initial settings, root branch, parent spawn request,
+  child start/handoff, and parent spawn completion commit as one store
+  transition. A historical parent turn is causal lineage, not permission to
+  append new live events to that already-finished turn
 - `context.compacted` records a stable `compaction_id`, trigger, phase, status,
   provider/model, context boundary, summary message reference, first-kept
   message/source reference when available, latency, and before/after accounting.

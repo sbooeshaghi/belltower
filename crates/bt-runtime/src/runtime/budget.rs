@@ -8,6 +8,7 @@ impl BelltowerRuntime {
         session_id: SessionId,
         turn_id: TurnId,
         projection: &SessionBudgetProjection,
+        terminal_at: Option<time::OffsetDateTime>,
     ) -> Result<TurnBudgetWindow> {
         let events = self.all_events(session_id)?;
         let mut window = TurnBudgetWindow {
@@ -18,6 +19,7 @@ impl BelltowerRuntime {
             anchor_time: projection.updated_at,
             delta_usage: zero_usage(),
             delta_cost_used_usd: None,
+            delta_cost_is_unknown: false,
             finished_at: None,
             already_checkpointed: false,
         };
@@ -38,6 +40,8 @@ impl BelltowerRuntime {
                     if let Some(cost) = cost {
                         window.delta_cost_used_usd =
                             Some(window.delta_cost_used_usd.unwrap_or(0.0) + cost.total_usd);
+                    } else {
+                        window.delta_cost_is_unknown = true;
                     }
                 }
                 EventPayload::TurnFinished { .. } => {
@@ -57,6 +61,7 @@ impl BelltowerRuntime {
                     window.anchor_time = event.occurred_at;
                     window.delta_usage = zero_usage();
                     window.delta_cost_used_usd = None;
+                    window.delta_cost_is_unknown = false;
                     window.already_checkpointed = true;
                 }
                 _ => {}
@@ -71,8 +76,11 @@ impl BelltowerRuntime {
             })?;
         }
         if window.finished_at.is_none() {
+            window.finished_at = terminal_at;
+        }
+        if window.finished_at.is_none() {
             return Err(bt_core::BelltowerError::InvalidState(format!(
-                "turn `{turn_id}` has no durable finish event for budget checkpointing"
+                "turn `{turn_id}` has neither a durable finish nor an active terminal timestamp for budget checkpointing"
             )));
         }
 

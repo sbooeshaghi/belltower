@@ -436,25 +436,12 @@ async fn send_message(
 ) -> Result<(StatusCode, Json<SendMessageResponse>), ApiError> {
     let session = require_session(&state, session_id)?;
     let branch = require_branch(&state, session_id, request.branch_id, "branch")?;
-    state
-        .runtime
-        .ensure_session_budget_allows_turn(session.session_id)?;
     let outcome = match state
         .runtime
         .admit_user_message(&session, &branch, request.message)?
     {
         UserMessageAdmission::Started(started) => {
-            run_session_turn_with_turn_id(
-                &state,
-                &session,
-                &branch,
-                Some(started.turn_id),
-                true,
-                started.settings_revision_id,
-                bt_core::TurnStartSource::UserMessage,
-                None,
-            )
-            .await?;
+            run_session_turn(&state, &session, &branch, started).await?;
             SendMessageOutcome::Dispatched
         }
         UserMessageAdmission::Queued { position } => SendMessageOutcome::Queued { position },
@@ -591,7 +578,7 @@ async fn approve_tool(
         )?;
         let turn_session = state
             .runtime
-            .session_for_settings_revision(&resumable.session, resumed.settings_revision_id)?;
+            .session_for_settings_revision(&resumable.session, resumed.settings_revision_id())?;
         let connection = state
             .runtime
             .connection(&turn_session.connection_id)
@@ -610,7 +597,7 @@ async fn approve_tool(
             &state,
             &turn_session,
             branch.branch_id,
-            Some(resumed.turn_id),
+            Some(resumed.turn_id()),
             &resumable.tool_call,
             decision,
         )
@@ -624,7 +611,7 @@ async fn approve_tool(
                     &branch,
                     &connection,
                     &model_id,
-                    resumed.turn_id,
+                    resumed.turn_id(),
                     &resumable.tool_call,
                     &error.0,
                     latency_ms,
@@ -641,7 +628,7 @@ async fn approve_tool(
         if let Err(persistence_error) = state.runtime.record_tool_terminal_transition(
             turn_session.session_id,
             branch.branch_id,
-            resumed.turn_id,
+            resumed.turn_id(),
             tool_result.clone(),
             tool_result_message,
         ) {
@@ -651,7 +638,7 @@ async fn approve_tool(
                 branch.branch_id,
                 &connection.provider,
                 &model_id,
-                resumed.turn_id,
+                resumed.turn_id(),
                 vec![tool_result],
                 &persistence_error,
                 latency_ms,
@@ -663,10 +650,10 @@ async fn approve_tool(
             .has_pending_approvals_on_branch(turn_session.session_id, branch.branch_id)?
         {
             let latency_ms = started.elapsed().as_millis() as u64;
-            state.runtime.record_turn_finished(
+            state.runtime.record_active_turn_finished(
                 turn_session.session_id,
                 branch.branch_id,
-                resumed.turn_id,
+                resumed.turn_id(),
                 connection.provider.clone(),
                 model_id.clone(),
                 "awaiting_approval".to_owned(),
@@ -675,17 +662,7 @@ async fn approve_tool(
             )?;
             return Ok(StatusCode::ACCEPTED);
         }
-        run_session_turn_with_turn_id(
-            &state,
-            &turn_session,
-            &branch,
-            Some(resumed.turn_id),
-            true,
-            resumed.settings_revision_id,
-            bt_core::TurnStartSource::ApprovalResume,
-            Some(call_id.clone()),
-        )
-        .await?;
+        run_session_turn(&state, &turn_session, &branch, resumed).await?;
 
         Ok(StatusCode::ACCEPTED)
     }
@@ -711,17 +688,7 @@ async fn answer_tool(
         let resumed = state
             .runtime
             .bootstrap_resumed_input_turn(&resumable, tool_result)?;
-        run_session_turn_with_turn_id(
-            &state,
-            &session,
-            &branch,
-            Some(resumed.turn_id),
-            true,
-            resumed.settings_revision_id,
-            bt_core::TurnStartSource::InputResume,
-            Some(request.call_id.clone()),
-        )
-        .await?;
+        run_session_turn(&state, &session, &branch, resumed).await?;
         Ok(StatusCode::ACCEPTED)
     }
     .instrument(session_span)
@@ -1470,15 +1437,11 @@ fn sse_event_for(event: bt_core::EventEnvelope) -> Event {
         .data(payload)
 }
 
-async fn run_session_turn_with_turn_id(
+async fn run_session_turn(
     state: &AppState,
     session: &SessionRecord,
     branch: &BranchRecord,
-    initial_turn_id: Option<TurnId>,
-    initial_turn_started: bool,
-    initial_settings_revision_id: u64,
-    initial_source: bt_core::TurnStartSource,
-    resumed_from_call_id: Option<ToolCallId>,
+    admitted_turn: bt_runtime::AdmittedTurn,
 ) -> Result<(), ApiError> {
     let adapters = ServerTurnAdapters {
         state: state.clone(),
@@ -1488,15 +1451,7 @@ async fn run_session_turn_with_turn_id(
         .turn_orchestrator()
         .run_session_turns(
             &adapters,
-            TurnRunRequest {
-                session: session.clone(),
-                branch: branch.clone(),
-                initial_turn_id,
-                initial_turn_started,
-                initial_settings_revision_id,
-                initial_source,
-                resumed_from_call_id,
-            },
+            TurnRunRequest::new(session.clone(), branch.clone(), admitted_turn)?,
         )
         .await?;
     Ok(())

@@ -4,7 +4,8 @@
 //! provider/auth/tool construction that are not yet runtime-owned.
 
 use crate::{
-    BelltowerRuntime, BudgetEnforcementOutcome, ContextCompactionReport, PostTurnControlAction,
+    AdmittedTurn, BelltowerRuntime, BudgetEnforcementOutcome, ContextCompactionReport,
+    PostTurnControlAction,
 };
 use bt_agent::{
     ToolLifecycleObserver, TurnApproval, TurnApprovalRequest, TurnLoop, TurnRequest,
@@ -13,9 +14,8 @@ use bt_agent::{
 use bt_context::{SystemPromptBuilder, SystemPromptInput};
 use bt_core::{
     BelltowerError, BranchId, BranchRecord, CompletionChunk, ConnectionDescriptor,
-    InstructionDocument, PlanInspection, Result, SessionId, SessionRecord, SpanKind, ToolCallId,
-    ToolResultEnvelope, ToolSpec, TurnId, TurnInstructionProvenance, TurnStartSource,
-    traits::Provider,
+    InstructionDocument, PlanInspection, Result, SessionId, SessionRecord, ToolResultEnvelope,
+    ToolSpec, TurnId, TurnInstructionProvenance, traits::Provider,
 };
 use bt_tools::BuiltInToolRegistry;
 use std::future::Future;
@@ -39,15 +39,33 @@ pub trait TurnExecutionAdapters: Send + Sync {
     ) -> TurnAdapterFuture<'a, Arc<dyn Provider>>;
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct TurnRunRequest {
-    pub session: SessionRecord,
-    pub branch: BranchRecord,
-    pub initial_turn_id: Option<TurnId>,
-    pub initial_turn_started: bool,
-    pub initial_settings_revision_id: u64,
-    pub initial_source: TurnStartSource,
-    pub resumed_from_call_id: Option<ToolCallId>,
+    session: SessionRecord,
+    branch: BranchRecord,
+    admitted_turn: AdmittedTurn,
+}
+
+impl TurnRunRequest {
+    pub fn new(
+        session: SessionRecord,
+        branch: BranchRecord,
+        admitted_turn: AdmittedTurn,
+    ) -> Result<Self> {
+        if branch.session_id != session.session_id
+            || admitted_turn.session_id != session.session_id
+            || admitted_turn.branch_id != branch.branch_id
+        {
+            return Err(BelltowerError::InvalidState(
+                "admitted turn does not belong to the requested session and branch".to_owned(),
+            ));
+        }
+        Ok(Self {
+            session,
+            branch,
+            admitted_turn,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +89,12 @@ pub enum TurnResultPersistenceStatus {
     Completed,
     AwaitingApproval,
     AwaitingInput,
+}
+
+struct PersistedTurnResult {
+    persistence: TurnResultPersistenceStatus,
+    status: String,
+    finish_reason: String,
 }
 
 impl TurnResultPersistenceStatus {
@@ -166,12 +190,9 @@ impl BelltowerRuntime {
         &self,
         session: &SessionRecord,
         branch: &BranchRecord,
-        connection: &ConnectionDescriptor,
-        model_id: &str,
         turn_id: TurnId,
         result: bt_agent::TurnResult,
-        latency_ms: u64,
-    ) -> Result<TurnResultPersistenceStatus> {
+    ) -> Result<PersistedTurnResult> {
         let bt_agent::TurnResult {
             messages,
             tool_results: _,
@@ -193,29 +214,23 @@ impl BelltowerRuntime {
             self.append_raw_message(session, branch, message, Some(turn_id))?;
         }
 
-        self.record_turn_finished(
-            session.session_id,
-            branch.branch_id,
-            turn_id,
-            connection.provider.clone(),
-            model_id.to_owned(),
-            if awaiting_input {
+        let persistence = if awaiting_input {
+            TurnResultPersistenceStatus::AwaitingInput
+        } else if awaiting_approval {
+            TurnResultPersistenceStatus::AwaitingApproval
+        } else {
+            TurnResultPersistenceStatus::Completed
+        };
+        Ok(PersistedTurnResult {
+            persistence,
+            status: if awaiting_input {
                 "awaiting_input".to_owned()
             } else if awaiting_approval {
                 "awaiting_approval".to_owned()
             } else {
                 "completed".to_owned()
             },
-            Some(finish_reason_label),
-            latency_ms,
-        )?;
-
-        Ok(if awaiting_input {
-            TurnResultPersistenceStatus::AwaitingInput
-        } else if awaiting_approval {
-            TurnResultPersistenceStatus::AwaitingApproval
-        } else {
-            TurnResultPersistenceStatus::Completed
+            finish_reason: finish_reason_label,
         })
     }
 
@@ -262,42 +277,31 @@ impl TurnOrchestrator<'_> {
         branch_id: BranchId,
         turn_id: TurnId,
         settings_revision_id: u64,
-        turn_started_already: bool,
         error: &BelltowerError,
     ) -> Result<()> {
-        if turn_started_already {
-            let (provider, model) = self
-                .runtime
-                .resolve_turn_settings(session.session_id, settings_revision_id)
-                .map(|(connection, model)| (connection.provider, model))
-                .unwrap_or_else(|_| {
-                    (
-                        session.connection_id.to_string(),
-                        session
-                            .model_id
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_owned()),
-                    )
-                });
-            return self.runtime.record_turn_failure_transition(
-                session.session_id,
-                branch_id,
-                &provider,
-                &model,
-                turn_id,
-                Vec::new(),
-                error,
-                0,
-            );
-        }
-        self.runtime.record_session_error(
+        let (provider, model) = self
+            .runtime
+            .resolve_turn_settings(session.session_id, settings_revision_id)
+            .map(|(connection, model)| (connection.provider, model))
+            .unwrap_or_else(|_| {
+                (
+                    session.connection_id.to_string(),
+                    session
+                        .model_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                )
+            });
+        self.runtime.record_turn_failure_transition(
             session.session_id,
             branch_id,
+            &provider,
+            &model,
+            turn_id,
+            Vec::new(),
             error,
-            Some(turn_id),
-            SpanKind::Agent,
-        )?;
-        Ok(())
+            0,
+        )
     }
 
     pub async fn run_session_turns<A>(
@@ -311,16 +315,14 @@ impl TurnOrchestrator<'_> {
         let session_span = session_scope_span(&request.session, request.branch.branch_id);
         async {
             let mut current_branch = request.branch;
-            let mut next_turn_id = request.initial_turn_id;
-            let mut next_turn_source = request.initial_source;
-            let mut next_resumed_from_call_id = request.resumed_from_call_id;
-            let mut next_settings_revision_id = request.initial_settings_revision_id;
-            let mut initial_turn_started = request.initial_turn_started;
+            let mut next_turn_id = Some(request.admitted_turn.turn_id);
+            let mut next_settings_revision_id = request.admitted_turn.settings_revision_id;
 
             loop {
-                let turn_id = next_turn_id.take().unwrap_or_default();
+                let turn_id = next_turn_id.take().ok_or_else(|| {
+                    BelltowerError::InvalidState("admitted turn id missing".to_owned())
+                })?;
                 let settings_revision_id = next_settings_revision_id;
-                let turn_started_already = initial_turn_started;
 
                 let preflight = async {
                     let turn_session = self
@@ -396,7 +398,6 @@ impl TurnOrchestrator<'_> {
                             current_branch.branch_id,
                             turn_id,
                             settings_revision_id,
-                            turn_started_already,
                             &error,
                         )?;
                         return Err(error);
@@ -410,19 +411,6 @@ impl TurnOrchestrator<'_> {
                     &model_id,
                 );
                 let post_turn_action = async {
-                    if !turn_started_already {
-                        self.runtime.record_turn_started(
-                            turn_session.session_id,
-                            current_branch.branch_id,
-                            turn_id,
-                            connection.provider.clone(),
-                            model_id.clone(),
-                            completion_request.messages.len() as u32,
-                            prepared_settings_revision_id,
-                            next_turn_source.clone(),
-                            next_resumed_from_call_id.take(),
-                        )?;
-                    }
                     self.runtime.record_turn_instruction_provenance(
                         turn_session.session_id,
                         current_branch.branch_id,
@@ -534,35 +522,38 @@ impl TurnOrchestrator<'_> {
                                 &error,
                                 latency_ms,
                             )?;
-                            let _ = self.runtime.checkpoint_session_budget(
-                                turn_session.session_id,
-                                current_branch.branch_id,
-                                turn_id,
-                            )?;
                             return Err(error);
                         }
                     };
 
                     let latency_ms = started.elapsed().as_millis() as u64;
-                    let persistence = self.runtime.record_turn_result(
+                    let persisted = self.runtime.record_turn_result(
                         &turn_session,
                         &current_branch,
-                        &connection,
-                        &model_id,
                         turn_id,
                         result,
-                        latency_ms,
                     )?;
-                    let budget_outcome = self.runtime.checkpoint_session_budget(
+                    let budget_outcome = self.runtime.record_active_turn_finished(
                         turn_session.session_id,
                         current_branch.branch_id,
                         turn_id,
+                        connection.provider.clone(),
+                        model_id.clone(),
+                        persisted.status,
+                        Some(persisted.finish_reason),
+                        latency_ms,
                     )?;
 
-                    if persistence.awaits_operator() {
+                    if budget_outcome == BudgetEnforcementOutcome::Exhausted {
                         return Ok((
                             PostTurnControlAction::Stop,
-                            match persistence {
+                            TurnRunStopReason::BudgetExhausted,
+                        ));
+                    }
+                    if persisted.persistence.awaits_operator() {
+                        return Ok((
+                            PostTurnControlAction::Stop,
+                            match persisted.persistence {
                                 TurnResultPersistenceStatus::AwaitingApproval => {
                                     TurnRunStopReason::AwaitingApproval
                                 }
@@ -575,13 +566,6 @@ impl TurnOrchestrator<'_> {
                             },
                         ));
                     }
-                    if budget_outcome == BudgetEnforcementOutcome::Exhausted {
-                        return Ok((
-                            PostTurnControlAction::Stop,
-                            TurnRunStopReason::BudgetExhausted,
-                        ));
-                    }
-
                     let was_cancelled = self.runtime.is_cancelled(turn_session.session_id)?;
                     self.runtime
                         .consume_post_turn_controls(&turn_session, &current_branch)
@@ -599,9 +583,7 @@ impl TurnOrchestrator<'_> {
 
                 match post_turn_action.0 {
                     PostTurnControlAction::ContinueQueuedBranch(dispatch) => {
-                        next_turn_source = TurnStartSource::QueuedFollowUp;
                         next_turn_id = Some(dispatch.turn_id);
-                        initial_turn_started = true;
                         next_settings_revision_id = dispatch.settings_revision_id;
                         current_branch = self
                             .runtime
@@ -612,9 +594,7 @@ impl TurnOrchestrator<'_> {
                         continue;
                     }
                     PostTurnControlAction::ContinueCurrentBranch(dispatch) => {
-                        next_turn_source = TurnStartSource::SteerFollowUp;
                         next_turn_id = Some(dispatch.turn_id);
-                        initial_turn_started = true;
                         next_settings_revision_id = dispatch.settings_revision_id;
                         continue;
                     }

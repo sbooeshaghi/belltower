@@ -1,8 +1,9 @@
 use crate::{CompletionCostReprojector, ReprojectionReport, StoredSessionEvent, apply_migrations};
 use bt_core::{
-    ApprovalScope, BelltowerError, BranchHead, BranchId, BranchRecord, BudgetConfig, EventEnvelope,
-    EventPayload, Message, Result, Role, SessionId, SessionRecord, SessionSettingsSnapshot,
-    SessionToolMode, ToolCallId, ToolOperationContext, TurnId, TurnStartSource,
+    ApprovalScope, BelltowerError, BranchHead, BranchId, BranchRecord, BudgetConfig, ConnectionId,
+    EventEnvelope, EventPayload, Message, Result, Role, SessionId, SessionRecord,
+    SessionSettingsSnapshot, SessionToolMode, SpanKind, ToolCallId, ToolOperationContext, TurnId,
+    TurnStartSource,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::HashMap;
@@ -30,18 +31,19 @@ mod paging;
 mod projections;
 mod search;
 use admission::{
-    validate_queued_continuation_events, validate_steer_continuation_events,
-    validate_turn_admission_events,
+    validate_queued_continuation_events, validate_resumed_continuation_events,
+    validate_steer_continuation_events, validate_turn_admission_events,
 };
 mod types;
 pub use types::{
-    ApprovalProjection, ChunkPage, ContextManifestProjection, ContextMessageRecord,
+    ApprovalProjection, ChunkPage, CommittedBudgetCheckpoint, CommittedBudgetConfiguration,
+    CommittedSessionSettingsUpdate, ContextManifestProjection, ContextMessageRecord,
     ContinuationClaim, CostSummaryProjection, PlanProjection, QueuedMessageProjection,
-    RawChunkInsert, RawChunkRecord, RecordedOperatorCommandRecord, ResumedTurnRecoveryRecord,
-    ReusableApprovalProjection, SequencedMessageRecord, SessionBudgetProjection,
-    SessionControlProjection, SessionInspectionMetrics, SessionSettingsRevisionProjection,
-    SessionTurnAdmission, SteerProjection, ToolOperationRecoveryRecord, ToolRunProjection,
-    TranscriptPage, TurnRecoveryRecord,
+    RawChunkInsert, RawChunkRecord, RecordedOperatorCommandRecord, ResumedContinuationKind,
+    ResumedTurnRecoveryRecord, ReusableApprovalProjection, SequencedMessageRecord,
+    SessionBudgetProjection, SessionControlProjection, SessionInspectionMetrics,
+    SessionSettingsRevisionProjection, SessionTurnAdmission, SteerProjection,
+    ToolOperationRecoveryRecord, ToolRunProjection, TranscriptPage, TurnRecoveryRecord,
 };
 
 impl SqliteSessionStore {
@@ -70,6 +72,103 @@ impl SqliteSessionStore {
         Self::insert_branch_in_tx(&tx, branch)?;
         tx.commit().map_err(storage_error)?;
         Ok(())
+    }
+
+    pub fn commit_child_session_spawn(
+        &mut self,
+        child_session: &SessionRecord,
+        child_branch: &BranchRecord,
+        spawn_requested: &EventEnvelope,
+        child_started: &EventEnvelope,
+        child_handoff: &EventEnvelope,
+        spawn_completed: &EventEnvelope,
+    ) -> Result<Vec<i64>> {
+        let objective = child_session.objective.as_deref().ok_or_else(|| {
+            BelltowerError::InvalidState("child session spawn requires an objective".to_owned())
+        })?;
+        let parent_session_id = child_session.parent_session_id.ok_or_else(|| {
+            BelltowerError::InvalidState("child session spawn requires a parent session".to_owned())
+        })?;
+        let parent_branch_id = child_session.parent_branch_id.ok_or_else(|| {
+            BelltowerError::InvalidState("child session spawn requires a parent branch".to_owned())
+        })?;
+        let child_connection_id = child_session.connection_id.to_string();
+        let valid_scope = child_branch.session_id == child_session.session_id
+            && spawn_requested.session_id == parent_session_id
+            && spawn_requested.branch_id == parent_branch_id
+            && spawn_requested.turn_id == child_session.parent_turn_id
+            && child_started.session_id == child_session.session_id
+            && child_started.branch_id == child_branch.branch_id
+            && child_started.turn_id.is_none()
+            && child_handoff.session_id == child_session.session_id
+            && child_handoff.branch_id == child_branch.branch_id
+            && child_handoff.turn_id.is_none()
+            && spawn_completed.session_id == parent_session_id
+            && spawn_completed.branch_id == parent_branch_id
+            && spawn_completed.turn_id == child_session.parent_turn_id;
+        let valid_payloads = matches!(
+            &spawn_requested.payload,
+            EventPayload::SessionSpawnRequested {
+                child_session_id,
+                objective: event_objective,
+                connection_id,
+                model_id,
+            } if *child_session_id == child_session.session_id
+                && event_objective == objective
+                && connection_id == &child_connection_id
+                && model_id == &child_session.model_id
+        ) && matches!(
+            &child_started.payload,
+            EventPayload::SessionStarted {
+                project_root,
+                connection_id,
+            } if project_root == child_session.project_root.as_str()
+                && connection_id == &child_connection_id
+        ) && matches!(
+            &child_handoff.payload,
+            EventPayload::SessionHandoffRecorded {
+                parent_session_id: event_parent_session_id,
+                parent_branch_id: event_parent_branch_id,
+                parent_turn_id,
+                objective: event_objective,
+                summary,
+            } if *event_parent_session_id == parent_session_id
+                && *event_parent_branch_id == parent_branch_id
+                && *parent_turn_id == child_session.parent_turn_id
+                && event_objective == objective
+                && summary == objective
+        ) && matches!(
+            &spawn_completed.payload,
+            EventPayload::SessionSpawned {
+                child_session_id,
+                child_branch_id,
+                objective: event_objective,
+            } if *child_session_id == child_session.session_id
+                && *child_branch_id == child_branch.branch_id
+                && event_objective == objective
+        );
+        if !valid_scope || !valid_payloads {
+            return Err(BelltowerError::InvalidState(
+                "child session spawn events do not match the canonical parent/child records"
+                    .to_owned(),
+            ));
+        }
+
+        let tx = self.connection.transaction().map_err(storage_error)?;
+        Self::insert_session_in_tx(&tx, child_session)?;
+        Self::insert_session_settings_revision_in_tx(&tx, child_session)?;
+        Self::insert_branch_in_tx(&tx, child_branch)?;
+        let seq_ids = Self::append_events_in_tx(
+            &tx,
+            &[
+                spawn_requested.clone(),
+                child_started.clone(),
+                child_handoff.clone(),
+                spawn_completed.clone(),
+            ],
+        )?;
+        tx.commit().map_err(storage_error)?;
+        Ok(seq_ids)
     }
 
     pub fn import_session_with_raw_chunks_and_events<F>(
@@ -139,6 +238,245 @@ impl SqliteSessionStore {
         Ok(seq_ids)
     }
 
+    pub fn commit_active_turn_events(
+        &mut self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        turn_id: TurnId,
+        events: &[EventEnvelope],
+    ) -> Result<Vec<i64>> {
+        Self::validate_active_turn_events(session_id, branch_id, turn_id, events)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        Self::ensure_active_turn_owner_in_tx(&tx, session_id, branch_id, turn_id)?;
+        let seq_ids = Self::append_events_in_tx(&tx, events)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(seq_ids)
+    }
+
+    pub fn commit_turn_terminal_transition(
+        &mut self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        turn_id: TurnId,
+        terminal_events: &[EventEnvelope],
+    ) -> Result<Vec<i64>> {
+        Self::validate_turn_terminal_events(session_id, branch_id, turn_id, terminal_events)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        Self::ensure_active_turn_owner_in_tx(&tx, session_id, branch_id, turn_id)?;
+        let seq_ids = Self::append_events_in_tx(&tx, terminal_events)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(seq_ids)
+    }
+
+    pub fn commit_budget_checkpoint(
+        &mut self,
+        checkpoint: &EventEnvelope,
+        cancellation: &EventEnvelope,
+    ) -> Result<CommittedBudgetCheckpoint> {
+        self.commit_budget_checkpoint_transition(checkpoint, cancellation, &[], false)
+    }
+
+    pub fn commit_budget_terminal_transition(
+        &mut self,
+        checkpoint: &EventEnvelope,
+        cancellation: &EventEnvelope,
+        terminal_events: &[EventEnvelope],
+    ) -> Result<CommittedBudgetCheckpoint> {
+        self.commit_budget_checkpoint_transition(checkpoint, cancellation, terminal_events, true)
+    }
+
+    fn commit_budget_checkpoint_transition(
+        &mut self,
+        checkpoint: &EventEnvelope,
+        cancellation: &EventEnvelope,
+        terminal_events: &[EventEnvelope],
+        require_terminal_finish: bool,
+    ) -> Result<CommittedBudgetCheckpoint> {
+        if checkpoint.session_id != cancellation.session_id
+            || checkpoint.branch_id != cancellation.branch_id
+            || !matches!(&checkpoint.payload, EventPayload::BudgetCheckpoint { .. })
+            || !matches!(&cancellation.payload, EventPayload::SessionCancelled { .. })
+        {
+            return Err(BelltowerError::InvalidState(
+                "budget checkpoint transition contains inconsistent events".to_owned(),
+            ));
+        }
+        if terminal_events.iter().any(|event| {
+            event.session_id != checkpoint.session_id
+                || event.branch_id != checkpoint.branch_id
+                || event.turn_id != checkpoint.turn_id
+        }) {
+            return Err(BelltowerError::InvalidState(
+                "budget terminal transition contains events outside the checkpoint turn".to_owned(),
+            ));
+        }
+        if require_terminal_finish
+            && !matches!(
+                terminal_events.last().map(|event| &event.payload),
+                Some(EventPayload::TurnFinished { turn_id, .. })
+                    if Some(*turn_id) == checkpoint.turn_id
+            )
+        {
+            return Err(BelltowerError::InvalidState(
+                "budget terminal transition must end with turn.finished".to_owned(),
+            ));
+        }
+
+        let turn_id = checkpoint.turn_id.ok_or_else(|| {
+            BelltowerError::InvalidState(
+                "budget checkpoint transition is missing a turn id".to_owned(),
+            )
+        })?;
+        if require_terminal_finish {
+            Self::validate_turn_terminal_events(
+                checkpoint.session_id,
+                checkpoint.branch_id,
+                turn_id,
+                terminal_events,
+            )?;
+        }
+
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        Self::ensure_active_turn_owner_in_tx(
+            &tx,
+            checkpoint.session_id,
+            checkpoint.branch_id,
+            turn_id,
+        )?;
+        let checkpoint_seq_id = Self::append_event_in_tx(&tx, checkpoint)?;
+        let exhausted = Self::session_budget_exhausted_in_tx(&tx, checkpoint.session_id)?;
+        let cancellation_seq_id = exhausted
+            .then(|| Self::append_event_in_tx(&tx, cancellation))
+            .transpose()?;
+        let terminal_seq_ids = Self::append_events_in_tx(&tx, terminal_events)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(CommittedBudgetCheckpoint {
+            checkpoint_seq_id,
+            cancellation_seq_id,
+            terminal_seq_ids,
+            exhausted,
+        })
+    }
+
+    pub fn commit_budget_configuration(
+        &mut self,
+        configuration: &EventEnvelope,
+        cancellation: &EventEnvelope,
+    ) -> Result<CommittedBudgetConfiguration> {
+        if configuration.session_id != cancellation.session_id
+            || configuration.branch_id != cancellation.branch_id
+            || !matches!(
+                &configuration.payload,
+                EventPayload::BudgetConfigured { .. }
+            )
+            || !matches!(&cancellation.payload, EventPayload::SessionCancelled { .. })
+        {
+            return Err(BelltowerError::InvalidState(
+                "budget configuration transition contains inconsistent events".to_owned(),
+            ));
+        }
+
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        if Self::active_turn_exists_in_tx(&tx, configuration.session_id)? {
+            return Err(BelltowerError::InvalidState(
+                "session budget can only be configured while the session is idle".to_owned(),
+            ));
+        }
+        let configuration_seq_id = Self::append_event_in_tx(&tx, configuration)?;
+        let exhausted = Self::session_budget_exhausted_in_tx(&tx, configuration.session_id)?;
+        // A prior operator cancellation is not evidence that this budget transition
+        // exhausted the session. Preserve the distinct budget stop reason durably.
+        let cancellation_seq_id = exhausted
+            .then(|| Self::append_event_in_tx(&tx, cancellation))
+            .transpose()?;
+        tx.commit().map_err(storage_error)?;
+        Ok(CommittedBudgetConfiguration {
+            configuration_seq_id,
+            cancellation_seq_id,
+            exhausted,
+        })
+    }
+
+    pub fn commit_session_settings_update(
+        &mut self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        connection_id: Option<ConnectionId>,
+        model_id: Option<Option<String>>,
+        tool_mode: Option<SessionToolMode>,
+    ) -> Result<CommittedSessionSettingsUpdate> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let current = tx
+            .query_row(
+                "SELECT connection_id, model_id, tool_mode, settings_revision_id
+                 FROM sessions WHERE session_id = ?1",
+                params![session_id.to_string()],
+                |row| {
+                    Ok((
+                        ConnectionId::new(row.get::<_, String>(0)?),
+                        row.get::<_, Option<String>>(1)?,
+                        parse_session_tool_mode(row.get::<_, String>(2)?),
+                        row.get::<_, i64>(3)?.max(1) as u64,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| BelltowerError::InvalidState("session not found".to_owned()))?;
+        let settings_revision_id = current.3.checked_add(1).ok_or_else(|| {
+            BelltowerError::InvalidState("session settings revision exhausted".to_owned())
+        })?;
+        i64::try_from(settings_revision_id).map_err(|_| {
+            BelltowerError::InvalidState("session settings revision exhausted".to_owned())
+        })?;
+        let connection_id = connection_id.unwrap_or(current.0);
+        let model_id = model_id.unwrap_or(current.1);
+        let tool_mode = tool_mode.unwrap_or(current.2);
+        let event = EventEnvelope::new(
+            session_id,
+            branch_id,
+            SpanKind::Session,
+            EventPayload::SessionSettingsUpdated {
+                settings_revision_id,
+                connection_id: connection_id.to_string(),
+                model_id: model_id.clone(),
+                tool_mode: session_tool_mode_to_str(tool_mode).to_owned(),
+            },
+        );
+        let seq_id = Self::append_event_in_tx(&tx, &event)?;
+        let session = tx
+            .query_row(
+                "SELECT session_id, project_root, connection_id, model_id, tool_mode,
+                        settings_revision_id, created_at, updated_at, status, display_name,
+                        objective, parent_session_id, parent_branch_id, parent_turn_id
+                 FROM sessions WHERE session_id = ?1",
+                params![session_id.to_string()],
+                parse_session_record,
+            )
+            .map_err(storage_error)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(CommittedSessionSettingsUpdate {
+            session,
+            event,
+            seq_id,
+        })
+    }
+
     pub fn admit_turn_or_queue(
         &mut self,
         session_id: SessionId,
@@ -173,6 +511,10 @@ impl SqliteSessionStore {
             started_events,
             queued_events,
         )?;
+
+        if Self::session_budget_exhausted_in_tx(&tx, session_id)? {
+            return Ok(SessionTurnAdmission::BudgetExhausted);
+        }
 
         if Self::session_has_pending_work_in_tx(&tx, session_id)? {
             let seq_ids = Self::append_events_in_tx(&tx, queued_events)?;
@@ -215,6 +557,9 @@ impl SqliteSessionStore {
         }
         if Self::active_turn_exists_in_tx(&tx, session_id)? {
             return Ok(ContinuationClaim::Busy);
+        }
+        if Self::session_budget_exhausted_in_tx(&tx, session_id)? {
+            return Ok(ContinuationClaim::BudgetExhausted);
         }
         let next_queue = tx
             .query_row(
@@ -266,6 +611,9 @@ impl SqliteSessionStore {
         if Self::active_turn_exists_in_tx(&tx, session_id)? {
             return Ok(ContinuationClaim::Busy);
         }
+        if Self::session_budget_exhausted_in_tx(&tx, session_id)? {
+            return Ok(ContinuationClaim::BudgetExhausted);
+        }
         let pending_sources = {
             let mut statement = tx
                 .prepare(
@@ -314,6 +662,69 @@ impl SqliteSessionStore {
         Ok(ContinuationClaim::Claimed { seq_ids })
     }
 
+    pub fn claim_resumed_continuation(
+        &mut self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        call_id: &ToolCallId,
+        tool_name: &str,
+        expected_turn_id: TurnId,
+        expected_request_seq_id: i64,
+        expected_settings_revision_id: u64,
+        kind: ResumedContinuationKind,
+        events: &[EventEnvelope],
+    ) -> Result<ContinuationClaim> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        if Self::session_budget_exhausted_in_tx(&tx, session_id)? {
+            return Ok(ContinuationClaim::BudgetExhausted);
+        }
+        if Self::cancel_requested_in_tx(&tx, session_id)? {
+            return Ok(ContinuationClaim::CancelPending);
+        }
+        if Self::active_turn_exists_in_tx(&tx, session_id)? {
+            return Ok(ContinuationClaim::Busy);
+        }
+        let pending = match kind {
+            ResumedContinuationKind::Approval => tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM approval_projection
+                    WHERE session_id = ?1 AND call_id = ?2 AND tool_name = ?3 AND status = 'pending'
+                      AND branch_id = ?4 AND turn_id = ?5 AND requested_seq_id = ?6
+                )",
+                params![session_id.to_string(), call_id.to_string(), tool_name, branch_id.to_string(), expected_turn_id.to_string(), expected_request_seq_id],
+                |row| row.get::<_, i64>(0),
+            ),
+            ResumedContinuationKind::Input => tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM tool_run_projection
+                    WHERE session_id = ?1 AND call_id = ?2 AND tool_name = ?3 AND status = 'requested'
+                      AND branch_id = ?4 AND turn_id = ?5 AND requested_seq_id = ?6
+                )",
+                params![session_id.to_string(), call_id.to_string(), tool_name, branch_id.to_string(), expected_turn_id.to_string(), expected_request_seq_id],
+                |row| row.get::<_, i64>(0),
+            ),
+        }
+        .map_err(storage_error)?
+            != 0;
+        if !pending {
+            return Ok(ContinuationClaim::Stale);
+        }
+        validate_resumed_continuation_events(
+            session_id,
+            branch_id,
+            call_id,
+            expected_settings_revision_id,
+            kind,
+            events,
+        )?;
+        let seq_ids = Self::append_events_in_tx(&tx, events)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(ContinuationClaim::Claimed { seq_ids })
+    }
+
     pub fn append_raw_chunk_with_event<F>(
         &mut self,
         session_id: SessionId,
@@ -329,6 +740,9 @@ impl SqliteSessionStore {
         F: FnOnce(i64) -> Result<EventEnvelope>,
     {
         let tx = self.connection.transaction().map_err(storage_error)?;
+        if let Some(turn_id) = turn_id {
+            Self::ensure_active_turn_owner_in_tx(&tx, session_id, branch_id, turn_id)?;
+        }
         tx.execute(
             "INSERT INTO raw_chunks (session_id, branch_id, turn_id, llm_call_ordinal, event_id, provider, stream_name, content, received_at)
              VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8)",
@@ -367,8 +781,11 @@ impl SqliteSessionStore {
         stream_name: &str,
         content: &[u8],
     ) -> Result<i64> {
-        self.connection
-            .execute(
+        let tx = self.connection.transaction().map_err(storage_error)?;
+        if let Some(turn_id) = turn_id {
+            Self::ensure_active_turn_owner_in_tx(&tx, session_id, branch_id, turn_id)?;
+        }
+        tx.execute(
             "INSERT INTO raw_chunks (session_id, branch_id, turn_id, llm_call_ordinal, event_id, provider, stream_name, content, received_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
@@ -384,7 +801,9 @@ impl SqliteSessionStore {
             ],
         )
             .map_err(storage_error)?;
-        Ok(self.connection.last_insert_rowid())
+        let chunk_id = tx.last_insert_rowid();
+        tx.commit().map_err(storage_error)?;
+        Ok(chunk_id)
     }
 
     pub fn load_raw_chunks(
@@ -524,6 +943,81 @@ impl SqliteSessionStore {
         .map_err(storage_error)
     }
 
+    fn ensure_active_turn_owner_in_tx(
+        tx: &Transaction<'_>,
+        session_id: SessionId,
+        branch_id: BranchId,
+        turn_id: TurnId,
+    ) -> Result<()> {
+        let owns_active_turn = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM active_turn_projection
+                    WHERE session_id = ?1 AND branch_id = ?2 AND turn_id = ?3
+                )",
+                params![
+                    session_id.to_string(),
+                    branch_id.to_string(),
+                    turn_id.to_string(),
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage_error)?
+            != 0;
+        if !owns_active_turn {
+            return Err(BelltowerError::InvalidState(
+                "terminal transition does not own the active turn".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_active_turn_events(
+        session_id: SessionId,
+        branch_id: BranchId,
+        turn_id: TurnId,
+        events: &[EventEnvelope],
+    ) -> Result<()> {
+        if events.is_empty()
+            || events.iter().any(|event| {
+                event.session_id != session_id
+                    || event.branch_id != branch_id
+                    || event.turn_id != Some(turn_id)
+                    || matches!(&event.payload, EventPayload::TurnFinished { .. })
+            })
+        {
+            return Err(BelltowerError::InvalidState(
+                "active turn transition must contain non-terminal events for exactly one turn"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_turn_terminal_events(
+        session_id: SessionId,
+        branch_id: BranchId,
+        turn_id: TurnId,
+        terminal_events: &[EventEnvelope],
+    ) -> Result<()> {
+        if terminal_events.iter().any(|event| {
+            event.session_id != session_id
+                || event.branch_id != branch_id
+                || event.turn_id != Some(turn_id)
+        }) || !matches!(
+            terminal_events.last().map(|event| &event.payload),
+            Some(EventPayload::TurnFinished {
+                turn_id: finished_turn_id,
+                ..
+            }) if *finished_turn_id == turn_id
+        ) {
+            return Err(BelltowerError::InvalidState(
+                "terminal transition must contain one turn and end with turn.finished".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn cancel_requested_in_tx(tx: &Transaction<'_>, session_id: SessionId) -> Result<bool> {
         tx.query_row(
             "SELECT COALESCE((
@@ -534,6 +1028,46 @@ impl SqliteSessionStore {
         )
         .map(|value| value != 0)
         .map_err(storage_error)
+    }
+
+    fn session_budget_exhausted_in_tx(tx: &Transaction<'_>, session_id: SessionId) -> Result<bool> {
+        let projection = tx
+            .query_row(
+                "SELECT max_wall_clock_seconds, max_tokens, max_turns, max_cost_usd,
+                        tokens_used, turns_used, elapsed_seconds, cost_used_usd
+                 FROM session_budget_projection WHERE session_id = ?1",
+                params![session_id.to_string()],
+                |row| {
+                    Ok((
+                        BudgetConfig {
+                            max_wall_clock_seconds: row
+                                .get::<_, Option<i64>>(0)?
+                                .map(|value| u64::try_from(value).map_err(to_sql_conversion))
+                                .transpose()?,
+                            max_tokens: row
+                                .get::<_, Option<i64>>(1)?
+                                .map(|value| u64::try_from(value).map_err(to_sql_conversion))
+                                .transpose()?,
+                            max_turns: row
+                                .get::<_, Option<i64>>(2)?
+                                .map(|value| u32::try_from(value).map_err(to_sql_conversion))
+                                .transpose()?,
+                            max_cost_usd: row.get(3)?,
+                        },
+                        row.get::<_, i64>(4)?.max(0) as u64,
+                        row.get::<_, i64>(5)?.max(0) as u32,
+                        row.get::<_, i64>(6)?.max(0) as u64,
+                        row.get::<_, Option<f64>>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        Ok(projection.is_some_and(
+            |(budget, tokens_used, turns_used, elapsed_seconds, cost_used_usd)| {
+                budget.is_exhausted(tokens_used, turns_used, elapsed_seconds, cost_used_usd)
+            },
+        ))
     }
 
     fn session_has_pending_work_in_tx(tx: &Transaction<'_>, session_id: SessionId) -> Result<bool> {
@@ -699,53 +1233,6 @@ impl SqliteSessionStore {
             )
             .map_err(storage_error)?;
         Ok(exists != 0)
-    }
-
-    pub fn update_session(
-        &mut self,
-        session_id: SessionId,
-        connection_id: &bt_core::ConnectionId,
-        model_id: Option<&str>,
-        tool_mode: SessionToolMode,
-        settings_revision_id: u64,
-    ) -> Result<()> {
-        let updated_at = OffsetDateTime::now_utc();
-        let tx = self.connection.transaction().map_err(storage_error)?;
-        tx.execute(
-            "UPDATE sessions
-             SET connection_id = ?1, model_id = ?2, tool_mode = ?3, settings_revision_id = ?4, updated_at = ?5
-             WHERE session_id = ?6",
-            params![
-                connection_id.to_string(),
-                model_id,
-                session_tool_mode_to_str(tool_mode),
-                settings_revision_id as i64,
-                format_time(updated_at)?,
-                session_id.to_string(),
-            ],
-        )
-        .map_err(storage_error)?;
-        tx.execute(
-            "INSERT INTO session_settings_revision_projection (
-                session_id, settings_revision_id, connection_id, model_id, tool_mode, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-            ON CONFLICT(session_id, settings_revision_id) DO UPDATE SET
-                connection_id = excluded.connection_id,
-                model_id = excluded.model_id,
-                tool_mode = excluded.tool_mode,
-                updated_at = excluded.updated_at",
-            params![
-                session_id.to_string(),
-                settings_revision_id as i64,
-                connection_id.to_string(),
-                model_id,
-                session_tool_mode_to_str(tool_mode),
-                format_time(updated_at)?,
-            ],
-        )
-        .map_err(storage_error)?;
-        tx.commit().map_err(storage_error)?;
-        Ok(())
     }
 
     pub fn update_session_parent(
@@ -1281,7 +1768,7 @@ impl SqliteSessionStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT call_id, session_id, tool_name, status, request_fingerprint, request_snapshot_json, decision_json, resolution_json, updated_at
+                "SELECT call_id, session_id, tool_name, status, branch_id, turn_id, requested_seq_id, request_fingerprint, request_snapshot_json, decision_json, resolution_json, updated_at
              FROM approval_projection
              WHERE session_id = ?1
              ORDER BY updated_at ASC",
@@ -1289,9 +1776,9 @@ impl SqliteSessionStore {
             .map_err(storage_error)?;
         let rows = statement
             .query_map(params![session_id.to_string()], |row| {
-                let request_snapshot_json: Option<String> = row.get(5)?;
-                let decision_json: Option<String> = row.get(6)?;
-                let resolution_json: Option<String> = row.get(7)?;
+                let request_snapshot_json: Option<String> = row.get(8)?;
+                let decision_json: Option<String> = row.get(9)?;
+                let resolution_json: Option<String> = row.get(10)?;
                 Ok(ApprovalProjection {
                     call_id: ToolCallId::new(row.get::<_, String>(0)?),
                     session_id: SessionId(
@@ -1301,7 +1788,18 @@ impl SqliteSessionStore {
                     ),
                     tool_name: row.get(2)?,
                     status: row.get(3)?,
-                    request_fingerprint: row.get(4)?,
+                    branch_id: row
+                        .get::<_, Option<String>>(4)?
+                        .map(|value| value.parse().map(BranchId))
+                        .transpose()
+                        .map_err(to_sql_conversion)?,
+                    turn_id: row
+                        .get::<_, Option<String>>(5)?
+                        .map(|value| value.parse().map(TurnId))
+                        .transpose()
+                        .map_err(to_sql_conversion)?,
+                    requested_seq_id: row.get(6)?,
+                    request_fingerprint: row.get(7)?,
                     request_snapshot: request_snapshot_json
                         .as_deref()
                         .map(serde_json::from_str)
@@ -1317,7 +1815,7 @@ impl SqliteSessionStore {
                         .map(serde_json::from_str)
                         .transpose()
                         .map_err(to_sql_conversion)?,
-                    updated_at: parse_time(row.get::<_, String>(8)?)?,
+                    updated_at: parse_time(row.get::<_, String>(11)?)?,
                 })
             })
             .map_err(storage_error)?;
@@ -1660,7 +2158,7 @@ impl SqliteSessionStore {
 
     pub fn load_tool_runs(&self, session_id: SessionId) -> Result<Vec<ToolRunProjection>> {
         let mut statement = self.connection.prepare(
-            "SELECT call_id, session_id, tool_name, status, arguments_json, result_json, updated_at
+            "SELECT call_id, session_id, tool_name, status, branch_id, turn_id, requested_seq_id, arguments_json, result_json, updated_at
              FROM tool_run_projection
              WHERE session_id = ?1
              ORDER BY updated_at ASC",
@@ -1676,19 +2174,30 @@ impl SqliteSessionStore {
                     ),
                     tool_name: row.get(2)?,
                     status: row.get(3)?,
-                    arguments: row
+                    branch_id: row
                         .get::<_, Option<String>>(4)?
+                        .map(|value| value.parse().map(BranchId))
+                        .transpose()
+                        .map_err(to_sql_conversion)?,
+                    turn_id: row
+                        .get::<_, Option<String>>(5)?
+                        .map(|value| value.parse().map(TurnId))
+                        .transpose()
+                        .map_err(to_sql_conversion)?,
+                    requested_seq_id: row.get(6)?,
+                    arguments: row
+                        .get::<_, Option<String>>(7)?
                         .as_deref()
                         .map(serde_json::from_str)
                         .transpose()
                         .map_err(to_sql_conversion)?,
                     result: row
-                        .get::<_, Option<String>>(5)?
+                        .get::<_, Option<String>>(8)?
                         .as_deref()
                         .map(serde_json::from_str)
                         .transpose()
                         .map_err(to_sql_conversion)?,
-                    updated_at: parse_time(row.get::<_, String>(6)?)?,
+                    updated_at: parse_time(row.get::<_, String>(9)?)?,
                 })
             })
             .map_err(storage_error)?;
@@ -1899,23 +2408,13 @@ impl SqliteSessionStore {
                 }
                 EventPayload::BudgetCheckpoint {
                     tokens_used,
-                    max_tokens,
                     turns_used,
-                    max_turns,
                     elapsed_seconds,
-                    max_wall_clock_seconds,
                     cost_used_usd,
-                    max_cost_usd,
                 } => Self::refresh_budget_projection_from_checkpoint(
                     &tx,
                     stored.event.session_id,
                     stored.event.occurred_at,
-                    &BudgetConfig {
-                        max_wall_clock_seconds: *max_wall_clock_seconds,
-                        max_tokens: *max_tokens,
-                        max_turns: *max_turns,
-                        max_cost_usd: *max_cost_usd,
-                    },
                     *tokens_used,
                     *turns_used,
                     *elapsed_seconds,
