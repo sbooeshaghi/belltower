@@ -52,6 +52,65 @@ fn assert_cost_close(actual: f64, expected: f64) {
     );
 }
 
+#[test]
+fn concurrent_runtime_commits_publish_in_canonical_sequence_order() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = Arc::new(BelltowerRuntime::open(config, file.path()).expect("runtime"));
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("event-order".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    runtime
+        .append_message(&session, &branch, Role::Assistant, "seed")
+        .expect("seed canonical stream");
+    let mut receiver = runtime.subscribe();
+
+    let writer_count = 32;
+    let barrier = Arc::new(std::sync::Barrier::new(writer_count));
+    let handles = (0..writer_count)
+        .map(|index| {
+            let runtime = Arc::clone(&runtime);
+            let barrier = Arc::clone(&barrier);
+            let session = session.clone();
+            let branch = branch.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                runtime
+                    .append_message(
+                        &session,
+                        &branch,
+                        Role::Assistant,
+                        format!("concurrent-{index}"),
+                    )
+                    .expect("append concurrent event")
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut committed = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("writer thread"))
+        .collect::<Vec<_>>();
+    committed.sort_unstable();
+    let published = (0..writer_count)
+        .map(|_| {
+            receiver
+                .blocking_recv()
+                .expect("receive committed event")
+                .seq_id
+                .expect("published sequence id")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(published, committed);
+}
+
 struct FailingProviderPreflightAdapters;
 
 impl TurnExecutionAdapters for FailingProviderPreflightAdapters {
@@ -172,12 +231,12 @@ fn runtime_creates_session_and_records_controls() {
             .is_cancelled(session.session_id)
             .expect("cancel state cleared")
     );
-    assert_eq!(
-        runtime
-            .apply_pending_steers(&session, &branch)
-            .expect("apply steer"),
-        Some(session.settings_revision_id)
-    );
+    let dispatch = runtime
+        .apply_pending_steers(&session, &branch)
+        .expect("apply steer")
+        .expect("steer dispatch");
+    assert_eq!(dispatch.branch_id, branch.branch_id);
+    assert_eq!(dispatch.settings_revision_id, session.settings_revision_id);
     assert_eq!(
         runtime
             .messages(session.session_id, Some(branch.branch_id))
@@ -1792,6 +1851,18 @@ fn resumed_approval_turn_keeps_paused_settings_revision_after_later_change() {
             Some(paused_turn_id),
         )
         .expect("approval requested");
+    runtime
+        .record_turn_finished(
+            session.session_id,
+            branch.branch_id,
+            paused_turn_id,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            "awaiting_approval".to_owned(),
+            Some("ToolCalls".to_owned()),
+            1,
+        )
+        .expect("paused turn finished");
 
     let updated = runtime
         .update_session_settings(
@@ -1923,6 +1994,18 @@ fn reopened_runtime_closes_interrupted_resumed_approval_turns() {
             Some(paused_turn_id),
         )
         .expect("approval requested");
+    runtime
+        .record_turn_finished(
+            session.session_id,
+            branch.branch_id,
+            paused_turn_id,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            "awaiting_approval".to_owned(),
+            Some("ToolCalls".to_owned()),
+            1,
+        )
+        .expect("paused turn finished");
     let resumable = runtime
         .resumable_approval_call(session.session_id, ToolCallId::new("call-shell"), "shell")
         .expect("resumable approval lookup")
@@ -2044,6 +2127,18 @@ fn reopened_runtime_closes_interrupted_resumed_input_turns() {
             Some(paused_turn_id),
         )
         .expect("ask requested");
+    runtime
+        .record_turn_finished(
+            session.session_id,
+            branch.branch_id,
+            paused_turn_id,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            "awaiting_input".to_owned(),
+            Some("ToolCalls".to_owned()),
+            1,
+        )
+        .expect("paused turn finished");
     let resumable = runtime
         .resumable_input_call(session.session_id, ToolCallId::new("call-ask"))
         .expect("resumable input lookup")
@@ -2353,6 +2448,18 @@ fn reused_call_id_inspection_and_resume_target_latest_pending_request() {
             ),
         )
         .expect("first terminal");
+    runtime
+        .record_turn_finished(
+            session.session_id,
+            branch.branch_id,
+            first_turn,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            "completed".to_owned(),
+            Some("ToolCalls".to_owned()),
+            1,
+        )
+        .expect("first turn finished");
 
     let second_turn = TurnId::new();
     runtime
@@ -2774,10 +2881,12 @@ fn pending_steers_apply_only_to_their_recorded_branch() {
         .expect("child messages");
     assert!(child_messages.is_empty());
 
-    let applied_revision = runtime
+    let dispatch = runtime
         .apply_pending_steers(&session, &branch)
-        .expect("apply root steers");
-    assert_eq!(applied_revision, Some(session.settings_revision_id));
+        .expect("apply root steers")
+        .expect("root steer dispatch");
+    assert_eq!(dispatch.branch_id, branch.branch_id);
+    assert_eq!(dispatch.settings_revision_id, session.settings_revision_id);
     let root_messages = runtime
         .messages(session.session_id, Some(branch.branch_id))
         .expect("root messages");

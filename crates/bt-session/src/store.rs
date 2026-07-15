@@ -4,10 +4,13 @@ use bt_core::{
     EventPayload, Message, Result, Role, SessionId, SessionRecord, SessionSettingsSnapshot,
     SessionToolMode, ToolCallId, ToolOperationContext, TurnId, TurnStartSource,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 use time::OffsetDateTime;
+
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct SqliteSessionStore {
@@ -22,28 +25,40 @@ use codec::{
     session_tool_mode_to_str, span_kind_to_str, steer_resolution_status, storage_error,
     to_sql_conversion,
 };
+mod admission;
 mod paging;
 mod projections;
 mod search;
+use admission::{
+    validate_queued_continuation_events, validate_steer_continuation_events,
+    validate_turn_admission_events,
+};
 mod types;
 pub use types::{
     ApprovalProjection, ChunkPage, ContextManifestProjection, ContextMessageRecord,
-    CostSummaryProjection, PlanProjection, QueuedMessageProjection, RawChunkInsert, RawChunkRecord,
-    RecordedOperatorCommandRecord, ResumedTurnRecoveryRecord, ReusableApprovalProjection,
-    SequencedMessageRecord, SessionBudgetProjection, SessionControlProjection,
-    SessionInspectionMetrics, SessionSettingsRevisionProjection, SteerProjection,
-    ToolOperationRecoveryRecord, ToolRunProjection, TranscriptPage, TurnRecoveryRecord,
+    ContinuationClaim, CostSummaryProjection, PlanProjection, QueuedMessageProjection,
+    RawChunkInsert, RawChunkRecord, RecordedOperatorCommandRecord, ResumedTurnRecoveryRecord,
+    ReusableApprovalProjection, SequencedMessageRecord, SessionBudgetProjection,
+    SessionControlProjection, SessionInspectionMetrics, SessionSettingsRevisionProjection,
+    SessionTurnAdmission, SteerProjection, ToolOperationRecoveryRecord, ToolRunProjection,
+    TranscriptPage, TurnRecoveryRecord,
 };
 
 impl SqliteSessionStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let connection = Connection::open(path).map_err(storage_error)?;
+        connection
+            .busy_timeout(SQLITE_BUSY_TIMEOUT)
+            .map_err(storage_error)?;
         apply_migrations(&connection).map_err(storage_error)?;
         Ok(Self { connection })
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let connection = Connection::open_in_memory().map_err(storage_error)?;
+        connection
+            .busy_timeout(SQLITE_BUSY_TIMEOUT)
+            .map_err(storage_error)?;
         apply_migrations(&connection).map_err(storage_error)?;
         Ok(Self { connection })
     }
@@ -122,6 +137,181 @@ impl SqliteSessionStore {
         }
         tx.commit().map_err(storage_error)?;
         Ok(seq_ids)
+    }
+
+    pub fn admit_turn_or_queue(
+        &mut self,
+        session_id: SessionId,
+        expected_settings_revision_id: u64,
+        cancel_clear_event: &EventEnvelope,
+        started_events: &[EventEnvelope],
+        queued_events: &[EventEnvelope],
+    ) -> Result<SessionTurnAdmission> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let current_settings_revision_id = tx
+            .query_row(
+                "SELECT settings_revision_id FROM sessions WHERE session_id = ?1",
+                params![session_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| BelltowerError::InvalidState("session not found".to_owned()))?
+            .max(1) as u64;
+        if current_settings_revision_id != expected_settings_revision_id {
+            return Ok(SessionTurnAdmission::RetryWithSettings {
+                settings_revision_id: current_settings_revision_id,
+            });
+        }
+        validate_turn_admission_events(
+            session_id,
+            expected_settings_revision_id,
+            cancel_clear_event,
+            started_events,
+            queued_events,
+        )?;
+
+        if Self::session_has_pending_work_in_tx(&tx, session_id)? {
+            let seq_ids = Self::append_events_in_tx(&tx, queued_events)?;
+            let position = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM queued_message_projection
+                     WHERE session_id = ?1 AND status = 'pending'",
+                    params![session_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(storage_error)?
+                .max(0) as usize;
+            tx.commit().map_err(storage_error)?;
+            return Ok(SessionTurnAdmission::Queued { seq_ids, position });
+        }
+
+        let mut seq_ids = Vec::with_capacity(started_events.len() + 1);
+        if Self::cancel_requested_in_tx(&tx, session_id)? {
+            seq_ids.push(Self::append_event_in_tx(&tx, cancel_clear_event)?);
+        }
+        for event in started_events {
+            seq_ids.push(Self::append_event_in_tx(&tx, event)?);
+        }
+        tx.commit().map_err(storage_error)?;
+        Ok(SessionTurnAdmission::Started { seq_ids })
+    }
+
+    pub fn claim_queued_continuation(
+        &mut self,
+        session_id: SessionId,
+        queue_event_id: bt_core::EventId,
+        events: &[EventEnvelope],
+    ) -> Result<ContinuationClaim> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        if Self::cancel_requested_in_tx(&tx, session_id)? {
+            return Ok(ContinuationClaim::CancelPending);
+        }
+        if Self::active_turn_exists_in_tx(&tx, session_id)? {
+            return Ok(ContinuationClaim::Busy);
+        }
+        let next_queue = tx
+            .query_row(
+                "SELECT queue_event_id, settings_revision_id FROM queued_message_projection
+                 WHERE session_id = ?1 AND status = 'pending'
+                 ORDER BY source_seq ASC LIMIT 1",
+                params![session_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?.max(1) as u64,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        let expected_queue_event_id = queue_event_id.to_string();
+        let Some((next_queue_event_id, settings_revision_id)) = next_queue else {
+            return Ok(ContinuationClaim::Stale);
+        };
+        if next_queue_event_id != expected_queue_event_id {
+            return Ok(ContinuationClaim::Stale);
+        }
+        validate_queued_continuation_events(
+            session_id,
+            queue_event_id,
+            settings_revision_id,
+            events,
+        )?;
+        let seq_ids = Self::append_events_in_tx(&tx, events)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(ContinuationClaim::Claimed { seq_ids })
+    }
+
+    pub fn claim_steer_continuation(
+        &mut self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        steer_event_ids: &[bt_core::EventId],
+        events: &[EventEnvelope],
+    ) -> Result<ContinuationClaim> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        if Self::cancel_requested_in_tx(&tx, session_id)? {
+            return Ok(ContinuationClaim::CancelPending);
+        }
+        if Self::active_turn_exists_in_tx(&tx, session_id)? {
+            return Ok(ContinuationClaim::Busy);
+        }
+        let pending_sources = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT steer_event_id, settings_revision_id FROM steer_projection
+                     WHERE session_id = ?1 AND branch_id = ?2 AND status = 'pending'
+                     ORDER BY source_seq ASC",
+                )
+                .map_err(storage_error)?;
+            let rows = statement
+                .query_map(
+                    params![session_id.to_string(), branch_id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?.max(1) as u64,
+                        ))
+                    },
+                )
+                .map_err(storage_error)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(storage_error)?
+        };
+        let pending_ids = pending_sources
+            .iter()
+            .map(|(event_id, _)| event_id.clone())
+            .collect::<Vec<_>>();
+        let expected_ids = steer_event_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if pending_ids != expected_ids {
+            return Ok(ContinuationClaim::Stale);
+        }
+        let Some((_, settings_revision_id)) = pending_sources.last() else {
+            return Ok(ContinuationClaim::Stale);
+        };
+        validate_steer_continuation_events(
+            session_id,
+            branch_id,
+            steer_event_ids,
+            *settings_revision_id,
+            events,
+        )?;
+        let seq_ids = Self::append_events_in_tx(&tx, events)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(ContinuationClaim::Claimed { seq_ids })
     }
 
     pub fn append_raw_chunk_with_event<F>(
@@ -313,6 +503,56 @@ impl SqliteSessionStore {
         let seq_id = tx.last_insert_rowid();
         Self::refresh_projections(tx, event, seq_id)?;
         Ok(seq_id)
+    }
+
+    fn append_events_in_tx(tx: &Transaction<'_>, events: &[EventEnvelope]) -> Result<Vec<i64>> {
+        events
+            .iter()
+            .map(|event| Self::append_event_in_tx(tx, event))
+            .collect()
+    }
+
+    fn active_turn_exists_in_tx(tx: &Transaction<'_>, session_id: SessionId) -> Result<bool> {
+        tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM active_turn_projection WHERE session_id = ?1
+            )",
+            params![session_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(storage_error)
+    }
+
+    fn cancel_requested_in_tx(tx: &Transaction<'_>, session_id: SessionId) -> Result<bool> {
+        tx.query_row(
+            "SELECT COALESCE((
+                SELECT cancel_requested FROM session_control_projection WHERE session_id = ?1
+            ), 0)",
+            params![session_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(storage_error)
+    }
+
+    fn session_has_pending_work_in_tx(tx: &Transaction<'_>, session_id: SessionId) -> Result<bool> {
+        tx.query_row(
+            "SELECT
+                EXISTS(SELECT 1 FROM active_turn_projection WHERE session_id = ?1)
+                OR EXISTS(SELECT 1 FROM approval_projection
+                          WHERE session_id = ?1 AND status = 'pending')
+                OR EXISTS(SELECT 1 FROM tool_run_projection
+                          WHERE session_id = ?1 AND tool_name = 'ask' AND status = 'requested')
+                OR EXISTS(SELECT 1 FROM queued_message_projection
+                          WHERE session_id = ?1 AND status = 'pending')
+                OR EXISTS(SELECT 1 FROM steer_projection
+                          WHERE session_id = ?1 AND status = 'pending')",
+            params![session_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(storage_error)
     }
 
     fn append_raw_chunk_in_tx(tx: &Transaction<'_>, raw_chunk: &RawChunkInsert) -> Result<i64> {
@@ -1718,6 +1958,11 @@ impl SqliteSessionStore {
             "SELECT COUNT(*) FROM raw_chunks WHERE session_id = ?1",
             session_id,
         )?;
+        let active_turn_count = count_query(
+            &self.connection,
+            "SELECT COUNT(*) FROM active_turn_projection WHERE session_id = ?1",
+            session_id,
+        )?;
         let turn_count = count_query(
             &self.connection,
             "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND event_kind = 'turn.started'",
@@ -1728,17 +1973,6 @@ impl SqliteSessionStore {
             "SELECT MAX(seq_id) FROM events WHERE session_id = ?1",
             session_id,
         )?;
-        let last_turn_started_seq = optional_i64_query(
-            &self.connection,
-            "SELECT MAX(seq_id) FROM events WHERE session_id = ?1 AND event_kind = 'turn.started'",
-            session_id,
-        )?;
-        let last_turn_finished_seq = optional_i64_query(
-            &self.connection,
-            "SELECT MAX(seq_id) FROM events WHERE session_id = ?1 AND event_kind = 'turn.finished'",
-            session_id,
-        )?;
-
         Ok(SessionInspectionMetrics {
             last_seq_id,
             turn_count,
@@ -1747,8 +1981,7 @@ impl SqliteSessionStore {
             approval_count,
             pending_approval_count,
             raw_chunk_count,
-            last_turn_started_seq,
-            last_turn_finished_seq,
+            active_turn_count,
         })
     }
 }

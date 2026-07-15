@@ -84,16 +84,7 @@ impl BelltowerRuntime {
         let pending_steers = self.load_pending_steers(session_id)?;
         let pending_input_count = self.pending_inputs(session_id)?.len() as u32;
         let cancel_requested = control.as_ref().is_some_and(|state| state.cancel_requested);
-        let active_turn_in_progress = matches!(
-            (metrics.last_turn_started_seq, metrics.last_turn_finished_seq),
-            (Some(started), Some(finished)) if started > finished
-        ) || matches!(
-            (
-                metrics.last_turn_started_seq,
-                metrics.last_turn_finished_seq
-            ),
-            (Some(_), None)
-        );
+        let active_turn_in_progress = metrics.active_turn_count > 0;
         let runtime_state = if pending_input_count > 0 {
             SessionRuntimeState::WaitingOnInput
         } else if metrics.pending_approval_count > 0 {

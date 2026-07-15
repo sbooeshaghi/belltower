@@ -80,6 +80,12 @@ At minimum it includes:
 - projections for messages, approvals, tool runs, context manifests, branch
   heads, costs, and session budgets
 
+`active_turn_projection` is a rebuildable store-owned coordination read model.
+It enforces at most one active turn per session while keeping
+`turn.started`/`turn.finished` as the canonical historical record. A matching
+`turn.finished` releases ownership; a stale finish for an older turn cannot
+clear a newer active turn.
+
 The budget projection is the canonical read model for session autonomy limits and
 used-so-far counters:
 
@@ -115,6 +121,20 @@ rescanning raw events or inferring prompt contents from the TUI.
 ## Event Sequence
 
 The most useful thing copied from `pi-agent-core` is not the code, but the explicit event sequence.
+
+User ingress is one atomic store transition. Under one SQLite write
+transaction, runtime checks the current settings revision and session control
+state, then does exactly one of the following:
+
+- appends the user message and `turn.started`, acquiring active-turn ownership
+- appends `session.queued_message.enqueued` and its audit event, preserving the
+  settings revision active at enqueue time
+
+The server transports this typed outcome; it does not inspect process-local
+state and independently decide whether work is busy. Two concurrent clients
+therefore cannot both start turns for the same session. Queue and steer
+continuations likewise claim their exact durable event identifiers and append
+their resumed `turn.started` transition atomically.
 
 For a normal prompt:
 
@@ -190,11 +210,15 @@ For a paused approval:
 ```text
 assistant requests tool
 -> approval request persisted
--> turn suspends
+-> turn.finished records awaiting_approval and releases active ownership
 -> human approves or denies
 -> approval event persisted
--> runtime resumes or terminates turn accordingly
+-> runtime atomically starts a resumed turn or terminates the request accordingly
 ```
+
+Pending user input follows the same boundary with `awaiting_input`. A paused
+turn is historical, not secretly active: continuation creates a new
+`turn.started` carrying the original settings revision and resume provenance.
 
 These sequences now need exact turn identifiers and event names, not just implied phases. The runtime should be able to answer:
 
@@ -235,6 +259,15 @@ pending rather than being misclassified as interrupted execution.
 The same unknown, non-retryable terminalization applies to interrupted unbound
 human operator requests. Recovery preserves their operator origin and never
 silently promotes them into agent transcript context or retries them.
+
+After resolving the configured connection identity and model label required by
+`turn.started`, direct user admission records that boundary before auth,
+provider construction, model execution, or tool preflight. If a later
+preflight fails, runtime appends a turn-bound `session.error` followed by
+`turn.finished { status: "failed" }`. This ordering keeps ingress atomic
+without leaving stale active ownership. Persisting enough settings metadata to
+admit work after a connection has been removed from local configuration remains
+follow-on hardening rather than current behavior.
 
 ## Turn Contract
 

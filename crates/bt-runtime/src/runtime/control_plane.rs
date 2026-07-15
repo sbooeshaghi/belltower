@@ -464,6 +464,96 @@ impl BelltowerRuntime {
         Ok(self.load_pending_queued_messages(session_id)?.len())
     }
 
+    pub fn admit_user_message(
+        &self,
+        session: &SessionRecord,
+        branch: &BranchRecord,
+        message: Message,
+    ) -> Result<UserMessageAdmission> {
+        let mut settings_revision_id = session.settings_revision_id;
+        for _ in 0..8 {
+            let turn_session = self.session_for_settings_revision(session, settings_revision_id)?;
+            let (connection, model_id) =
+                self.resolve_turn_settings(session.session_id, settings_revision_id)?;
+            let turn_id = TurnId::new();
+            let message_count = self
+                .messages(session.session_id, Some(branch.branch_id))?
+                .len()
+                .saturating_add(1) as u32;
+            let raw_input = render_queue_message_input(&message);
+            let cancel_clear_event = EventEnvelope::new(
+                session.session_id,
+                branch.branch_id,
+                SpanKind::Agent,
+                EventPayload::SessionCancelCleared {
+                    reason: "superseded by direct user message".to_owned(),
+                },
+            );
+            let message_event = EventEnvelope::new(
+                session.session_id,
+                branch.branch_id,
+                SpanKind::Agent,
+                EventPayload::MessageAppended {
+                    message: message.clone(),
+                },
+            )
+            .with_turn_id(turn_id);
+            let turn_started_event = self.turn_started_event(
+                turn_session.session_id,
+                branch.branch_id,
+                turn_id,
+                connection.provider,
+                model_id,
+                message_count,
+                settings_revision_id,
+                TurnStartSource::UserMessage,
+                None,
+            );
+            let queued_event = EventEnvelope::new(
+                session.session_id,
+                branch.branch_id,
+                SpanKind::Agent,
+                EventPayload::SessionQueuedMessageEnqueued {
+                    message: message.clone(),
+                    settings_revision_id,
+                },
+            );
+            let queued_audit_event = operator_command_event(
+                session.session_id,
+                branch.branch_id,
+                "queued_message".to_owned(),
+                raw_input,
+                "Queued behind active session work.".to_owned(),
+                true,
+            );
+            match self.commit_turn_admission(
+                session.session_id,
+                settings_revision_id,
+                cancel_clear_event,
+                vec![message_event, turn_started_event],
+                vec![queued_event, queued_audit_event],
+            )? {
+                SessionTurnAdmission::Started { .. } => {
+                    return Ok(UserMessageAdmission::Started(BootstrappedTurn {
+                        turn_id,
+                        settings_revision_id,
+                    }));
+                }
+                SessionTurnAdmission::Queued { position, .. } => {
+                    return Ok(UserMessageAdmission::Queued { position });
+                }
+                SessionTurnAdmission::RetryWithSettings {
+                    settings_revision_id: current_settings_revision_id,
+                } => {
+                    settings_revision_id = current_settings_revision_id;
+                }
+            }
+        }
+        Err(bt_core::BelltowerError::InvalidState(
+            "session settings changed repeatedly during turn admission".to_owned(),
+        ))
+    }
+
     pub fn clear_queued_messages(
         &self,
         session_id: SessionId,
@@ -547,7 +637,7 @@ impl BelltowerRuntime {
         &self,
         session: &SessionRecord,
         branch: &BranchRecord,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Option<QueuedDispatch>> {
         let pending = self.load_pending_steers_for_branch(session.session_id, branch.branch_id)?;
         if pending.is_empty() {
             return Ok(None);
@@ -557,13 +647,24 @@ impl BelltowerRuntime {
             .map(|steer| steer.settings_revision_id)
             .unwrap_or_else(default_settings_revision_id);
         let combined = combine_steer_messages(pending.iter().map(|steer| steer.message.clone()));
-        self.append_events(vec![
+        let steer_event_ids = pending
+            .iter()
+            .map(|steer| steer.steer_event_id)
+            .collect::<Vec<_>>();
+        let turn_id = TurnId::new();
+        let (connection, model_id) =
+            self.resolve_turn_settings(session.session_id, settings_revision_id)?;
+        let message_count = self
+            .messages(session.session_id, Some(branch.branch_id))?
+            .len()
+            .saturating_add(1) as u32;
+        let events = vec![
             EventEnvelope::new(
                 session.session_id,
                 branch.branch_id,
                 SpanKind::Agent,
                 EventPayload::SessionSteersResolved {
-                    steer_event_ids: pending.iter().map(|steer| steer.steer_event_id).collect(),
+                    steer_event_ids: steer_event_ids.clone(),
                     outcome: SteerResolutionOutcome::Applied,
                     combined_message: Some(combined.clone()),
                     reason: None,
@@ -576,9 +677,35 @@ impl BelltowerRuntime {
                 EventPayload::MessageAppended {
                     message: Message::text(Role::User, combined),
                 },
+            )
+            .with_turn_id(turn_id),
+            self.turn_started_event(
+                session.session_id,
+                branch.branch_id,
+                turn_id,
+                connection.provider,
+                model_id,
+                message_count,
+                settings_revision_id,
+                TurnStartSource::SteerFollowUp,
+                None,
             ),
-        ])?;
-        Ok(Some(settings_revision_id))
+        ];
+        match self.commit_steer_continuation(
+            session.session_id,
+            branch.branch_id,
+            &steer_event_ids,
+            events,
+        )? {
+            ContinuationClaim::Claimed { .. } => Ok(Some(QueuedDispatch {
+                branch_id: branch.branch_id,
+                turn_id,
+                settings_revision_id,
+            })),
+            ContinuationClaim::Busy
+            | ContinuationClaim::CancelPending
+            | ContinuationClaim::Stale => Ok(None),
+        }
     }
 
     pub fn dispatch_next_queued_message(
@@ -598,7 +725,14 @@ impl BelltowerRuntime {
                 bt_core::BelltowerError::InvalidState("queued branch not found".to_owned())
             })?;
         let raw_input = render_queue_message_input(&queued.message);
-        self.append_events(vec![
+        let turn_id = TurnId::new();
+        let (connection, model_id) =
+            self.resolve_turn_settings(session.session_id, queued.settings_revision_id)?;
+        let message_count = self
+            .messages(session.session_id, Some(queued.branch_id))?
+            .len()
+            .saturating_add(1) as u32;
+        let events = vec![
             EventEnvelope::new(
                 session.session_id,
                 queued.branch_id,
@@ -635,12 +769,30 @@ impl BelltowerRuntime {
                 EventPayload::MessageAppended {
                     message: queued.message,
                 },
+            )
+            .with_turn_id(turn_id),
+            self.turn_started_event(
+                session.session_id,
+                branch.branch_id,
+                turn_id,
+                connection.provider,
+                model_id,
+                message_count,
+                queued.settings_revision_id,
+                TurnStartSource::QueuedFollowUp,
+                None,
             ),
-        ])?;
-        Ok(Some(QueuedDispatch {
-            branch_id: branch.branch_id,
-            settings_revision_id: queued.settings_revision_id,
-        }))
+        ];
+        match self.commit_queued_continuation(session.session_id, queued.queue_event_id, events)? {
+            ContinuationClaim::Claimed { .. } => Ok(Some(QueuedDispatch {
+                branch_id: branch.branch_id,
+                turn_id,
+                settings_revision_id: queued.settings_revision_id,
+            })),
+            ContinuationClaim::Busy
+            | ContinuationClaim::CancelPending
+            | ContinuationClaim::Stale => Ok(None),
+        }
     }
 
     pub fn consume_post_turn_controls(
@@ -714,10 +866,8 @@ impl BelltowerRuntime {
             self.append_events(events)?;
             return Ok(PostTurnControlAction::Stop);
         }
-        if let Some(settings_revision_id) = self.apply_pending_steers(session, branch)? {
-            return Ok(PostTurnControlAction::ContinueCurrentBranch(
-                settings_revision_id,
-            ));
+        if let Some(dispatch) = self.apply_pending_steers(session, branch)? {
+            return Ok(PostTurnControlAction::ContinueCurrentBranch(dispatch));
         }
         if let Some(dispatch) = self.dispatch_next_queued_message(session)? {
             return Ok(PostTurnControlAction::ContinueQueuedBranch(dispatch));

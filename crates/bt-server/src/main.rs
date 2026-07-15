@@ -23,8 +23,7 @@ use bt_context::{SystemPromptBuilder, SystemPromptInput, summarize_messages};
 use bt_core::Message;
 use bt_core::{
     ApprovalRequest, BelltowerConfig, BranchRecord, ErrorClass, SessionId, SessionRecord,
-    SessionRuntimeState, StartupTrace, ToolCallId, TurnId, config_dir,
-    server_auth_token_path_for_url,
+    StartupTrace, ToolCallId, TurnId, config_dir, server_auth_token_path_for_url,
 };
 use bt_protocol::{
     ActivateBranchRequest, AnswerToolRequest, ApproveToolRequest, BranchMessagesPageResponse,
@@ -44,7 +43,7 @@ use bt_protocol::{
     negotiate_protocol_version,
 };
 use bt_readiness::{inspect_connection_model_inventory, inspect_connection_models, inspect_status};
-use bt_runtime::{BelltowerRuntime, TurnRunRequest};
+use bt_runtime::{BelltowerRuntime, TurnRunRequest, UserMessageAdmission};
 use clap::Parser;
 use serde::{Deserialize, de::DeserializeOwned};
 use std::collections::HashMap;
@@ -440,46 +439,32 @@ async fn send_message(
     state
         .runtime
         .ensure_session_budget_allows_turn(session.session_id)?;
-    if let Some(queue) = state.runtime.inspect_queue(session_id)?
-        && session_busy_for_queue(queue.runtime_state)
-    {
-        let position = state.runtime.queue_message(
-            session.session_id,
-            request.branch_id,
-            request.message.clone(),
-        )?;
-        state.runtime.record_operator_command(
-            session.session_id,
-            request.branch_id,
-            "queued_message".to_owned(),
-            bt_core::render_queue_message_input(&request.message),
-            format!("Queued at position {position}."),
-            true,
-        )?;
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(SendMessageResponse {
-                session_id,
-                branch_id: request.branch_id,
-                outcome: SendMessageOutcome::Queued { position },
-            }),
-        ));
-    }
-    let _ = state.runtime.clear_cancel_request(
-        session.session_id,
-        branch.branch_id,
-        "cleared by direct user message",
-    )?;
-    state
+    let outcome = match state
         .runtime
-        .append_raw_message(&session, &branch, request.message, None)?;
-    run_session_turn(&state, &session, &branch).await?;
+        .admit_user_message(&session, &branch, request.message)?
+    {
+        UserMessageAdmission::Started(started) => {
+            run_session_turn_with_turn_id(
+                &state,
+                &session,
+                &branch,
+                Some(started.turn_id),
+                true,
+                started.settings_revision_id,
+                bt_core::TurnStartSource::UserMessage,
+                None,
+            )
+            .await?;
+            SendMessageOutcome::Dispatched
+        }
+        UserMessageAdmission::Queued { position } => SendMessageOutcome::Queued { position },
+    };
     Ok((
         StatusCode::ACCEPTED,
         Json(SendMessageResponse {
             session_id,
             branch_id: branch.branch_id,
-            outcome: SendMessageOutcome::Dispatched,
+            outcome,
         }),
     ))
 }
@@ -1485,24 +1470,6 @@ fn sse_event_for(event: bt_core::EventEnvelope) -> Event {
         .data(payload)
 }
 
-async fn run_session_turn(
-    state: &AppState,
-    session: &SessionRecord,
-    branch: &BranchRecord,
-) -> Result<(), ApiError> {
-    run_session_turn_with_turn_id(
-        state,
-        session,
-        branch,
-        None,
-        false,
-        session.settings_revision_id,
-        bt_core::TurnStartSource::UserMessage,
-        None,
-    )
-    .await
-}
-
 async fn run_session_turn_with_turn_id(
     state: &AppState,
     session: &SessionRecord,
@@ -1538,16 +1505,6 @@ async fn run_session_turn_with_turn_id(
 #[cfg(test)]
 fn queue_message_input(message: &Message) -> String {
     bt_core::render_queue_message_input(message)
-}
-
-fn session_busy_for_queue(runtime_state: SessionRuntimeState) -> bool {
-    matches!(
-        runtime_state,
-        SessionRuntimeState::Working
-            | SessionRuntimeState::WaitingOnInput
-            | SessionRuntimeState::WaitingOnApproval
-            | SessionRuntimeState::CancelRequested
-    )
 }
 
 #[derive(Debug)]

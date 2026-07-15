@@ -258,13 +258,40 @@ impl BelltowerRuntime {
 impl TurnOrchestrator<'_> {
     fn record_pre_turn_failure(
         &self,
-        session_id: SessionId,
+        session: &SessionRecord,
         branch_id: BranchId,
         turn_id: TurnId,
+        settings_revision_id: u64,
+        turn_started_already: bool,
         error: &BelltowerError,
     ) -> Result<()> {
+        if turn_started_already {
+            let (provider, model) = self
+                .runtime
+                .resolve_turn_settings(session.session_id, settings_revision_id)
+                .map(|(connection, model)| (connection.provider, model))
+                .unwrap_or_else(|_| {
+                    (
+                        session.connection_id.to_string(),
+                        session
+                            .model_id
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                    )
+                });
+            return self.runtime.record_turn_failure_transition(
+                session.session_id,
+                branch_id,
+                &provider,
+                &model,
+                turn_id,
+                Vec::new(),
+                error,
+                0,
+            );
+        }
         self.runtime.record_session_error(
-            session_id,
+            session.session_id,
             branch_id,
             error,
             Some(turn_id),
@@ -294,7 +321,6 @@ impl TurnOrchestrator<'_> {
                 let turn_id = next_turn_id.take().unwrap_or_default();
                 let settings_revision_id = next_settings_revision_id;
                 let turn_started_already = initial_turn_started;
-                initial_turn_started = false;
 
                 let preflight = async {
                     let turn_session = self
@@ -366,9 +392,11 @@ impl TurnOrchestrator<'_> {
                     Ok(preflight) => preflight,
                     Err(error) => {
                         self.record_pre_turn_failure(
-                            request.session.session_id,
+                            &request.session,
                             current_branch.branch_id,
                             turn_id,
+                            settings_revision_id,
+                            turn_started_already,
                             &error,
                         )?;
                         return Err(error);
@@ -572,6 +600,8 @@ impl TurnOrchestrator<'_> {
                 match post_turn_action.0 {
                     PostTurnControlAction::ContinueQueuedBranch(dispatch) => {
                         next_turn_source = TurnStartSource::QueuedFollowUp;
+                        next_turn_id = Some(dispatch.turn_id);
+                        initial_turn_started = true;
                         next_settings_revision_id = dispatch.settings_revision_id;
                         current_branch = self
                             .runtime
@@ -581,9 +611,11 @@ impl TurnOrchestrator<'_> {
                             })?;
                         continue;
                     }
-                    PostTurnControlAction::ContinueCurrentBranch(settings_revision_id) => {
+                    PostTurnControlAction::ContinueCurrentBranch(dispatch) => {
                         next_turn_source = TurnStartSource::SteerFollowUp;
-                        next_settings_revision_id = settings_revision_id;
+                        next_turn_id = Some(dispatch.turn_id);
+                        initial_turn_started = true;
+                        next_settings_revision_id = dispatch.settings_revision_id;
                         continue;
                     }
                     PostTurnControlAction::Stop => {

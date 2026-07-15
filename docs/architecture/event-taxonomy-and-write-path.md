@@ -176,9 +176,19 @@ mutable approval projection is an inspection cache, not the rehydration source.
 
 The control-plane rule is now explicit:
 
+- runtime/store own admission: one transaction either acquires the session's
+  single active-turn slot by appending the user message plus `turn.started`, or
+  appends a queued-input transition under the settings revision observed in
+  that same transaction
+- the active-turn projection is a rebuildable coordination read model over
+  canonical turn boundaries; transports must not recreate a process-local
+  busy/idle heuristic
 - queued follow-up input is canonical runtime state, not a server-local queue
 - cancellation is a durable request that stays pending until runtime clears it
 - steer messages are durable queued control inputs that runtime later applies or drops
+- queue and steer continuation claims compare exact durable source event ids
+  and append their resolution plus resumed `turn.started` transition in one
+  write transaction
 - `session.settings.updated` advances a durable `settings_revision_id`, and runtime control events capture the revision they should later run under
 - `session.queued_message.enqueued` and `session.steered` capture a settings revision, and runtime resolves the matching historical settings snapshot before it starts the follow-up turn
 - `turn.started` records the settings revision actually used for that turn, so paused turns can resume under their original model/connection
@@ -228,9 +238,15 @@ The important rule is:
 
 - approval pause and resume are not hidden blocking IO inside `bt-agent`
 - the runtime persists the approval request with request-time evidence
-- the turn suspends cleanly
+- the turn suspends cleanly by recording an `awaiting_approval` or
+  `awaiting_input` finish boundary, releasing active-turn ownership
 - the runtime later persists the approval decision and bootstraps canonical
   resumed-turn state before the server execution path continues the turn
+- after runtime resolves the configured connection identity needed by
+  `turn.started`, direct ingress persists that boundary before auth, provider
+  construction, model execution, or tool preflight; a later preflight failure
+  appends a turn-bound `session.error` and failed `turn.finished` rather than
+  erasing the admitted turn from history
 
 ## Read Model and Replay
 

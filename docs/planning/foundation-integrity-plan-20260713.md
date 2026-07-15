@@ -153,6 +153,40 @@ that runtime transition.
 
 **Invariant:** a session has at most one executable active turn.
 
+#### 2.1a Linearize settings and budget admission
+
+**Owners:** `bt-session` transaction primitives, `bt-runtime` policy
+
+**Problem:** settings revisions are currently incremented before the durable
+write transaction, and the HTTP transport checks budget separately from turn
+admission. Concurrent updates can reuse a revision, while a turn can race a
+budget-exhaustion checkpoint.
+
+**Change:** assign settings revisions in one store transaction and move the
+budget predicate into runtime-owned admission/continuation claims. Keep
+provider, auth, and tool construction outside SQLite.
+
+**Invariant:** every revision identifies one immutable settings snapshot, and
+exhausted sessions cannot acquire new executable work.
+
+#### 2.1b Recover idle durable continuations
+
+**Owners:** `bt-session` claim primitives, `bt-runtime` dispatcher, `bt-server`
+execution host
+
+**Problem:** a crash after `turn.finished` but before post-turn dispatch can
+leave queued or steered work durable but idle. Startup recovery terminalizes
+interrupted turns but does not wake their pending tail.
+
+**Change:** add one runtime claim operation for the next idle continuation.
+Reuse `turn.started` as the ownership claim, preserve steer-before-queue and
+queue FIFO policy, block on pending approval/input/cancel, and let the server
+host execute the already-claimed turn. Do not add an in-memory queue or another
+durable ownership table.
+
+**Invariant:** durable pending work is either blocked by explicit canonical
+control state or becomes executable exactly once after restart.
+
 ### 2.2 Atomically claim approval and input resume
 
 **Owners:** `bt-session`, `bt-runtime`

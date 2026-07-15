@@ -1,6 +1,6 @@
 //! Tests for SQLite session store persistence, projections, replay, and export fidelity.
 
-use super::SqliteSessionStore;
+use super::{ContinuationClaim, SessionTurnAdmission, SqliteSessionStore};
 use crate::{
     LEGACY_SESSION_EXPORT_BUNDLE_SCHEMA_VERSION, LegacySessionExporter,
     PortableSessionBundleExporter, PortableSessionBundleImporter, SESSION_BT_ARTIFACTS_DIR,
@@ -55,6 +55,101 @@ fn sample_session() -> (SessionRecord, BranchRecord) {
     (session, branch)
 }
 
+fn turn_started_event(
+    session: &SessionRecord,
+    branch: &BranchRecord,
+    turn_id: TurnId,
+) -> EventEnvelope {
+    turn_started_event_with_source(session, branch, turn_id, TurnStartSource::UserMessage)
+}
+
+fn turn_started_event_with_source(
+    session: &SessionRecord,
+    branch: &BranchRecord,
+    turn_id: TurnId,
+    source: TurnStartSource,
+) -> EventEnvelope {
+    turn_started_event_with_source_and_revision(
+        session,
+        branch,
+        turn_id,
+        source,
+        session.settings_revision_id,
+    )
+}
+
+fn turn_started_event_with_source_and_revision(
+    session: &SessionRecord,
+    branch: &BranchRecord,
+    turn_id: TurnId,
+    source: TurnStartSource,
+    settings_revision_id: u64,
+) -> EventEnvelope {
+    EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::TurnStarted {
+            turn_id,
+            provider: "test".to_owned(),
+            model: "test-model".to_owned(),
+            message_count: 1,
+            settings_revision_id,
+            source,
+            resumed_from_call_id: None,
+        },
+    )
+    .with_turn_id(turn_id)
+}
+
+fn turn_finished_event(
+    session: &SessionRecord,
+    branch: &BranchRecord,
+    turn_id: TurnId,
+) -> EventEnvelope {
+    EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::TurnFinished {
+            turn_id,
+            provider: "test".to_owned(),
+            model: "test-model".to_owned(),
+            status: "completed".to_owned(),
+            finish_reason: Some("stop".to_owned()),
+            latency_ms: 1,
+        },
+    )
+    .with_turn_id(turn_id)
+}
+
+fn queued_message_event(
+    session: &SessionRecord,
+    branch: &BranchRecord,
+    text: &str,
+) -> EventEnvelope {
+    EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::SessionQueuedMessageEnqueued {
+            message: Message::text(Role::User, text),
+            settings_revision_id: session.settings_revision_id,
+        },
+    )
+}
+
+fn cancel_clear_event(session: &SessionRecord, branch: &BranchRecord) -> EventEnvelope {
+    EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::SessionCancelCleared {
+            reason: "superseded by direct user operation".to_owned(),
+        },
+    )
+}
+
 #[test]
 fn migrations_and_session_creation_work() {
     let file = NamedTempFile::new().expect("tempfile");
@@ -104,6 +199,541 @@ fn session_has_events_reflects_appended_activity() {
         store
             .session_has_events(session.session_id)
             .expect("events after append")
+    );
+}
+
+#[test]
+fn turn_admission_starts_once_then_queues_and_claims_oldest_continuation() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+
+    let first_turn_id = TurnId::new();
+    let first_message = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::MessageAppended {
+            message: Message::text(Role::User, "first"),
+        },
+    )
+    .with_turn_id(first_turn_id);
+    let first_start = turn_started_event(&session, &branch, first_turn_id);
+    let first_queue = queued_message_event(&session, &branch, "first");
+    let admission = store
+        .admit_turn_or_queue(
+            session.session_id,
+            session.settings_revision_id,
+            &cancel_clear_event(&session, &branch),
+            &[first_message, first_start],
+            &[first_queue],
+        )
+        .expect("admit first turn");
+    assert!(matches!(
+        admission,
+        SessionTurnAdmission::Started { ref seq_ids } if seq_ids.len() == 2
+    ));
+
+    let second_turn_id = TurnId::new();
+    let second_message = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::MessageAppended {
+            message: Message::text(Role::User, "second"),
+        },
+    )
+    .with_turn_id(second_turn_id);
+    let second_start = turn_started_event(&session, &branch, second_turn_id);
+    let second_queue = queued_message_event(&session, &branch, "second");
+    let second_queue_id = second_queue.event_id;
+    let admission = store
+        .admit_turn_or_queue(
+            session.session_id,
+            session.settings_revision_id,
+            &cancel_clear_event(&session, &branch),
+            &[second_message, second_start],
+            &[second_queue],
+        )
+        .expect("queue second turn");
+    assert!(matches!(
+        admission,
+        SessionTurnAdmission::Queued { position: 1, .. }
+    ));
+
+    let metrics = store
+        .load_session_inspection_metrics(session.session_id)
+        .expect("metrics");
+    assert_eq!(metrics.active_turn_count, 1);
+    assert_eq!(metrics.turn_count, 1);
+    assert_eq!(metrics.message_count, 1);
+
+    store
+        .append_event(&turn_finished_event(&session, &branch, first_turn_id))
+        .expect("finish first turn");
+    let continuation_turn_id = TurnId::new();
+    let continuation_events = vec![
+        EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::SessionQueuedMessageResolved {
+                queue_event_id: second_queue_id,
+                outcome: bt_core::QueuedMessageResolutionOutcome::Dispatched,
+                reason: Some("test dispatch".to_owned()),
+            },
+        ),
+        EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::MessageAppended {
+                message: Message::text(Role::User, "second"),
+            },
+        )
+        .with_turn_id(continuation_turn_id),
+        turn_started_event_with_source(
+            &session,
+            &branch,
+            continuation_turn_id,
+            TurnStartSource::QueuedFollowUp,
+        ),
+    ];
+    let claim = store
+        .claim_queued_continuation(session.session_id, second_queue_id, &continuation_events)
+        .expect("claim queue");
+    assert!(matches!(
+        claim,
+        ContinuationClaim::Claimed { ref seq_ids } if seq_ids.len() == 3
+    ));
+
+    store
+        .append_event(&turn_finished_event(
+            &session,
+            &branch,
+            continuation_turn_id,
+        ))
+        .expect("finish continuation");
+    assert_eq!(
+        store
+            .claim_queued_continuation(session.session_id, second_queue_id, &continuation_events,)
+            .expect("reject consumed queue"),
+        ContinuationClaim::Stale
+    );
+}
+
+#[test]
+fn turn_transition_primitives_reject_malformed_event_batches() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+
+    let error = store
+        .admit_turn_or_queue(
+            session.session_id,
+            session.settings_revision_id,
+            &cancel_clear_event(&session, &branch),
+            &[],
+            &[queued_message_event(&session, &branch, "queued")],
+        )
+        .expect_err("empty started transition must fail");
+    assert!(error.to_string().contains("turn transition"));
+    assert!(
+        store
+            .load_all_events(session.session_id)
+            .expect("events")
+            .is_empty()
+    );
+
+    let queued = queued_message_event(&session, &branch, "queued");
+    let queue_event_id = queued.event_id;
+    store.append_event(&queued).expect("queue source");
+    let error = store
+        .claim_queued_continuation(session.session_id, queue_event_id, &[])
+        .expect_err("empty continuation transition must fail");
+    assert!(error.to_string().contains("turn transition"));
+    assert_eq!(
+        store
+            .load_pending_queued_messages(session.session_id)
+            .expect("pending queue")
+            .len(),
+        1
+    );
+
+    let turn_id = TurnId::new();
+    let started_events = vec![
+        EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::MessageAppended {
+                message: Message::text(Role::User, "new input"),
+            },
+        )
+        .with_turn_id(turn_id),
+        turn_started_event(&session, &branch, turn_id),
+    ];
+    let duplicate_queue_events = vec![
+        queued_message_event(&session, &branch, "new input"),
+        EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::SessionQueuedMessageEnqueued {
+                message: Message::text(Role::User, "wrong revision"),
+                settings_revision_id: session.settings_revision_id + 1,
+            },
+        ),
+    ];
+    let error = store
+        .admit_turn_or_queue(
+            session.session_id,
+            session.settings_revision_id,
+            &cancel_clear_event(&session, &branch),
+            &started_events,
+            &duplicate_queue_events,
+        )
+        .expect_err("duplicate queued transition must fail");
+    assert!(error.to_string().contains("settings revision"));
+
+    let continuation_turn_id = TurnId::new();
+    let malformed_resolution = vec![
+        EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::SessionQueuedMessageResolved {
+                queue_event_id,
+                outcome: bt_core::QueuedMessageResolutionOutcome::Dispatched,
+                reason: None,
+            },
+        ),
+        EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::SessionQueuedMessageResolved {
+                queue_event_id: bt_core::EventId::new(),
+                outcome: bt_core::QueuedMessageResolutionOutcome::Dropped,
+                reason: Some("unexpected".to_owned()),
+            },
+        ),
+        EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::MessageAppended {
+                message: Message::text(Role::User, "queued"),
+            },
+        )
+        .with_turn_id(continuation_turn_id),
+        turn_started_event_with_source(
+            &session,
+            &branch,
+            continuation_turn_id,
+            TurnStartSource::QueuedFollowUp,
+        ),
+    ];
+    let error = store
+        .claim_queued_continuation(session.session_id, queue_event_id, &malformed_resolution)
+        .expect_err("mismatched extra resolution must fail");
+    assert!(error.to_string().contains("unexpected source"));
+
+    let wrong_revision_events = vec![
+        EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::SessionQueuedMessageResolved {
+                queue_event_id,
+                outcome: bt_core::QueuedMessageResolutionOutcome::Dispatched,
+                reason: None,
+            },
+        ),
+        EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::MessageAppended {
+                message: Message::text(Role::User, "queued"),
+            },
+        )
+        .with_turn_id(continuation_turn_id),
+        turn_started_event_with_source_and_revision(
+            &session,
+            &branch,
+            continuation_turn_id,
+            TurnStartSource::QueuedFollowUp,
+            session.settings_revision_id + 1,
+        ),
+    ];
+    let error = store
+        .claim_queued_continuation(session.session_id, queue_event_id, &wrong_revision_events)
+        .expect_err("continuation must inherit its queued settings revision");
+    assert!(error.to_string().contains("settings revision"));
+    assert_eq!(
+        store
+            .load_pending_queued_messages(session.session_id)
+            .expect("pending queue after malformed claims")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn steer_continuation_claim_is_scoped_to_one_branch() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    let child_branch = BranchRecord {
+        branch_id: bt_core::BranchId::new(),
+        session_id: session.session_id,
+        parent_branch_id: Some(branch.branch_id),
+        parent_event_id: None,
+        head_event_id: None,
+        summary: None,
+        created_at: OffsetDateTime::now_utc(),
+        is_default: false,
+    };
+    store
+        .create_branch(&child_branch)
+        .expect("create child branch");
+
+    let root_steer = EventEnvelope::new(
+        session.session_id,
+        branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::SessionSteered {
+            message: "root steer".to_owned(),
+            settings_revision_id: session.settings_revision_id,
+        },
+    );
+    let root_steer_id = root_steer.event_id;
+    store.append_event(&root_steer).expect("root steer");
+    let child_steer = EventEnvelope::new(
+        session.session_id,
+        child_branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::SessionSteered {
+            message: "child steer".to_owned(),
+            settings_revision_id: session.settings_revision_id,
+        },
+    );
+    let child_steer_id = child_steer.event_id;
+    store.append_event(&child_steer).expect("child steer");
+
+    let turn_id = TurnId::new();
+    let events = vec![
+        EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::SessionSteersResolved {
+                steer_event_ids: vec![root_steer_id],
+                outcome: bt_core::SteerResolutionOutcome::Applied,
+                combined_message: Some("root steer".to_owned()),
+                reason: None,
+            },
+        ),
+        EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::MessageAppended {
+                message: Message::text(Role::User, "root steer"),
+            },
+        )
+        .with_turn_id(turn_id),
+        turn_started_event_with_source(&session, &branch, turn_id, TurnStartSource::SteerFollowUp),
+    ];
+    let mut wrong_revision_events = events.clone();
+    wrong_revision_events.pop();
+    wrong_revision_events.push(turn_started_event_with_source_and_revision(
+        &session,
+        &branch,
+        turn_id,
+        TurnStartSource::SteerFollowUp,
+        session.settings_revision_id + 1,
+    ));
+    let error = store
+        .claim_steer_continuation(
+            session.session_id,
+            branch.branch_id,
+            &[root_steer_id],
+            &wrong_revision_events,
+        )
+        .expect_err("continuation must inherit the latest steer settings revision");
+    assert!(error.to_string().contains("settings revision"));
+    let claim = store
+        .claim_steer_continuation(
+            session.session_id,
+            branch.branch_id,
+            &[root_steer_id],
+            &events,
+        )
+        .expect("claim root steer");
+    assert!(matches!(claim, ContinuationClaim::Claimed { .. }));
+    let pending = store
+        .load_pending_steers(session.session_id)
+        .expect("pending steers");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].steer_event_id, child_steer_id);
+    assert_eq!(pending[0].branch_id, child_branch.branch_id);
+}
+
+#[test]
+fn reopening_without_rebuild_marker_recovers_active_turn_projection() {
+    let file = NamedTempFile::new().expect("tempfile");
+    let (session, branch) = sample_session();
+    let turn_id = TurnId::new();
+    {
+        let mut store = SqliteSessionStore::open(file.path()).expect("store");
+        store
+            .create_session(&session, &branch)
+            .expect("create session");
+        store
+            .append_event(&turn_started_event(&session, &branch, turn_id))
+            .expect("start turn");
+    }
+    {
+        let connection = rusqlite::Connection::open(file.path()).expect("raw connection");
+        connection
+            .execute("DELETE FROM active_turn_projection", [])
+            .expect("clear projection");
+        connection
+            .execute(
+                "DELETE FROM migration_metadata WHERE key = 'active_turn_projection_v1_rebuilt'",
+                [],
+            )
+            .expect("clear marker");
+    }
+
+    let mut store = SqliteSessionStore::open(file.path()).expect("reopen store");
+    assert_eq!(
+        store
+            .load_session_inspection_metrics(session.session_id)
+            .expect("metrics")
+            .active_turn_count,
+        1
+    );
+    let follow_up_turn_id = TurnId::new();
+    let admission = store
+        .admit_turn_or_queue(
+            session.session_id,
+            session.settings_revision_id,
+            &cancel_clear_event(&session, &branch),
+            &[
+                EventEnvelope::new(
+                    session.session_id,
+                    branch.branch_id,
+                    SpanKind::Agent,
+                    EventPayload::MessageAppended {
+                        message: Message::text(Role::User, "follow up"),
+                    },
+                )
+                .with_turn_id(follow_up_turn_id),
+                turn_started_event(&session, &branch, follow_up_turn_id),
+            ],
+            &[queued_message_event(&session, &branch, "follow up")],
+        )
+        .expect("queue behind reconstructed active turn");
+    assert!(matches!(
+        admission,
+        SessionTurnAdmission::Queued { position: 1, .. }
+    ));
+}
+
+#[test]
+fn turn_admission_retries_stale_settings_without_appending_events() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    let turn_id = TurnId::new();
+    let admission = store
+        .admit_turn_or_queue(
+            session.session_id,
+            session.settings_revision_id + 1,
+            &cancel_clear_event(&session, &branch),
+            &[turn_started_event(&session, &branch, turn_id)],
+            &[queued_message_event(&session, &branch, "queued")],
+        )
+        .expect("stale admission");
+    assert_eq!(
+        admission,
+        SessionTurnAdmission::RetryWithSettings {
+            settings_revision_id: session.settings_revision_id,
+        }
+    );
+    assert!(
+        !store
+            .session_has_events(session.session_id)
+            .expect("event presence")
+    );
+}
+
+#[test]
+fn stale_turn_finish_does_not_clear_newer_active_turn() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    let first_turn_id = TurnId::new();
+    let second_turn_id = TurnId::new();
+    store
+        .append_event(&turn_started_event(&session, &branch, first_turn_id))
+        .expect("start first");
+    store
+        .append_event(&turn_finished_event(&session, &branch, first_turn_id))
+        .expect("finish first");
+    store
+        .append_event(&turn_started_event(&session, &branch, second_turn_id))
+        .expect("start second");
+    store
+        .append_event(&turn_finished_event(&session, &branch, first_turn_id))
+        .expect("append stale finish");
+    assert_eq!(
+        store
+            .load_session_inspection_metrics(session.session_id)
+            .expect("metrics")
+            .active_turn_count,
+        1
+    );
+}
+
+#[test]
+fn cancel_request_blocks_queued_continuation_claim() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    let queued = queued_message_event(&session, &branch, "queued");
+    let queue_event_id = queued.event_id;
+    store.append_event(&queued).expect("queue message");
+    store
+        .append_event(&EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::SessionCancelled {
+                reason: "operator cancelled".to_owned(),
+            },
+        ))
+        .expect("cancel");
+    assert_eq!(
+        store
+            .claim_queued_continuation(session.session_id, queue_event_id, &[])
+            .expect("cancel wins"),
+        ContinuationClaim::CancelPending
     );
 }
 
@@ -299,8 +929,7 @@ fn inspection_metrics_capture_counts_and_turn_boundaries() {
     assert_eq!(metrics.approval_count, 1);
     assert_eq!(metrics.pending_approval_count, 1);
     assert_eq!(metrics.raw_chunk_count, 1);
-    assert!(metrics.last_turn_started_seq.is_some());
-    assert_eq!(metrics.last_turn_finished_seq, None);
+    assert_eq!(metrics.active_turn_count, 1);
 }
 
 #[test]
@@ -709,19 +1338,42 @@ fn migration_rebuilds_tool_and_approval_projections_with_composite_identity() {
 #[test]
 fn unfinished_resumed_turn_recovery_scans_turn_boundaries_only() {
     let mut store = SqliteSessionStore::open_in_memory().expect("store");
-    let (session, branch) = sample_session();
-    store
-        .create_session(&session, &branch)
-        .expect("create session");
+    let (user_session, user_branch) = sample_session();
+    let (finished_session, finished_branch) = sample_session();
+    let (unfinished_session, unfinished_branch) = sample_session();
+    for (session, branch) in [
+        (&user_session, &user_branch),
+        (&finished_session, &finished_branch),
+        (&unfinished_session, &unfinished_branch),
+    ] {
+        store
+            .create_session(session, branch)
+            .expect("create session");
+    }
 
     let user_turn_id = TurnId::new();
     let finished_resume_id = TurnId::new();
     let unfinished_resume_id = TurnId::new();
 
-    for (turn_id, source) in [
-        (user_turn_id, TurnStartSource::UserMessage),
-        (finished_resume_id, TurnStartSource::ApprovalResume),
-        (unfinished_resume_id, TurnStartSource::InputResume),
+    for (session, branch, turn_id, source) in [
+        (
+            &user_session,
+            &user_branch,
+            user_turn_id,
+            TurnStartSource::UserMessage,
+        ),
+        (
+            &finished_session,
+            &finished_branch,
+            finished_resume_id,
+            TurnStartSource::ApprovalResume,
+        ),
+        (
+            &unfinished_session,
+            &unfinished_branch,
+            unfinished_resume_id,
+            TurnStartSource::InputResume,
+        ),
     ] {
         store
             .append_event(
@@ -747,8 +1399,8 @@ fn unfinished_resumed_turn_recovery_scans_turn_boundaries_only() {
     store
         .append_event(
             &EventEnvelope::new(
-                session.session_id,
-                branch.branch_id,
+                finished_session.session_id,
+                finished_branch.branch_id,
                 SpanKind::Agent,
                 EventPayload::TurnFinished {
                     turn_id: finished_resume_id,
@@ -767,8 +1419,8 @@ fn unfinished_resumed_turn_recovery_scans_turn_boundaries_only() {
         .load_unfinished_resumed_turns()
         .expect("unfinished resumed turns");
     assert_eq!(unfinished.len(), 1);
-    assert_eq!(unfinished[0].session_id, session.session_id);
-    assert_eq!(unfinished[0].branch_id, branch.branch_id);
+    assert_eq!(unfinished[0].session_id, unfinished_session.session_id);
+    assert_eq!(unfinished[0].branch_id, unfinished_branch.branch_id);
     assert_eq!(unfinished[0].turn_id, unfinished_resume_id);
     assert_eq!(unfinished[0].provider, "test-provider");
     assert_eq!(unfinished[0].model, "test-model");
@@ -777,16 +1429,32 @@ fn unfinished_resumed_turn_recovery_scans_turn_boundaries_only() {
 #[test]
 fn unfinished_turn_recovery_includes_user_message_turns() {
     let mut store = SqliteSessionStore::open_in_memory().expect("store");
-    let (session, branch) = sample_session();
-    store
-        .create_session(&session, &branch)
-        .expect("create session");
+    let (user_session, user_branch) = sample_session();
+    let (finished_session, finished_branch) = sample_session();
+    for (session, branch) in [
+        (&user_session, &user_branch),
+        (&finished_session, &finished_branch),
+    ] {
+        store
+            .create_session(session, branch)
+            .expect("create session");
+    }
 
     let user_turn_id = TurnId::new();
     let finished_resume_id = TurnId::new();
-    for (turn_id, source) in [
-        (user_turn_id, TurnStartSource::UserMessage),
-        (finished_resume_id, TurnStartSource::ApprovalResume),
+    for (session, branch, turn_id, source) in [
+        (
+            &user_session,
+            &user_branch,
+            user_turn_id,
+            TurnStartSource::UserMessage,
+        ),
+        (
+            &finished_session,
+            &finished_branch,
+            finished_resume_id,
+            TurnStartSource::ApprovalResume,
+        ),
     ] {
         store
             .append_event(
@@ -812,8 +1480,8 @@ fn unfinished_turn_recovery_includes_user_message_turns() {
     store
         .append_event(
             &EventEnvelope::new(
-                session.session_id,
-                branch.branch_id,
+                finished_session.session_id,
+                finished_branch.branch_id,
                 SpanKind::Agent,
                 EventPayload::TurnFinished {
                     turn_id: finished_resume_id,

@@ -168,7 +168,9 @@ This removes the main `401 Unauthorized` failure mode that came from rotating on
 
 1. create or resume session through `bt-client`
 2. open SSE stream
-3. send message or control action
+3. send a message or control action; message ingress returns a typed
+   `dispatched` or `queued { position }` outcome from the runtime-owned atomic
+   admission transition rather than a client-side inference
 4. receive ordered events with monotonic IDs
 5. reconnect using `Last-Event-ID` if interrupted
 

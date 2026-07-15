@@ -53,8 +53,15 @@ pub struct BootstrappedTurn {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UserMessageAdmission {
+    Started(BootstrappedTurn),
+    Queued { position: usize },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueuedDispatch {
     pub branch_id: bt_core::BranchId,
+    pub turn_id: TurnId,
     pub settings_revision_id: u64,
 }
 
@@ -78,7 +85,7 @@ pub struct ResumableToolCall {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PostTurnControlAction {
     Stop,
-    ContinueCurrentBranch(u64),
+    ContinueCurrentBranch(QueuedDispatch),
     ContinueQueuedBranch(QueuedDispatch),
 }
 

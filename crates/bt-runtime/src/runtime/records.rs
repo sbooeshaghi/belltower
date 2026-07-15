@@ -826,12 +826,11 @@ impl BelltowerRuntime {
             self.ensure_session_started(&event)?;
         }
         self.take_store_append_fault_for_test()?;
-        let seq_id = {
-            let mut store = self.store.lock().map_err(|_| {
-                bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned())
-            })?;
-            commit(&mut store, &event)?
-        };
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
+        let seq_id = commit(&mut store, &event)?;
         self.publish_committed_event(event, seq_id);
         Ok(seq_id)
     }
@@ -849,15 +848,101 @@ impl BelltowerRuntime {
             }
         }
         self.take_store_append_fault_for_test()?;
-        let seq_ids = self
+        let mut store = self
             .store
             .lock()
-            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?
-            .append_events(&events)?;
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
+        let seq_ids = store.append_events(&events)?;
         for (event, seq_id) in events.into_iter().zip(seq_ids.iter().copied()) {
             self.publish_committed_event(event, seq_id);
         }
         Ok(seq_ids)
+    }
+
+    pub(super) fn commit_turn_admission(
+        &self,
+        session_id: SessionId,
+        expected_settings_revision_id: u64,
+        cancel_clear_event: EventEnvelope,
+        started_events: Vec<EventEnvelope>,
+        queued_events: Vec<EventEnvelope>,
+    ) -> Result<SessionTurnAdmission> {
+        if let Some(event) = started_events.first().or_else(|| queued_events.first()) {
+            self.ensure_session_started(event)?;
+        }
+        self.take_store_append_fault_for_test()?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
+        let outcome = store.admit_turn_or_queue(
+            session_id,
+            expected_settings_revision_id,
+            &cancel_clear_event,
+            &started_events,
+            &queued_events,
+        )?;
+        match &outcome {
+            SessionTurnAdmission::Started { seq_ids } => {
+                let mut events = Vec::with_capacity(seq_ids.len());
+                if seq_ids.len() == started_events.len() + 1 {
+                    events.push(cancel_clear_event);
+                }
+                events.extend(started_events);
+                for (event, seq_id) in events.into_iter().zip(seq_ids.iter().copied()) {
+                    self.publish_committed_event(event, seq_id);
+                }
+            }
+            SessionTurnAdmission::Queued { seq_ids, .. } => {
+                for (event, seq_id) in queued_events.into_iter().zip(seq_ids.iter().copied()) {
+                    self.publish_committed_event(event, seq_id);
+                }
+            }
+            SessionTurnAdmission::RetryWithSettings { .. } => {}
+        }
+        Ok(outcome)
+    }
+
+    pub(super) fn commit_queued_continuation(
+        &self,
+        session_id: SessionId,
+        queue_event_id: bt_core::EventId,
+        events: Vec<EventEnvelope>,
+    ) -> Result<ContinuationClaim> {
+        self.take_store_append_fault_for_test()?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
+        let outcome = store.claim_queued_continuation(session_id, queue_event_id, &events)?;
+        if let ContinuationClaim::Claimed { seq_ids } = &outcome {
+            for (event, seq_id) in events.into_iter().zip(seq_ids.iter().copied()) {
+                self.publish_committed_event(event, seq_id);
+            }
+        }
+        Ok(outcome)
+    }
+
+    pub(super) fn commit_steer_continuation(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        steer_event_ids: &[bt_core::EventId],
+        events: Vec<EventEnvelope>,
+    ) -> Result<ContinuationClaim> {
+        self.take_store_append_fault_for_test()?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
+        let outcome =
+            store.claim_steer_continuation(session_id, branch_id, steer_event_ids, &events)?;
+        if let ContinuationClaim::Claimed { seq_ids } = &outcome {
+            for (event, seq_id) in events.into_iter().zip(seq_ids.iter().copied()) {
+                self.publish_committed_event(event, seq_id);
+            }
+        }
+        Ok(outcome)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -892,33 +977,24 @@ impl BelltowerRuntime {
     }
 
     fn ensure_session_started(&self, event: &EventEnvelope) -> Result<()> {
-        let started_event = {
-            let mut store = self.store.lock().map_err(|_| {
-                bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned())
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
+        if !store.session_has_events(event.session_id)? {
+            let session = store.load_session(event.session_id)?.ok_or_else(|| {
+                bt_core::BelltowerError::InvalidState("session not found".to_owned())
             })?;
-            if store.session_has_events(event.session_id)? {
-                None
-            } else {
-                let session = store.load_session(event.session_id)?.ok_or_else(|| {
-                    bt_core::BelltowerError::InvalidState("session not found".to_owned())
-                })?;
-                let started_event = EventEnvelope::new(
-                    session.session_id,
-                    event.branch_id,
-                    SpanKind::Session,
-                    EventPayload::SessionStarted {
-                        project_root: session.project_root.to_string(),
-                        connection_id: session.connection_id.to_string(),
-                    },
-                );
-                let seq_id = store.append_event(&started_event)?;
-                let mut started_event = started_event;
-                started_event.seq_id = Some(seq_id);
-                Some(started_event)
-            }
-        };
-
-        if let Some(started_event) = started_event {
+            let mut started_event = EventEnvelope::new(
+                session.session_id,
+                event.branch_id,
+                SpanKind::Session,
+                EventPayload::SessionStarted {
+                    project_root: session.project_root.to_string(),
+                    connection_id: session.connection_id.to_string(),
+                },
+            );
+            started_event.seq_id = Some(store.append_event(&started_event)?);
             bt_otel::mirror_event(&started_event);
             let _ = self.event_bus.send(started_event);
         }

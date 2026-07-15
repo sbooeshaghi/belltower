@@ -203,8 +203,22 @@ pub struct SessionInspectionMetrics {
     pub approval_count: u32,
     pub pending_approval_count: u32,
     pub raw_chunk_count: u32,
-    pub last_turn_started_seq: Option<i64>,
-    pub last_turn_finished_seq: Option<i64>,
+    pub active_turn_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionTurnAdmission {
+    Started { seq_ids: Vec<i64> },
+    Queued { seq_ids: Vec<i64>, position: usize },
+    RetryWithSettings { settings_revision_id: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContinuationClaim {
+    Claimed { seq_ids: Vec<i64> },
+    Busy,
+    CancelPending,
+    Stale,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -1622,7 +1622,7 @@ async fn failed_streaming_turn_records_session_error_and_failed_turn_finish() {
 }
 
 #[tokio::test]
-async fn pre_turn_failure_records_session_error_without_turn_started() {
+async fn pre_turn_failure_closes_prestarted_turn() {
     let mut config = BelltowerConfig::from_embedded().expect("config");
     config.connections.push(ConnectionDescriptor {
         id: ConnectionId::new("preflight-auth"),
@@ -1683,22 +1683,57 @@ async fn pre_turn_failure_records_session_error_without_turn_started() {
         .json()
         .await
         .expect("events body");
-    assert!(
+    let started_index = events
+        .events
+        .iter()
+        .position(|event| matches!(event.payload, EventPayload::TurnStarted { .. }))
+        .expect("prestarted turn");
+    let turn_id = events.events[started_index]
+        .turn_id
+        .expect("prestarted turn id");
+    let error_index = events
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::SessionError {
+                    class,
+                    code,
+                    ..
+                } if *class == ErrorClass::Auth
+                    && code == "auth_error"
+                    && event.turn_id == Some(turn_id)
+            )
+        })
+        .expect("auth session error");
+    let finished_index = events
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::TurnFinished {
+                    turn_id: finished_turn_id,
+                    status,
+                    finish_reason,
+                    ..
+                } if *finished_turn_id == turn_id
+                    && status == "failed"
+                    && finish_reason.as_deref() == Some("auth_error")
+            )
+        })
+        .expect("failed turn finish");
+    assert!(started_index < error_index);
+    assert!(error_index < finished_index);
+    assert_eq!(
         events
             .events
             .iter()
-            .all(|event| !matches!(event.payload, EventPayload::TurnStarted { .. }))
+            .filter(|event| matches!(event.payload, EventPayload::TurnStarted { .. }))
+            .count(),
+        1
     );
-    assert!(events.events.iter().any(|event| matches!(
-        &event.payload,
-        EventPayload::SessionError {
-            class,
-            code,
-            ..
-        } if *class == ErrorClass::Auth
-            && code == "auth_error"
-            && event.turn_id.is_some()
-    )));
 }
 
 #[tokio::test]
@@ -6975,6 +7010,19 @@ async fn failed_approved_tool_resume_records_one_terminal_transition() {
             Some(paused_turn_id),
         )
         .expect("record approval request");
+    server
+        .runtime
+        .record_turn_finished(
+            session.session_id,
+            branch.branch_id,
+            paused_turn_id,
+            "openai-compatible".to_owned(),
+            "test-model".to_owned(),
+            "awaiting_approval".to_owned(),
+            Some("ToolCalls".to_owned()),
+            1,
+        )
+        .expect("finish paused turn");
 
     let response = server
         .request(
@@ -7191,6 +7239,19 @@ async fn approved_tool_resume_closes_turn_when_initial_terminal_append_fails() {
             Some(paused_turn_id),
         )
         .expect("record approval request");
+    server
+        .runtime
+        .record_turn_finished(
+            session.session_id,
+            branch.branch_id,
+            paused_turn_id,
+            "openai-compatible".to_owned(),
+            "test-model".to_owned(),
+            "awaiting_approval".to_owned(),
+            Some("ToolCalls".to_owned()),
+            1,
+        )
+        .expect("finish paused turn");
 
     let approve_client = client.clone();
     let approve_url = server.url(&format!("sessions/{}/approve", session.session_id));
@@ -7349,6 +7410,19 @@ async fn answer_round_trip_starts_resumed_turn_before_result_events() {
             Some(paused_turn_id),
         )
         .expect("append ask tool call");
+    server
+        .runtime
+        .record_turn_finished(
+            created.session.session_id,
+            created.branch.branch_id,
+            paused_turn_id,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            "awaiting_input".to_owned(),
+            Some("ToolCalls".to_owned()),
+            1,
+        )
+        .expect("finish paused turn");
 
     let answer = server
         .request(
@@ -7529,6 +7603,19 @@ async fn answer_round_trip_resumes_pending_call_on_original_branch() {
             Some(paused_turn_id),
         )
         .expect("append ask tool call");
+    server
+        .runtime
+        .record_turn_finished(
+            created.session.session_id,
+            child.branch.branch_id,
+            paused_turn_id,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            "awaiting_input".to_owned(),
+            Some("ToolCalls".to_owned()),
+            1,
+        )
+        .expect("finish paused turn");
 
     let answer = server
         .request(
@@ -7668,6 +7755,19 @@ async fn answer_resume_keeps_paused_settings_revision_after_session_model_change
             Some(paused_turn_id),
         )
         .expect("append ask tool call");
+    server
+        .runtime
+        .record_turn_finished(
+            created.session.session_id,
+            created.branch.branch_id,
+            paused_turn_id,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            "awaiting_input".to_owned(),
+            Some("ToolCalls".to_owned()),
+            1,
+        )
+        .expect("finish paused turn");
 
     let updated: CreateSessionResponse = server
         .request(
@@ -7767,46 +7867,64 @@ async fn busy_session_send_returns_queued_outcome() {
         .expect("create session body");
 
     let send_url = server.url(&format!("sessions/{}/message", created.session.session_id));
-    let token = server.token.clone();
-    let first_request = SendMessageRequest {
-        branch_id: created.branch.branch_id,
-        message: Message::text(Role::User, "start working"),
-    };
-    let send_client = client.clone();
-    let first_handle = tokio::spawn(async move {
-        send_client
-            .post(send_url)
-            .bearer_auth(token)
-            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
-            .json(&first_request)
-            .send()
-            .await
-            .expect("first send request")
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let queued = server
-        .request(
-            &client,
-            Method::POST,
-            &format!("sessions/{}/message", created.session.session_id),
-        )
-        .json(&SendMessageRequest {
-            branch_id: created.branch.branch_id,
-            message: Message::text(Role::User, "follow up"),
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut handles = ["start working", "follow up"]
+        .into_iter()
+        .map(|message| {
+            let barrier = Arc::clone(&barrier);
+            let send_client = client.clone();
+            let send_url = send_url.clone();
+            let token = server.token.clone();
+            let request = SendMessageRequest {
+                branch_id: created.branch.branch_id,
+                message: Message::text(Role::User, message),
+            };
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let response = send_client
+                    .post(send_url)
+                    .bearer_auth(token)
+                    .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
+                    .json(&request)
+                    .send()
+                    .await
+                    .expect("simultaneous send request");
+                let status = response.status();
+                let body = response
+                    .json::<SendMessageResponse>()
+                    .await
+                    .expect("simultaneous send body");
+                (status, body)
+            })
         })
-        .send()
-        .await
-        .expect("queued send");
-    assert_eq!(queued.status(), StatusCode::ACCEPTED);
-    let queued: SendMessageResponse = queued.json().await.expect("queued send body");
-    assert_eq!(queued.session_id, created.session.session_id);
-    assert_eq!(queued.branch_id, created.branch.branch_id);
-    assert_eq!(queued.outcome, SendMessageOutcome::Queued { position: 1 });
-
-    let first = first_handle.await.expect("first send join");
-    assert_eq!(first.status(), StatusCode::ACCEPTED);
+        .collect::<Vec<_>>();
+    barrier.wait().await;
+    let second = handles.pop().expect("second handle").await.expect("join");
+    let first = handles.pop().expect("first handle").await.expect("join");
+    let responses = [first, second];
+    assert!(
+        responses
+            .iter()
+            .all(|(status, response)| *status == StatusCode::ACCEPTED
+                && response.session_id == created.session.session_id
+                && response.branch_id == created.branch.branch_id)
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|(_, response)| response.outcome == SendMessageOutcome::Dispatched)
+            .count(),
+        1
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|(_, response)| {
+                response.outcome == SendMessageOutcome::Queued { position: 1 }
+            })
+            .count(),
+        1
+    );
 
     let requests = mock_provider.requests.as_ref().expect("requests capture");
     for _ in 0..40 {

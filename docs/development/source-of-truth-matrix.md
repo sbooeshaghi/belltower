@@ -42,6 +42,8 @@ During coherence passes, treat these as the primary comparison surfaces:
 - provider, auth, model, and readiness behavior
 - MCP lifecycle and operator surfaces
 - session, branch, workflow, and raw-chunk inspection
+- atomic user ingress, active-turn ownership, and queued/control continuation
+  admission
 - telemetry and export behavior
 
 ## Expected Outcomes

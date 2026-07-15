@@ -168,6 +168,29 @@ impl SqliteSessionStore {
                 )
                 .map_err(storage_error)?;
             }
+            EventPayload::TurnStarted { turn_id, .. } => {
+                tx.execute(
+                    "INSERT INTO active_turn_projection (
+                        session_id, branch_id, turn_id, started_seq_id, started_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        event.session_id.to_string(),
+                        event.branch_id.to_string(),
+                        turn_id.to_string(),
+                        seq_id,
+                        format_time(event.occurred_at)?,
+                    ],
+                )
+                .map_err(storage_error)?;
+            }
+            EventPayload::TurnFinished { turn_id, .. } => {
+                tx.execute(
+                    "DELETE FROM active_turn_projection
+                     WHERE session_id = ?1 AND turn_id = ?2",
+                    params![event.session_id.to_string(), turn_id.to_string()],
+                )
+                .map_err(storage_error)?;
+            }
             EventPayload::TurnContextManifestRecorded { manifest } => {
                 tx.execute(
                     "INSERT INTO context_manifest_projection (

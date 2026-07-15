@@ -1,6 +1,9 @@
 use bt_core::{ApprovalDecision, EventEnvelope, EventPayload};
 use rusqlite::{Connection, params};
 use serde_json::Value;
+use std::collections::HashMap;
+
+const ACTIVE_TURN_REBUILD_MARKER: &str = "active_turn_projection_v1_rebuilt";
 
 const TOOL_AND_APPROVAL_PROJECTION_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS approval_projection (
@@ -165,6 +168,19 @@ CREATE TABLE IF NOT EXISTS session_control_projection (
     session_id      TEXT PRIMARY KEY,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
     updated_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS active_turn_projection (
+    session_id      TEXT PRIMARY KEY,
+    branch_id       TEXT NOT NULL,
+    turn_id         TEXT NOT NULL,
+    started_seq_id  INTEGER NOT NULL,
+    started_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS migration_metadata (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS queued_message_projection (
@@ -348,7 +364,95 @@ pub fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
     drop_column_if_exists(connection, "events", "trace_id")?;
     rewrite_legacy_event_json_without_trace_id(connection)?;
     cut_over_tool_and_approval_projection_identity(connection)?;
+    if !migration_marker_exists(connection, ACTIVE_TURN_REBUILD_MARKER)? {
+        rebuild_active_turn_projection(connection)?;
+    }
     Ok(())
+}
+
+fn migration_marker_exists(connection: &Connection, key: &str) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM migration_metadata WHERE key = ?1
+        )",
+        params![key],
+        |row| row.get::<_, i64>(0).map(|value| value != 0),
+    )
+}
+
+fn rebuild_active_turn_projection(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        let boundaries = {
+            let mut statement = connection.prepare(
+                "SELECT seq_id, event_json FROM events
+                 WHERE event_kind IN ('turn.started', 'turn.finished')
+                 ORDER BY seq_id ASC",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut active = HashMap::new();
+        for (seq_id, event_json) in boundaries {
+            let event: EventEnvelope = serde_json::from_str(&event_json)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            match &event.payload {
+                EventPayload::TurnStarted { turn_id, .. } => {
+                    let started_at = event
+                        .occurred_at
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                    active.insert(
+                        event.session_id.to_string(),
+                        (
+                            event.branch_id.to_string(),
+                            turn_id.to_string(),
+                            seq_id,
+                            started_at,
+                        ),
+                    );
+                }
+                EventPayload::TurnFinished { turn_id, .. } => {
+                    let session_id = event.session_id.to_string();
+                    if active
+                        .get(&session_id)
+                        .is_some_and(|(_, active_turn_id, _, _)| {
+                            active_turn_id == &turn_id.to_string()
+                        })
+                    {
+                        active.remove(&session_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        connection.execute("DELETE FROM active_turn_projection", [])?;
+        for (session_id, (branch_id, turn_id, started_seq_id, started_at)) in active {
+            connection.execute(
+                "INSERT INTO active_turn_projection (
+                    session_id, branch_id, turn_id, started_seq_id, started_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![session_id, branch_id, turn_id, started_seq_id, started_at],
+            )?;
+        }
+        connection.execute(
+            "INSERT OR REPLACE INTO migration_metadata (key, value) VALUES (?1, 'complete')",
+            params![ACTIVE_TURN_REBUILD_MARKER],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => connection.execute_batch("COMMIT"),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 fn cut_over_tool_and_approval_projection_identity(connection: &Connection) -> rusqlite::Result<()> {
