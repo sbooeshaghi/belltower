@@ -64,7 +64,7 @@ use crate::operator_routes::{
 use crate::session_tools::try_build_ask_response;
 use crate::tool_execution::{
     ServerTurnAdapters, build_tool_registry, execute_tool_call, format_shell_command_output,
-    resolve_tool_after_approval, session_scope_span,
+    resolve_tool_after_approval, session_scope_span, tool_execution_error_result,
 };
 
 const DEFAULT_TRANSCRIPT_PAGE_LIMIT: usize = 200;
@@ -647,23 +647,32 @@ async fn approve_tool(
                 return Err(error);
             }
         };
-        state.runtime.append_raw_message(
-            &turn_session,
-            &branch,
-            bt_core::Message::from_part(
-                bt_core::Role::Tool,
-                bt_core::MessagePart::ToolResult {
-                    result: tool_result.clone(),
-                },
-            ),
-            Some(resumed.turn_id),
-        )?;
-        state.runtime.record_tool_execution(
+        let tool_result_message = bt_core::Message::from_part(
+            bt_core::Role::Tool,
+            bt_core::MessagePart::ToolResult {
+                result: tool_result.clone(),
+            },
+        );
+        if let Err(persistence_error) = state.runtime.record_tool_terminal_transition(
             turn_session.session_id,
             branch.branch_id,
-            tool_result,
-            Some(resumed.turn_id),
-        )?;
+            resumed.turn_id,
+            tool_result.clone(),
+            tool_result_message,
+        ) {
+            let latency_ms = started.elapsed().as_millis() as u64;
+            state.runtime.record_turn_failure_transition(
+                turn_session.session_id,
+                branch.branch_id,
+                &connection.provider,
+                &model_id,
+                resumed.turn_id,
+                vec![tool_result],
+                &persistence_error,
+                latency_ms,
+            )?;
+            return Err(ApiError(persistence_error));
+        }
         if state
             .runtime
             .has_pending_approvals_on_branch(turn_session.session_id, branch.branch_id)?

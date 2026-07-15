@@ -4285,6 +4285,36 @@ async fn operator_shell_commands_record_tool_and_command_events() {
         .await
         .expect("events body");
 
+    let operation_index = events
+        .events
+        .iter()
+        .position(|event| matches!(event.payload, EventPayload::ToolOperationRecorded { .. }))
+        .expect("operator tool operation");
+    let request_index = events
+        .events
+        .iter()
+        .position(|event| matches!(event.payload, EventPayload::ToolCallRequested { .. }))
+        .expect("operator tool request");
+    let terminal_index = events
+        .events
+        .iter()
+        .position(|event| matches!(event.payload, EventPayload::ToolExecutionFinished { .. }))
+        .expect("operator tool terminal");
+    let command_index = events
+        .events
+        .iter()
+        .position(|event| matches!(event.payload, EventPayload::OperatorCommandRecorded { .. }))
+        .expect("operator command audit event");
+    assert_eq!(request_index, operation_index + 1);
+    assert_eq!(command_index, terminal_index + 1);
+    assert!(!events.events.iter().any(|event| {
+        matches!(
+            &event.payload,
+            EventPayload::MessageAppended { message }
+                if message.tool_call().is_some() || message.tool_result().is_some()
+        )
+    }));
+
     assert!(events.events.iter().any(|event| matches!(
         &event.payload,
         EventPayload::ToolOperationRecorded {
@@ -4320,6 +4350,186 @@ async fn operator_shell_commands_record_tool_and_command_events() {
             && output.contains("stdout:\nok")
             && *success
     )));
+}
+
+#[tokio::test]
+async fn operator_shell_request_admission_is_atomic_on_storage_failure() {
+    let server = spawn_server(BelltowerConfig::from_embedded().expect("config")).await;
+    let client = Client::new();
+    let project_root = tempfile::TempDir::new().expect("project root");
+    let created: CreateSessionResponse = server
+        .request(&client, Method::POST, "sessions")
+        .json(&CreateSessionRequest {
+            project_root: project_root.path().display().to_string(),
+            connection_id: ConnectionId::new("local"),
+            model_id: None,
+            tool_mode: None,
+            display_name: Some("operator-shell-atomicity".to_owned()),
+            objective: None,
+            budget: None,
+        })
+        .send()
+        .await
+        .expect("create session")
+        .json()
+        .await
+        .expect("create session body");
+
+    server
+        .runtime
+        .inject_next_store_append_error_for_test("operator admission failure");
+    let response = server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/commands/shell", created.session.session_id),
+        )
+        .json(&RunShellCommandRequest {
+            raw_input: "!printf should-not-run".to_owned(),
+            command: "printf should-not-run".to_owned(),
+            timeout_seconds: Some(5),
+        })
+        .send()
+        .await
+        .expect("run shell command");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let events = server
+        .runtime
+        .all_events(created.session.session_id)
+        .expect("canonical events");
+    assert!(!events.iter().any(|event| {
+        matches!(
+            &event.payload,
+            EventPayload::ToolOperationRecorded { .. }
+                | EventPayload::ToolCallRequested { .. }
+                | EventPayload::ToolExecutionFinished { .. }
+                | EventPayload::OperatorCommandRecorded { .. }
+        )
+    }));
+}
+
+#[tokio::test]
+async fn operator_shell_route_recovers_terminal_batch_after_storage_failure() {
+    let server = spawn_server(BelltowerConfig::from_embedded().expect("config")).await;
+    let client = Client::new();
+    let project_root = tempfile::TempDir::new().expect("project root");
+    let created: CreateSessionResponse = server
+        .request(&client, Method::POST, "sessions")
+        .json(&CreateSessionRequest {
+            project_root: project_root.path().display().to_string(),
+            connection_id: ConnectionId::new("local"),
+            model_id: None,
+            tool_mode: None,
+            display_name: Some("operator-shell-terminal-recovery".to_owned()),
+            objective: None,
+            budget: None,
+        })
+        .send()
+        .await
+        .expect("create session")
+        .json()
+        .await
+        .expect("create session body");
+
+    let request_client = client.clone();
+    let request_url = server.url(&format!(
+        "sessions/{}/commands/shell",
+        created.session.session_id
+    ));
+    let token = server.token.clone();
+    let request_task = tokio::spawn(async move {
+        request_client
+            .post(request_url)
+            .bearer_auth(token)
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
+            .json(&RunShellCommandRequest {
+                raw_input: "!sleep 1; printf ok".to_owned(),
+                command: "sleep 1; printf ok".to_owned(),
+                timeout_seconds: Some(5),
+            })
+            .send()
+            .await
+            .expect("run shell command")
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let events = server
+                .runtime
+                .all_events(created.session.session_id)
+                .expect("canonical events");
+            if events.iter().any(|event| {
+                matches!(
+                    &event.payload,
+                    EventPayload::ToolCallRequested { tool_name, .. } if tool_name == "shell"
+                )
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("operator request should be committed before execution finishes");
+    server
+        .runtime
+        .inject_next_store_append_error_for_test("operator terminal append failure");
+
+    let response = request_task.await.expect("request task");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let events = server
+        .runtime
+        .all_events(created.session.session_id)
+        .expect("canonical events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.payload, EventPayload::ToolCallRequested { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.payload, EventPayload::ToolExecutionFinished { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.payload, EventPayload::OperatorCommandRecorded { .. }))
+            .count(),
+        1
+    );
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.payload,
+            EventPayload::SessionError { code, .. } if code == "storage_error"
+        )
+    }));
+    let call_id = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            EventPayload::ToolCallRequested { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        })
+        .expect("operator call id");
+    let inspection = server
+        .runtime
+        .inspect_tool_call(created.session.session_id, call_id)
+        .expect("tool inspection")
+        .expect("operator tool call");
+    assert_eq!(inspection.execution_status.as_deref(), Some("completed"));
+    assert_eq!(
+        inspection
+            .result
+            .as_ref()
+            .and_then(|result| result["output"]["stdout"].as_str()),
+        Some("ok")
+    );
 }
 
 #[tokio::test]
@@ -5052,6 +5262,154 @@ async fn event_stream_replays_across_process_restart_without_duplicates() {
 // both appear in turn execution summaries, and both survive bundle export without
 // source-specific reconstruction logic.
 #[tokio::test]
+async fn same_turn_continuation_manifest_uses_committed_tool_messages() {
+    let mock_provider = spawn_mock_safe_tool_provider().await;
+    let server = spawn_server(config_for_mock_provider(&mock_provider.base_url)).await;
+    let client = api_client(&server);
+    let project_root = tempfile::TempDir::new().expect("project root");
+    std::fs::write(project_root.path().join("README.md"), "fixture").expect("fixture file");
+    let created = client
+        .create_session(&CreateSessionRequest {
+            project_root: project_root.path().display().to_string(),
+            connection_id: ConnectionId::new("local"),
+            model_id: None,
+            tool_mode: None,
+            display_name: Some("same-turn-tool-context".to_owned()),
+            objective: None,
+            budget: None,
+        })
+        .await
+        .expect("create session");
+
+    let dispatched = client
+        .send_message(
+            created.session.session_id,
+            &SendMessageRequest {
+                branch_id: created.branch.branch_id,
+                message: Message::text(Role::User, "list the workspace"),
+            },
+        )
+        .await
+        .expect("send message");
+    assert!(matches!(dispatched.outcome, SendMessageOutcome::Dispatched));
+
+    let events = client
+        .session_events(created.session.session_id, None)
+        .await
+        .expect("events")
+        .events;
+    let call_id = ToolCallId::new("call-list-same-turn");
+    let requested = events
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::ToolCallRequested {
+                    call_id: event_call_id,
+                    tool_name,
+                    ..
+                } if *event_call_id == call_id && tool_name == "list"
+            )
+        })
+        .expect("tool request");
+    let request_message = events
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::MessageAppended { message }
+                    if message.tool_call().is_some_and(|call| call.call_id == call_id.to_string())
+            )
+        })
+        .expect("tool-call message");
+    let finished = events
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::ToolExecutionFinished {
+                    call_id: event_call_id,
+                    ..
+                } if *event_call_id == call_id
+            )
+        })
+        .expect("tool terminal");
+    let result_message = events
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::MessageAppended { message }
+                    if message.tool_result().is_some_and(|result| result.call_id == call_id)
+            )
+        })
+        .expect("tool-result message");
+    let continuation = events
+        .iter()
+        .find(|event| {
+            event.seq_id > result_message.seq_id
+                && matches!(event.payload, EventPayload::CompletionRequested { .. })
+        })
+        .expect("same-turn continuation");
+    let manifest = events
+        .iter()
+        .find_map(|event| {
+            if event.seq_id > result_message.seq_id
+                && event.seq_id < continuation.seq_id
+                && let EventPayload::TurnContextManifestRecorded { manifest } = &event.payload
+            {
+                Some(manifest)
+            } else {
+                None
+            }
+        })
+        .expect("continuation manifest");
+    let request_message_value = match &request_message.payload {
+        EventPayload::MessageAppended { message } => message,
+        _ => unreachable!("filtered request message"),
+    };
+    let result_message_value = match &result_message.payload {
+        EventPayload::MessageAppended { message } => message,
+        _ => unreachable!("filtered result message"),
+    };
+
+    assert_eq!(requested.turn_id, finished.turn_id);
+    assert_eq!(finished.turn_id, continuation.turn_id);
+    assert!(
+        requested.seq_id < request_message.seq_id
+            && request_message.seq_id < finished.seq_id
+            && finished.seq_id < result_message.seq_id
+            && result_message.seq_id < continuation.seq_id
+    );
+    assert!(manifest.messages.iter().any(|source| {
+        source.message_id == request_message_value.message_id
+            && source.source_seq_id == request_message.seq_id
+    }));
+    assert!(manifest.messages.iter().any(|source| {
+        source.message_id == result_message_value.message_id
+            && source.source_seq_id == result_message.seq_id
+    }));
+    assert!(
+        !events.iter().any(|event| matches!(
+            &event.payload,
+            EventPayload::ToolApprovalRequested {
+                call_id: event_call_id,
+                ..
+            } if *event_call_id == call_id
+        )),
+        "safe tool should continue in the same turn without approval"
+    );
+
+    let requests = mock_provider
+        .requests
+        .as_ref()
+        .expect("captured requests")
+        .lock()
+        .expect("requests lock");
+    assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
 async fn inspection_contract_min_reconstructs_canonical_session_truth() {
     let mock_provider = spawn_mock_inspection_contract_provider().await;
     let mcp_fixture = spawn_mock_http_mcp_server().await;
@@ -5333,6 +5691,121 @@ async fn inspection_contract_min_reconstructs_canonical_session_truth() {
         .session_events(created.session.session_id, None)
         .await
         .expect("events");
+
+    for call_id in ["call-shell-approval", "call-mcp-approval"] {
+        let requested = events
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.payload,
+                    EventPayload::ToolCallRequested { call_id: recorded, .. }
+                        if *recorded == ToolCallId::new(call_id)
+                )
+            })
+            .collect::<Vec<_>>();
+        let finished = events
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.payload,
+                    EventPayload::ToolExecutionFinished { call_id: recorded, .. }
+                        if *recorded == ToolCallId::new(call_id)
+                )
+            })
+            .collect::<Vec<_>>();
+        let request_messages = events
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.payload,
+                    EventPayload::MessageAppended { message }
+                        if message.tool_call().is_some_and(|call| {
+                            call.call_id == call_id
+                        })
+                )
+            })
+            .collect::<Vec<_>>();
+        let result_messages = events
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.payload,
+                    EventPayload::MessageAppended { message }
+                        if message.tool_result().is_some_and(|result| {
+                            result.call_id == ToolCallId::new(call_id)
+                        })
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requested.len(), 1, "one canonical request for {call_id}");
+        assert_eq!(
+            request_messages.len(),
+            1,
+            "one canonical tool-call message for {call_id}"
+        );
+        assert_eq!(finished.len(), 1, "one canonical terminal for {call_id}");
+        assert_eq!(
+            result_messages.len(),
+            1,
+            "one canonical tool-result message for {call_id}"
+        );
+        let next_completion = events
+            .events
+            .iter()
+            .find(|event| {
+                event.seq_id > finished[0].seq_id
+                    && matches!(event.payload, EventPayload::CompletionRequested { .. })
+            })
+            .expect("tool result must be followed by provider continuation");
+        let request_message = match &request_messages[0].payload {
+            EventPayload::MessageAppended { message } => message,
+            _ => unreachable!("filtered request message"),
+        };
+        let result_message = match &result_messages[0].payload {
+            EventPayload::MessageAppended { message } => message,
+            _ => unreachable!("filtered result message"),
+        };
+        let next_manifest = events
+            .events
+            .iter()
+            .find_map(|event| {
+                if event.seq_id > result_messages[0].seq_id
+                    && event.seq_id < next_completion.seq_id
+                    && let EventPayload::TurnContextManifestRecorded { manifest } = &event.payload
+                {
+                    Some(manifest)
+                } else {
+                    None
+                }
+            })
+            .expect("provider continuation must record its model-visible context");
+        assert!(
+            requested[0].seq_id < request_messages[0].seq_id
+                && request_messages[0].seq_id < finished[0].seq_id
+                && finished[0].seq_id < result_messages[0].seq_id
+                && result_messages[0].seq_id < next_completion.seq_id,
+            "atomic tool evidence must be durable before provider continuation for {call_id}"
+        );
+        assert!(
+            next_manifest.messages.iter().any(|message| {
+                message.message_id == request_message.message_id
+                    && message.source_seq_id == request_messages[0].seq_id
+            }),
+            "provider continuation must reuse the exact canonical tool-call message for {call_id}"
+        );
+        assert!(
+            next_manifest.messages.iter().any(|message| {
+                message.message_id == result_message.message_id
+                    && message.source_seq_id == result_messages[0].seq_id
+            }),
+            "provider continuation must reuse the exact canonical tool-result message for {call_id}"
+        );
+    }
+
     assert!(events.events.iter().any(|event| matches!(
         &event.payload,
         EventPayload::OperatorCommandRecorded {
@@ -5862,6 +6335,125 @@ async fn approval_round_trip_executes_tool_and_continues_turn() {
         })
         .count();
     assert_eq!(resumed_tool_spans, 1, "expected one resumed tool span");
+}
+
+#[tokio::test]
+async fn once_approval_does_not_authorize_repeated_identical_request() {
+    let mock_provider = spawn_mock_repeated_approval_provider().await;
+    let server = spawn_server(config_for_mock_provider(&mock_provider.base_url)).await;
+    let client = Client::new();
+    let project_root = tempfile::TempDir::new().expect("project root");
+
+    let created: CreateSessionResponse = server
+        .request(&client, Method::POST, "sessions")
+        .json(&CreateSessionRequest {
+            project_root: project_root.path().display().to_string(),
+            connection_id: ConnectionId::new("local"),
+            model_id: None,
+            tool_mode: None,
+            display_name: Some("approval-once-repeated-request".to_owned()),
+            objective: None,
+            budget: None,
+        })
+        .send()
+        .await
+        .expect("create session")
+        .json()
+        .await
+        .expect("create session body");
+
+    let send = server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/message", created.session.session_id),
+        )
+        .json(&SendMessageRequest {
+            branch_id: created.branch.branch_id,
+            message: Message::text(Role::User, "run the command"),
+        })
+        .send()
+        .await
+        .expect("send message");
+    assert_eq!(send.status(), StatusCode::ACCEPTED);
+
+    let call_id = ToolCallId::new("call-approval-repeat");
+    let approval = server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/approve", created.session.session_id),
+        )
+        .json(&ApproveToolRequest {
+            call_id: call_id.clone(),
+            tool_name: "shell".to_owned(),
+            scope: ApprovalScope::Once,
+            decision: ApprovalDecision::Approved {
+                decided_at: time::OffsetDateTime::now_utc(),
+                decided_by: "test".to_owned(),
+                scope: ApprovalScope::Once,
+                source: ApprovalDecisionSource::Human,
+            },
+        })
+        .send()
+        .await
+        .expect("approve tool");
+    assert_eq!(approval.status(), StatusCode::ACCEPTED);
+
+    let events = server
+        .runtime
+        .all_events(created.session.session_id)
+        .expect("canonical events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                &event.payload,
+                EventPayload::ToolApprovalRequested { call_id: recorded, .. }
+                    if *recorded == call_id
+            ))
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                &event.payload,
+                EventPayload::ToolApprovalResolved { call_id: recorded, .. }
+                    if *recorded == call_id
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                &event.payload,
+                EventPayload::ToolExecutionFinished { call_id: recorded, .. }
+                    if *recorded == call_id
+            ))
+            .count(),
+        1
+    );
+    assert!(
+        server
+            .runtime
+            .resumable_approval_call(created.session.session_id, call_id, "shell")
+            .expect("resumable approval lookup")
+            .is_some()
+    );
+    assert_eq!(
+        mock_provider
+            .requests
+            .as_ref()
+            .expect("captured requests")
+            .lock()
+            .expect("requests lock")
+            .len(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -6410,7 +7002,17 @@ async fn failed_approved_tool_resume_records_one_terminal_transition() {
         .runtime
         .all_events(session.session_id)
         .expect("canonical events");
-    let terminal_start = events
+    let terminal_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::ToolExecutionFinished { call_id: recorded, result, .. }
+                    if *recorded == call_id && result.is_error
+            )
+        })
+        .expect("terminal tool event");
+    let result_message_index = events
         .iter()
         .position(|event| {
             matches!(
@@ -6423,27 +7025,53 @@ async fn failed_approved_tool_resume_records_one_terminal_transition() {
             )
         })
         .expect("error tool result message");
-    let terminal_events = &events[terminal_start..terminal_start + 4];
-    assert!(matches!(
-        &terminal_events[1].payload,
-        EventPayload::ToolExecutionFinished { call_id: recorded, result, .. }
-            if *recorded == call_id && result.is_error
-    ));
-    assert!(matches!(
-        &terminal_events[2].payload,
-        EventPayload::SessionError {
-            class: ErrorClass::Tool,
-            ..
-        }
-    ));
-    assert!(matches!(
-        &terminal_events[3].payload,
-        EventPayload::TurnFinished { status, .. } if status == "failed"
-    ));
+    let session_error_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::SessionError {
+                    class: ErrorClass::Tool,
+                    ..
+                }
+            )
+        })
+        .expect("session error");
+    let turn_finished_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::TurnFinished { status, .. } if status == "failed"
+            )
+        })
+        .expect("failed turn finish");
+    assert!(terminal_index < result_message_index);
+    assert!(result_message_index < session_error_index);
+    assert!(session_error_index < turn_finished_index);
+    let transition_turn_id = events[terminal_index].turn_id;
     assert!(
-        terminal_events
+        [
+            terminal_index,
+            result_message_index,
+            session_error_index,
+            turn_finished_index,
+        ]
+        .into_iter()
+        .all(|index| events[index].turn_id == transition_turn_id)
+    );
+    assert_eq!(
+        events
             .iter()
-            .all(|event| event.turn_id == terminal_events[0].turn_id)
+            .filter(|event| {
+                matches!(
+                    &event.payload,
+                    EventPayload::ToolExecutionFinished { call_id: recorded, .. }
+                        if *recorded == call_id
+                )
+            })
+            .count(),
+        1
     );
 
     let queue = server
@@ -6466,6 +7094,188 @@ async fn failed_approved_tool_resume_records_one_terminal_transition() {
             .and_then(|value| value.get("is_error")),
         Some(&Value::Bool(true))
     );
+}
+
+#[tokio::test]
+async fn approved_tool_resume_closes_turn_when_initial_terminal_append_fails() {
+    let server = spawn_server(BelltowerConfig::from_embedded().expect("config")).await;
+    let client = Client::new();
+    let project_root = tempfile::TempDir::new().expect("project root");
+    let marker = project_root.path().join("tool-started");
+    let command = format!("touch '{}' && sleep 1", marker.display());
+    let (session, branch) = server
+        .runtime
+        .create_session(
+            project_root.path().display().to_string().into(),
+            ConnectionId::new("local"),
+            None,
+            SessionToolMode::Extended,
+            Some("terminal-persistence-recovery".to_owned()),
+            None,
+        )
+        .expect("create session");
+    let paused_turn_id = TurnId::new();
+    let call_id = ToolCallId::new("call-shell-persistence");
+    let arguments = serde_json::json!({
+        "command": command,
+        "timeout_seconds": 5,
+    });
+    let tool_call = ToolCall {
+        tool_name: "shell".to_owned(),
+        call_id: call_id.to_string(),
+        arguments: arguments.clone(),
+    };
+    let approval_request = bt_core::ApprovalRequest {
+        session_id: session.session_id,
+        call_id: call_id.clone(),
+        tool_name: "shell".to_owned(),
+        arguments: arguments.clone(),
+        requirement: bt_core::ApprovalRequirement::Always,
+        tool_metadata: bt_core::ToolMetadata {
+            risk_class: bt_core::ToolRiskClass::High,
+            is_read_only: false,
+            is_concurrency_safe: false,
+            interrupt_behavior: bt_core::ToolInterruptBehavior::TerminateProcess,
+            execution_mode: bt_core::ToolExecutionMode::Immediate,
+            should_defer: false,
+            catalogue_tags: vec!["execution".to_owned()],
+            display_group: bt_core::ToolDisplayGroup::Execution,
+        },
+        requested_at: time::OffsetDateTime::now_utc(),
+    };
+
+    server
+        .runtime
+        .append_message(&session, &branch, Role::User, "run the shell command")
+        .expect("append user message");
+    server
+        .runtime
+        .record_turn_started(
+            session.session_id,
+            branch.branch_id,
+            paused_turn_id,
+            "openai-compatible".to_owned(),
+            "test-model".to_owned(),
+            1,
+            session.settings_revision_id,
+            TurnStartSource::UserMessage,
+            None,
+        )
+        .expect("record paused turn");
+    server
+        .runtime
+        .append_raw_message(
+            &session,
+            &branch,
+            Message::from_part(Role::Assistant, MessagePart::ToolCall { call: tool_call }),
+            Some(paused_turn_id),
+        )
+        .expect("append tool call message");
+    server
+        .runtime
+        .record_tool_call_requested(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            arguments,
+            Some(paused_turn_id),
+        )
+        .expect("record tool request");
+    server
+        .runtime
+        .record_approval_requested_for_request(
+            session.session_id,
+            branch.branch_id,
+            &approval_request,
+            Some(paused_turn_id),
+        )
+        .expect("record approval request");
+
+    let approve_client = client.clone();
+    let approve_url = server.url(&format!("sessions/{}/approve", session.session_id));
+    let token = server.token.clone();
+    let approve_call_id = call_id.clone();
+    let approve_task = tokio::spawn(async move {
+        approve_client
+            .post(approve_url)
+            .bearer_auth(token)
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
+            .json(&ApproveToolRequest {
+                call_id: approve_call_id,
+                tool_name: "shell".to_owned(),
+                scope: ApprovalScope::Once,
+                decision: ApprovalDecision::Approved {
+                    decided_at: time::OffsetDateTime::now_utc(),
+                    decided_by: "test".to_owned(),
+                    scope: ApprovalScope::Once,
+                    source: ApprovalDecisionSource::Human,
+                },
+            })
+            .send()
+            .await
+            .expect("approve tool")
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !marker.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("tool execution should start");
+    server
+        .runtime
+        .inject_next_store_append_error_for_test("terminal append failure");
+
+    let response = approve_task.await.expect("approve task");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let events = server
+        .runtime
+        .all_events(session.session_id)
+        .expect("canonical events");
+    let resumed_turn_id = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            EventPayload::TurnStarted {
+                source: TurnStartSource::ApprovalResume,
+                resumed_from_call_id: Some(resumed_call_id),
+                ..
+            } if *resumed_call_id == call_id => event.turn_id,
+            _ => None,
+        })
+        .expect("resumed turn");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.turn_id == Some(resumed_turn_id)
+                    && matches!(
+                        &event.payload,
+                        EventPayload::ToolExecutionFinished { call_id: recorded, .. }
+                            if *recorded == call_id
+                    )
+            })
+            .count(),
+        1
+    );
+    assert!(events.iter().any(|event| {
+        event.turn_id == Some(resumed_turn_id)
+            && matches!(
+                &event.payload,
+                EventPayload::SessionError {
+                    class: ErrorClass::Storage,
+                    ..
+                }
+            )
+    }));
+    assert!(events.iter().any(|event| {
+        event.turn_id == Some(resumed_turn_id)
+            && matches!(
+                &event.payload,
+                EventPayload::TurnFinished { status, .. } if status == "failed"
+            )
+    }));
 }
 
 #[tokio::test]
@@ -6611,8 +7421,8 @@ async fn answer_round_trip_starts_resumed_turn_before_result_events() {
         })
         .and_then(|event| event.seq_id)
         .expect("tool execution seq");
-    assert!(resumed_start_seq < tool_message_seq);
-    assert!(tool_message_seq < tool_execution_seq);
+    assert!(resumed_start_seq < tool_execution_seq);
+    assert!(tool_execution_seq < tool_message_seq);
     assert_eq!(
         events
             .events
@@ -7672,6 +8482,59 @@ async fn spawn_mock_approval_provider() -> MockProvider {
     }
 }
 
+async fn spawn_mock_repeated_approval_provider() -> MockProvider {
+    async fn models() -> &'static str {
+        "{\"data\":[]}"
+    }
+
+    async fn completions(
+        axum::extract::State(state): axum::extract::State<MockApprovalProviderState>,
+        Json(payload): Json<Value>,
+    ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+        state.requests.lock().expect("requests lock").push(payload);
+        let request_index = state.counter.fetch_add(1, Ordering::SeqCst);
+        let events = if request_index < 2 {
+            vec![
+                Event::default().data(
+                    "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-approval-repeat\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"printf approved\\\",\\\"call_id\\\":\\\"model-call-id\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}",
+                ),
+                Event::default().data("[DONE]"),
+            ]
+        } else {
+            vec![
+                Event::default().data(
+                    "{\"choices\":[{\"delta\":{\"content\":\"complete\"},\"finish_reason\":null}]}",
+                ),
+                Event::default().data("[DONE]"),
+            ]
+        };
+
+        Sse::new(futures_util::stream::iter(
+            events.into_iter().map(Ok::<_, Infallible>),
+        ))
+    }
+
+    let state = MockApprovalProviderState {
+        counter: Arc::new(AtomicUsize::new(0)),
+        requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let app = Router::new()
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(completions))
+        .with_state(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = listener.local_addr().expect("mock addr");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("mock should run");
+    });
+
+    MockProvider {
+        base_url: format!("http://{addr}/v1/"),
+        handle,
+        requests: Some(state.requests),
+    }
+}
+
 async fn spawn_mock_dual_approval_provider() -> MockProvider {
     async fn models() -> &'static str {
         "{\"data\":[]}"
@@ -7729,6 +8592,62 @@ async fn spawn_mock_dual_approval_provider() -> MockProvider {
 struct MockApprovalProviderState {
     counter: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<Value>>>,
+}
+
+async fn spawn_mock_safe_tool_provider() -> MockProvider {
+    async fn models() -> &'static str {
+        "{\"data\":[]}"
+    }
+
+    async fn completions(
+        axum::extract::State(state): axum::extract::State<MockInspectionProviderState>,
+        Json(payload): Json<Value>,
+    ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+        state.requests.lock().expect("requests lock").push(payload);
+        let request_index = state.counter.fetch_add(1, Ordering::SeqCst);
+        let events = if request_index == 0 {
+            vec![
+                Event::default().data(
+                    "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-list-same-turn\",\"function\":{\"name\":\"list\",\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}",
+                ),
+                Event::default().data("[DONE]"),
+            ]
+        } else {
+            vec![
+                Event::default().data(
+                    "{\"choices\":[{\"delta\":{\"content\":\"listed\"},\"finish_reason\":null}]}",
+                ),
+                Event::default().data(
+                    "{\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":2,\"total_tokens\":14}}",
+                ),
+                Event::default().data("[DONE]"),
+            ]
+        };
+
+        Sse::new(futures_util::stream::iter(
+            events.into_iter().map(Ok::<_, Infallible>),
+        ))
+    }
+
+    let state = MockInspectionProviderState {
+        counter: Arc::new(AtomicUsize::new(0)),
+        requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let app = Router::new()
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(completions))
+        .with_state(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = listener.local_addr().expect("mock addr");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("mock should run");
+    });
+
+    MockProvider {
+        base_url: format!("http://{addr}/v1/"),
+        handle,
+        requests: Some(state.requests),
+    }
 }
 
 async fn spawn_mock_inspection_contract_provider() -> MockProvider {

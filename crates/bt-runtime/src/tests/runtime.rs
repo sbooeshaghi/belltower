@@ -1,5 +1,7 @@
 use super::support::completion_cost_breakdown;
-use super::{BelltowerRuntime, BudgetEnforcementOutcome, PostTurnControlAction};
+use super::{
+    BelltowerRuntime, BudgetEnforcementOutcome, PostTurnControlAction, ResumableToolCallKind,
+};
 use crate::{TurnAdapterFuture, TurnExecutionAdapters, TurnRunRequest};
 use bt_core::{
     ApprovalDecision, ApprovalDecisionSource, ApprovalRequest, ApprovalRequirement, ApprovalScope,
@@ -8,7 +10,8 @@ use bt_core::{
     ContextCompactionTrigger, ContextManifest, ContextMessageSourceRef, EventPayload, FinishReason,
     Message, MessagePart, PlanItem, PlanStatus, Role, SessionRuntimeState, SessionToolMode,
     TokenUsage, ToolCallId, ToolDisplayGroup, ToolExecutionMode, ToolInterruptBehavior,
-    ToolMetadata, ToolResultEnvelope, ToolRiskClass, TurnId, TurnStartSource,
+    ToolMetadata, ToolOperationContext, ToolOperationInitiator, ToolResultEnvelope, ToolRiskClass,
+    TurnId, TurnStartSource,
 };
 use bt_tools::BuiltInToolRegistry;
 use serde_json::json;
@@ -293,6 +296,92 @@ fn reopened_runtime_reuses_session_scoped_approval() {
 }
 
 #[test]
+fn reopened_runtime_replays_latest_reusable_approval_from_canonical_events() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config.clone(), file.path()).expect("runtime");
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("local"),
+            None,
+            SessionToolMode::Extended,
+            Some("approval-event-replay".to_owned()),
+            None,
+        )
+        .expect("session creation");
+
+    let approved = approval_request(
+        session.session_id,
+        "call-reused",
+        "shell",
+        json!({"command":"pwd","call_id":"call-reused"}),
+    );
+    runtime
+        .record_approval_for_request(
+            session.session_id,
+            branch.branch_id,
+            &approved,
+            ApprovalDecision::Approved {
+                decided_at: OffsetDateTime::now_utc(),
+                decided_by: "user".to_owned(),
+                scope: ApprovalScope::Session,
+                source: ApprovalDecisionSource::Human,
+            },
+            None,
+        )
+        .expect("record approved scope");
+    runtime
+        .record_approval_for_request(
+            session.session_id,
+            branch.branch_id,
+            &approved,
+            ApprovalDecision::Denied {
+                decided_at: OffsetDateTime::now_utc(),
+                decided_by: "user".to_owned(),
+                reason: Some("later denial".to_owned()),
+                scope: ApprovalScope::Session,
+                source: ApprovalDecisionSource::Human,
+            },
+            None,
+        )
+        .expect("record later denied scope");
+
+    // Reusing a call ID resets its latest-request projection. Rehydration must still replay the
+    // canonical approval history rather than resurrecting an older projected decision.
+    runtime
+        .record_tool_call_requested(
+            session.session_id,
+            branch.branch_id,
+            approved.call_id.clone(),
+            approved.tool_name.clone(),
+            approved.arguments.clone(),
+            None,
+        )
+        .expect("reuse call id");
+    drop(runtime);
+
+    let reopened = BelltowerRuntime::open(config, file.path()).expect("reopen");
+    let next = approval_request(
+        session.session_id,
+        "call-next",
+        "shell",
+        json!({"command":"pwd","call_id":"call-next"}),
+    );
+    assert!(matches!(
+        reopened
+            .approval_evaluator()
+            .evaluate(&next)
+            .expect("evaluate replayed scope"),
+        Some(ApprovalDecision::Denied {
+            scope: ApprovalScope::Session,
+            reason: Some(ref reason),
+            ..
+        }) if reason == "later denial"
+    ));
+}
+
+#[test]
 fn reopened_runtime_reuses_global_approval_across_sessions() {
     let config = BelltowerConfig::from_embedded().expect("config");
     let file = NamedTempFile::new().expect("tempfile");
@@ -452,6 +541,177 @@ fn first_recorded_activity_emits_session_started_and_makes_session_visible() {
             .collect::<Vec<_>>(),
         vec![session.session_id]
     );
+}
+
+#[test]
+fn operator_tool_terminal_recovery_closes_requested_operation() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("operator-terminal-recovery".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    let call_id = ToolCallId::new("operator-shell-recovery");
+    runtime
+        .record_tool_operation_request_transition(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            json!({ "command": "printf ok" }),
+            ToolOperationContext {
+                initiator: ToolOperationInitiator::Human,
+                ..ToolOperationContext::default()
+            },
+            None,
+        )
+        .expect("operator request");
+    let result = ToolResultEnvelope {
+        call_id: call_id.clone(),
+        tool_name: "shell".to_owned(),
+        is_error: false,
+        output: json!({ "stdout": "ok" }),
+        duration_ms: Some(1),
+    };
+    runtime.inject_next_store_append_error_for_test("operator terminal write failed");
+    let persistence_error = runtime
+        .record_operator_tool_terminal_transition(
+            session.session_id,
+            branch.branch_id,
+            result.clone(),
+            "shell_command".to_owned(),
+            "!printf ok".to_owned(),
+            "ok".to_owned(),
+            true,
+        )
+        .expect_err("terminal persistence should fail once");
+    runtime
+        .recover_operator_tool_terminal_transition(
+            session.session_id,
+            branch.branch_id,
+            result,
+            "shell_command".to_owned(),
+            "!printf ok".to_owned(),
+            "ok".to_owned(),
+            true,
+            &persistence_error,
+        )
+        .expect("recovered terminal batch");
+
+    let events = runtime.all_events(session.session_id).expect("events");
+    let terminal_index = events
+        .iter()
+        .position(|event| matches!(event.payload, EventPayload::ToolExecutionFinished { .. }))
+        .expect("terminal event");
+    assert!(matches!(
+        events[terminal_index + 1].payload,
+        EventPayload::OperatorCommandRecorded { success: true, .. }
+    ));
+    assert!(matches!(
+        events[terminal_index + 2].payload,
+        EventPayload::SessionError { ref code, .. } if code == "storage_error"
+    ));
+    let inspection = runtime
+        .inspect_tool_call(session.session_id, call_id)
+        .expect("inspection")
+        .expect("tool call");
+    assert_eq!(inspection.execution_status.as_deref(), Some("completed"));
+}
+
+#[test]
+fn reopened_runtime_terminalizes_unbound_human_tool_without_retrying_it() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config.clone(), file.path()).expect("runtime");
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("local"),
+            None,
+            SessionToolMode::Extended,
+            Some("operator-restart-recovery".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    let call_id = ToolCallId::new("operator-shell-interrupted");
+    runtime
+        .record_tool_operation_request_transition(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            json!({ "command": "touch may-have-run" }),
+            ToolOperationContext {
+                initiator: ToolOperationInitiator::Human,
+                ..ToolOperationContext::default()
+            },
+            None,
+        )
+        .expect("operator request");
+    drop(runtime);
+
+    let reopened = BelltowerRuntime::open(config.clone(), file.path()).expect("reopen");
+    let events = reopened.all_events(session.session_id).expect("events");
+    let recovered = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::ToolExecutionFinished {
+                call_id: event_call_id,
+                result,
+                ..
+            } if *event_call_id == call_id => Some(result),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(recovered.len(), 1);
+    assert!(recovered[0].is_error);
+    assert_eq!(
+        recovered[0].output["error"]["code"],
+        "tool_outcome_unknown_after_restart"
+    );
+    assert_eq!(recovered[0].output["error"]["retryable"], false);
+    assert!(events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::SessionError {
+            code,
+            retryable: false,
+            ..
+        } if code == "tool_outcome_unknown_after_restart"
+    )));
+    let inspection = reopened
+        .inspect_tool_call(session.session_id, call_id.clone())
+        .expect("tool inspection")
+        .expect("recovered tool");
+    assert_eq!(inspection.execution_status.as_deref(), Some("completed"));
+    assert_eq!(
+        inspection.result.as_ref().expect("result")["output"]["error"]["code"],
+        "tool_outcome_unknown_after_restart"
+    );
+    drop(reopened);
+
+    let reopened_again = BelltowerRuntime::open(config, file.path()).expect("second reopen");
+    let terminal_count = reopened_again
+        .all_events(session.session_id)
+        .expect("events")
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::ToolExecutionFinished {
+                    call_id: event_call_id,
+                    ..
+                } if *event_call_id == call_id
+            )
+        })
+        .count();
+    assert_eq!(terminal_count, 1, "recovery must be idempotent");
 }
 
 #[test]
@@ -1421,7 +1681,7 @@ fn reopened_runtime_preserves_pending_control_state() {
         .expect("cancel session");
     drop(runtime);
 
-    let reopened = BelltowerRuntime::open(config, file.path()).expect("reopened runtime");
+    let reopened = BelltowerRuntime::open(config.clone(), file.path()).expect("reopened runtime");
     let inspection = reopened
         .inspect_queue(session.session_id)
         .expect("queue inspection")
@@ -1686,7 +1946,7 @@ fn reopened_runtime_closes_interrupted_resumed_approval_turns() {
         .expect("bootstrap resumed approval");
     drop(runtime);
 
-    let reopened = BelltowerRuntime::open(config, file.path()).expect("reopened runtime");
+    let reopened = BelltowerRuntime::open(config.clone(), file.path()).expect("reopened runtime");
     let queue = reopened
         .inspect_queue(session.session_id)
         .expect("queue inspection")
@@ -1709,6 +1969,39 @@ fn reopened_runtime_closes_interrupted_resumed_approval_turns() {
         Some("interrupted_after_resume")
     );
     assert!(resumed.finished_at.is_some());
+
+    let events = reopened.all_events(session.session_id).expect("events");
+    let recovered_results = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::ToolExecutionFinished {
+                call_id, result, ..
+            } if *call_id == ToolCallId::new("call-shell") => Some(result),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(recovered_results.len(), 1);
+    assert!(recovered_results[0].is_error);
+    assert_eq!(
+        recovered_results[0].output["error"]["code"],
+        "tool_outcome_unknown_after_restart"
+    );
+    drop(reopened);
+
+    let reopened_again = BelltowerRuntime::open(config, file.path()).expect("second reopen");
+    let terminal_count = reopened_again
+        .all_events(session.session_id)
+        .expect("events")
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::ToolExecutionFinished { call_id, .. }
+                    if *call_id == ToolCallId::new("call-shell")
+            )
+        })
+        .count();
+    assert_eq!(terminal_count, 1);
 }
 
 #[test]
@@ -1769,7 +2062,7 @@ fn reopened_runtime_closes_interrupted_resumed_input_turns() {
         .expect("bootstrap resumed input");
     drop(runtime);
 
-    let reopened = BelltowerRuntime::open(config, file.path()).expect("reopened runtime");
+    let reopened = BelltowerRuntime::open(config.clone(), file.path()).expect("reopened runtime");
     let queue = reopened
         .inspect_queue(session.session_id)
         .expect("queue inspection")
@@ -1792,6 +2085,22 @@ fn reopened_runtime_closes_interrupted_resumed_input_turns() {
         Some("interrupted_after_resume")
     );
     assert!(resumed.finished_at.is_some());
+    drop(reopened);
+
+    let reopened_again = BelltowerRuntime::open(config, file.path()).expect("second reopen");
+    let terminal_count = reopened_again
+        .all_events(session.session_id)
+        .expect("events")
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::ToolExecutionFinished { call_id, .. }
+                    if *call_id == ToolCallId::new("call-ask")
+            )
+        })
+        .count();
+    assert_eq!(terminal_count, 1);
 }
 
 #[test]
@@ -1824,6 +2133,16 @@ fn reopened_runtime_closes_interrupted_user_message_turns() {
             None,
         )
         .expect("turn started");
+    runtime
+        .record_tool_call_requested(
+            session.session_id,
+            branch.branch_id,
+            ToolCallId::new("call-list"),
+            "list".to_owned(),
+            json!({ "path": "." }),
+            Some(turn_id),
+        )
+        .expect("tool call requested");
     drop(runtime);
 
     let reopened = BelltowerRuntime::open(config, file.path()).expect("reopened runtime");
@@ -1842,6 +2161,501 @@ fn reopened_runtime_closes_interrupted_user_message_turns() {
         Some("interrupted_after_restart")
     );
     assert!(recovered.finished_at.is_some());
+    let result = reopened
+        .all_events(session.session_id)
+        .expect("events")
+        .into_iter()
+        .find_map(|event| match event.payload {
+            EventPayload::ToolExecutionFinished {
+                call_id, result, ..
+            } if call_id == ToolCallId::new("call-list") => Some(result),
+            _ => None,
+        })
+        .expect("recovered tool result");
+    assert_eq!(
+        result.output["error"]["code"],
+        "tool_outcome_unknown_after_restart"
+    );
+}
+
+#[test]
+fn reopened_runtime_recovers_denied_tool_with_deterministic_result() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config.clone(), file.path()).expect("runtime");
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("denied-tool-recovery".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    let turn_id = TurnId::new();
+    let call_id = ToolCallId::new("call-denied");
+    runtime
+        .record_turn_started(
+            session.session_id,
+            branch.branch_id,
+            turn_id,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            1,
+            session.settings_revision_id,
+            TurnStartSource::UserMessage,
+            None,
+        )
+        .expect("turn started");
+    runtime
+        .record_tool_call_requested(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            json!({ "command": "false" }),
+            Some(turn_id),
+        )
+        .expect("tool request");
+    runtime
+        .record_approval_requested(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            Some(turn_id),
+        )
+        .expect("approval request");
+    runtime
+        .record_approval(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            ApprovalDecision::Denied {
+                decided_at: OffsetDateTime::now_utc(),
+                decided_by: "test".to_owned(),
+                reason: Some("not permitted".to_owned()),
+                scope: ApprovalScope::Once,
+                source: ApprovalDecisionSource::Human,
+            },
+            Some(turn_id),
+        )
+        .expect("approval denied");
+    drop(runtime);
+
+    let reopened = BelltowerRuntime::open(config, file.path()).expect("reopened runtime");
+    let result = reopened
+        .all_events(session.session_id)
+        .expect("events")
+        .into_iter()
+        .find_map(|event| match event.payload {
+            EventPayload::ToolExecutionFinished {
+                call_id: event_call_id,
+                result,
+                ..
+            } if event_call_id == call_id => Some(result),
+            _ => None,
+        })
+        .expect("recovered denied result");
+    assert!(result.is_error);
+    assert_eq!(
+        result.output["error"],
+        "invalid state: tool `shell` was denied"
+    );
+    assert!(result.output["error"]["code"].is_null());
+}
+
+#[test]
+fn reused_call_id_inspection_and_resume_target_latest_pending_request() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("latest-request-inspection".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    let call_id = ToolCallId::new("call-reused");
+
+    let first_turn = TurnId::new();
+    runtime
+        .record_turn_started(
+            session.session_id,
+            branch.branch_id,
+            first_turn,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            1,
+            session.settings_revision_id,
+            TurnStartSource::UserMessage,
+            None,
+        )
+        .expect("first turn started");
+    runtime
+        .record_tool_call_requested(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            json!({"command":"pwd"}),
+            Some(first_turn),
+        )
+        .expect("first request");
+    runtime
+        .record_approval_requested(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            Some(first_turn),
+        )
+        .expect("first approval request");
+    runtime
+        .record_approval(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            ApprovalDecision::Approved {
+                decided_at: OffsetDateTime::now_utc(),
+                decided_by: "test".to_owned(),
+                scope: ApprovalScope::Once,
+                source: ApprovalDecisionSource::Human,
+            },
+            Some(first_turn),
+        )
+        .expect("first approval resolution");
+    let first_result = ToolResultEnvelope {
+        call_id: call_id.clone(),
+        tool_name: "shell".to_owned(),
+        is_error: false,
+        output: json!({"stdout":"first"}),
+        duration_ms: Some(1),
+    };
+    runtime
+        .record_tool_terminal_transition(
+            session.session_id,
+            branch.branch_id,
+            first_turn,
+            first_result.clone(),
+            Message::from_part(
+                Role::Tool,
+                MessagePart::ToolResult {
+                    result: first_result,
+                },
+            ),
+        )
+        .expect("first terminal");
+
+    let second_turn = TurnId::new();
+    runtime
+        .record_turn_started(
+            session.session_id,
+            branch.branch_id,
+            second_turn,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            2,
+            session.settings_revision_id,
+            TurnStartSource::UserMessage,
+            None,
+        )
+        .expect("second turn started");
+    runtime
+        .record_tool_call_requested(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            json!({"command":"ls"}),
+            Some(second_turn),
+        )
+        .expect("second request");
+    let pre_approval = runtime
+        .inspect_tool_call(session.session_id, call_id.clone())
+        .expect("inspect new request")
+        .expect("new request inspection");
+    assert!(pre_approval.approval_status.is_none());
+    assert!(pre_approval.approval_request_snapshot.is_none());
+    assert!(pre_approval.approval_resolution.is_none());
+    runtime
+        .record_approval_requested(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            Some(second_turn),
+        )
+        .expect("second approval request");
+
+    let inspection = runtime
+        .inspect_tool_call(session.session_id, call_id.clone())
+        .expect("inspect call")
+        .expect("call inspection");
+    assert_eq!(inspection.turn_id, Some(second_turn));
+    assert_eq!(inspection.execution_status.as_deref(), Some("requested"));
+    assert_eq!(inspection.approval_status.as_deref(), Some("pending"));
+    assert_eq!(inspection.arguments, Some(json!({"command":"ls"})));
+    assert!(inspection.completed_seq_id.is_none());
+    assert!(inspection.completed_at.is_none());
+    assert!(inspection.result.is_none());
+    assert!(
+        runtime
+            .resumable_tool_call(
+                session.session_id,
+                call_id,
+                "shell",
+                ResumableToolCallKind::Approval,
+            )
+            .expect("resumable call")
+            .is_some()
+    );
+}
+
+#[test]
+fn same_turn_reused_call_id_resets_turn_and_trace_summaries() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("local"),
+            None,
+            SessionToolMode::Extended,
+            Some("same-turn-call-reuse".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    let turn_id = TurnId::new();
+    let call_id = ToolCallId::new("call-reused-in-turn");
+    runtime
+        .record_turn_started(
+            session.session_id,
+            branch.branch_id,
+            turn_id,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            1,
+            session.settings_revision_id,
+            TurnStartSource::UserMessage,
+            None,
+        )
+        .expect("turn started");
+    runtime
+        .record_tool_call_requested(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            json!({"command":"pwd"}),
+            Some(turn_id),
+        )
+        .expect("first request");
+    runtime
+        .record_approval_requested(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            Some(turn_id),
+        )
+        .expect("first approval request");
+    runtime
+        .record_approval(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            ApprovalDecision::Approved {
+                decided_at: OffsetDateTime::now_utc(),
+                decided_by: "test".to_owned(),
+                scope: ApprovalScope::Once,
+                source: ApprovalDecisionSource::Human,
+            },
+            Some(turn_id),
+        )
+        .expect("first approval");
+    runtime
+        .record_tool_execution(
+            session.session_id,
+            branch.branch_id,
+            ToolResultEnvelope {
+                call_id: call_id.clone(),
+                tool_name: "shell".to_owned(),
+                is_error: false,
+                output: json!({"stdout":"old"}),
+                duration_ms: Some(1),
+            },
+            Some(turn_id),
+        )
+        .expect("first result");
+
+    runtime
+        .record_tool_call_requested(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "read".to_owned(),
+            json!({"path":"README.md"}),
+            Some(turn_id),
+        )
+        .expect("second request");
+
+    let turn = runtime
+        .turn_history(session.session_id)
+        .expect("turn history")
+        .into_iter()
+        .find(|turn| turn.turn_id == turn_id)
+        .expect("turn summary");
+    assert_eq!(turn.tool_calls.len(), 1);
+    assert_eq!(turn.tool_calls[0].call_id, call_id);
+    assert_eq!(turn.tool_calls[0].tool_name, "read");
+    assert!(turn.tool_calls[0].approval_status.is_none());
+    assert!(turn.tool_calls[0].execution_status.is_none());
+
+    let trace_turn = runtime
+        .session_execution(session.session_id)
+        .expect("session execution")
+        .expect("execution exists")
+        .turns
+        .into_iter()
+        .find(|turn| turn.turn_id == turn_id)
+        .expect("trace turn");
+    assert_eq!(trace_turn.tool_calls.len(), 1);
+    assert_eq!(trace_turn.tool_calls[0].tool_name, "read");
+    assert!(trace_turn.tool_calls[0].approval_status.is_none());
+    assert!(trace_turn.tool_calls[0].execution_status.is_none());
+}
+
+#[test]
+fn reopened_runtime_scopes_recovery_to_reused_call_request() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config.clone(), file.path()).expect("runtime");
+
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("reused-call-id-recovery".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    let completed_turn = TurnId::new();
+    runtime
+        .record_turn_started(
+            session.session_id,
+            branch.branch_id,
+            completed_turn,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            1,
+            session.settings_revision_id,
+            TurnStartSource::UserMessage,
+            None,
+        )
+        .expect("completed turn started");
+    runtime
+        .record_tool_call_requested(
+            session.session_id,
+            branch.branch_id,
+            ToolCallId::new("call-reused"),
+            "list".to_owned(),
+            json!({ "path": "." }),
+            Some(completed_turn),
+        )
+        .expect("historical tool request");
+    let historical_result = ToolResultEnvelope {
+        call_id: ToolCallId::new("call-reused"),
+        tool_name: "list".to_owned(),
+        is_error: false,
+        output: json!({ "entries": [] }),
+        duration_ms: Some(1),
+    };
+    runtime
+        .record_tool_terminal_transition(
+            session.session_id,
+            branch.branch_id,
+            completed_turn,
+            historical_result.clone(),
+            Message::from_part(
+                Role::Tool,
+                MessagePart::ToolResult {
+                    result: historical_result,
+                },
+            ),
+        )
+        .expect("historical terminal transition");
+    runtime
+        .record_turn_finished(
+            session.session_id,
+            branch.branch_id,
+            completed_turn,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            "completed".to_owned(),
+            Some("stop".to_owned()),
+            1,
+        )
+        .expect("historical turn finished");
+
+    let interrupted_turn = TurnId::new();
+    runtime
+        .record_turn_started(
+            session.session_id,
+            branch.branch_id,
+            interrupted_turn,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            2,
+            session.settings_revision_id,
+            TurnStartSource::UserMessage,
+            None,
+        )
+        .expect("interrupted turn started");
+    runtime
+        .record_tool_call_requested(
+            session.session_id,
+            branch.branch_id,
+            ToolCallId::new("call-reused"),
+            "list".to_owned(),
+            json!({ "path": "src" }),
+            Some(interrupted_turn),
+        )
+        .expect("reused tool request");
+    drop(runtime);
+
+    let reopened = BelltowerRuntime::open(config, file.path()).expect("reopened runtime");
+    let terminals = reopened
+        .all_events(session.session_id)
+        .expect("events")
+        .into_iter()
+        .filter_map(|event| match event.payload {
+            EventPayload::ToolExecutionFinished {
+                call_id, result, ..
+            } if call_id == ToolCallId::new("call-reused") => Some((event.turn_id, result)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 2);
+    let recovered = terminals
+        .iter()
+        .find(|(turn_id, _)| *turn_id == Some(interrupted_turn))
+        .expect("recovered terminal for interrupted request");
+    assert_eq!(
+        recovered.1.output["error"]["code"],
+        "tool_outcome_unknown_after_restart"
+    );
 }
 
 #[test]

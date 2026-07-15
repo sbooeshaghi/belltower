@@ -6,7 +6,7 @@
 
 use super::{
     ApiError, ApiJson, AppState, execute_tool_call, format_shell_command_output,
-    require_default_branch, require_session,
+    require_default_branch, require_session, tool_execution_error_result,
 };
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -82,30 +82,67 @@ pub(super) async fn run_shell_command(
         arguments: arguments.clone(),
     };
     let shell_spec = ShellTool.spec();
-    state.runtime.record_tool_call_requested_with_context(
+    state.runtime.record_tool_operation_request_transition(
         session.session_id,
         branch.branch_id,
-        call_id,
+        call_id.clone(),
         "shell".to_owned(),
         arguments.clone(),
         ToolOperationContext::from_tool_spec(ToolOperationInitiator::Human, &shell_spec),
         None,
     )?;
-    let tool_result =
-        execute_tool_call(&state, &session, branch.branch_id, None, &tool_call).await?;
-    state.runtime.record_tool_execution(
-        session.session_id,
-        branch.branch_id,
-        tool_result.clone(),
-        None,
-    )?;
-    state.runtime.record_operator_command(
-        session.session_id,
-        branch.branch_id,
-        "shell_command".to_owned(),
-        request.raw_input,
-        format_shell_command_output(&tool_result),
-        !tool_result.is_error,
-    )?;
-    Ok(StatusCode::ACCEPTED)
+    match execute_tool_call(&state, &session, branch.branch_id, None, &tool_call).await {
+        Ok(tool_result) => {
+            let output = format_shell_command_output(&tool_result);
+            let success = !tool_result.is_error;
+            if let Err(persistence_error) = state.runtime.record_operator_tool_terminal_transition(
+                session.session_id,
+                branch.branch_id,
+                tool_result.clone(),
+                "shell_command".to_owned(),
+                request.raw_input.clone(),
+                output.clone(),
+                success,
+            ) {
+                state.runtime.recover_operator_tool_terminal_transition(
+                    session.session_id,
+                    branch.branch_id,
+                    tool_result,
+                    "shell_command".to_owned(),
+                    request.raw_input,
+                    output,
+                    success,
+                    &persistence_error,
+                )?;
+                return Err(ApiError(persistence_error));
+            }
+            Ok(StatusCode::ACCEPTED)
+        }
+        Err(error) => {
+            let tool_result = tool_execution_error_result(&tool_call, &error.0);
+            let output = format_shell_command_output(&tool_result);
+            if let Err(persistence_error) = state.runtime.record_operator_tool_terminal_transition(
+                session.session_id,
+                branch.branch_id,
+                tool_result.clone(),
+                "shell_command".to_owned(),
+                request.raw_input.clone(),
+                output.clone(),
+                false,
+            ) {
+                state.runtime.recover_operator_tool_terminal_transition(
+                    session.session_id,
+                    branch.branch_id,
+                    tool_result,
+                    "shell_command".to_owned(),
+                    request.raw_input,
+                    output,
+                    false,
+                    &persistence_error,
+                )?;
+                return Err(ApiError(persistence_error));
+            }
+            Err(error)
+        }
+    }
 }

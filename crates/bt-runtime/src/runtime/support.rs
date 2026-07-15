@@ -324,6 +324,18 @@ pub(super) fn ensure_turn_tool_call(
         .expect("tool call exists immediately after push")
 }
 
+pub(super) fn reset_turn_tool_call(
+    turn: &mut TurnInspection,
+    call_id: ToolCallId,
+    tool_name: String,
+) -> &mut TurnToolCallSummary {
+    let tool = ensure_turn_tool_call(turn, call_id, tool_name.clone());
+    tool.tool_name = tool_name;
+    tool.approval_status = None;
+    tool.execution_status = None;
+    tool
+}
+
 pub(super) fn increment_trace_event_counts(counts: &mut TraceEventCounts, kind: SpanKind) {
     match kind {
         SpanKind::Session => counts.session += 1,
@@ -434,7 +446,7 @@ pub(super) fn build_trace_turns(
             EventPayload::ToolCallRequested {
                 call_id, tool_name, ..
             } => {
-                ensure_trace_tool_call(turn, call_id.clone(), tool_name.clone());
+                reset_trace_tool_call(turn, call_id.clone(), tool_name.clone());
             }
             EventPayload::ToolApprovalRequested {
                 call_id, tool_name, ..
@@ -648,6 +660,18 @@ pub(super) fn ensure_trace_tool_call(
     turn.tool_calls
         .last_mut()
         .expect("trace tool call exists immediately after push")
+}
+
+pub(super) fn reset_trace_tool_call(
+    turn: &mut TraceTurnInspection,
+    call_id: ToolCallId,
+    tool_name: String,
+) -> &mut TurnToolCallSummary {
+    let tool = ensure_trace_tool_call(turn, call_id, tool_name.clone());
+    tool.tool_name = tool_name;
+    tool.approval_status = None;
+    tool.execution_status = None;
+    tool
 }
 
 pub(super) fn branch_depth(

@@ -12,9 +12,15 @@ pub struct ApprovalState {
 
 #[derive(Default)]
 struct ApprovalStore {
-    per_call: HashMap<ToolCallId, ApprovalDecision>,
+    per_call: HashMap<(SessionId, ToolCallId), CallApproval>,
     per_session: HashMap<(SessionId, String), ApprovalDecision>,
     global: HashMap<String, ApprovalDecision>,
+}
+
+#[derive(Clone)]
+struct CallApproval {
+    request_fingerprint: Option<String>,
+    decision: ApprovalDecision,
 }
 
 impl ApprovalState {
@@ -43,8 +49,19 @@ impl ApprovalState {
         }
     }
 
-    pub fn record_call(&self, call_id: ToolCallId, decision: ApprovalDecision) -> Result<()> {
-        self.lock_store()?.per_call.insert(call_id, decision);
+    pub fn record_call(
+        &self,
+        session_id: SessionId,
+        call_id: ToolCallId,
+        decision: ApprovalDecision,
+    ) -> Result<()> {
+        self.lock_store()?.per_call.insert(
+            (session_id, call_id),
+            CallApproval {
+                request_fingerprint: None,
+                decision,
+            },
+        );
         Ok(())
     }
 
@@ -55,9 +72,13 @@ impl ApprovalState {
     ) -> Result<()> {
         let fingerprint = approval_request_fingerprint(request);
         let mut store = self.lock_store()?;
-        store
-            .per_call
-            .insert(request.call_id.clone(), decision.clone());
+        store.per_call.insert(
+            (request.session_id, request.call_id.clone()),
+            CallApproval {
+                request_fingerprint: Some(fingerprint.clone()),
+                decision: decision.clone(),
+            },
+        );
         Self::apply_reusable_decision(&mut store, request.session_id, fingerprint, decision);
         Ok(())
     }
@@ -73,33 +94,61 @@ impl ApprovalState {
         Ok(())
     }
 
-    pub fn get(&self, call_id: &ToolCallId) -> Result<Option<ApprovalDecision>> {
-        Ok(self.lock_store()?.per_call.get(call_id).cloned())
+    pub fn get(
+        &self,
+        session_id: SessionId,
+        call_id: &ToolCallId,
+    ) -> Result<Option<ApprovalDecision>> {
+        Ok(self
+            .lock_store()?
+            .per_call
+            .get(&(session_id, call_id.clone()))
+            .map(|approval| approval.decision.clone()))
     }
 
     pub fn evaluate_request(&self, request: &ApprovalRequest) -> Result<Option<ApprovalDecision>> {
-        if let Some(existing) = self.get(&request.call_id)? {
-            return Ok(Some(existing));
-        }
-
         let fingerprint = approval_request_fingerprint(request);
         let mut store = self.lock_store()?;
+
+        if let Some(existing) = store
+            .per_call
+            .get(&(request.session_id, request.call_id.clone()))
+            .filter(|approval| {
+                approval.request_fingerprint.as_deref() == Some(fingerprint.as_str())
+            })
+            .cloned()
+        {
+            if matches!(decision_scope(&existing.decision), ApprovalScope::Once) {
+                store
+                    .per_call
+                    .remove(&(request.session_id, request.call_id.clone()));
+            }
+            return Ok(Some(existing.decision));
+        }
 
         if let Some(decision) = store
             .per_session
             .get(&(request.session_id, fingerprint.clone()))
             .cloned()
         {
-            store
-                .per_call
-                .insert(request.call_id.clone(), decision.clone());
+            store.per_call.insert(
+                (request.session_id, request.call_id.clone()),
+                CallApproval {
+                    request_fingerprint: Some(fingerprint.clone()),
+                    decision: decision.clone(),
+                },
+            );
             return Ok(Some(decision));
         }
 
         if let Some(decision) = store.global.get(&fingerprint).cloned() {
-            store
-                .per_call
-                .insert(request.call_id.clone(), decision.clone());
+            store.per_call.insert(
+                (request.session_id, request.call_id.clone()),
+                CallApproval {
+                    request_fingerprint: Some(fingerprint),
+                    decision: decision.clone(),
+                },
+            );
             return Ok(Some(decision));
         }
 
@@ -218,7 +267,7 @@ impl Default for RuntimeApprovalEvaluator {
 
 impl ApprovalEvaluator for RuntimeApprovalEvaluator {
     fn evaluate(&self, request: &ApprovalRequest) -> Result<Option<ApprovalDecision>> {
-        self.state.get(&request.call_id)
+        self.state.evaluate_request(request)
     }
 }
 
@@ -417,12 +466,21 @@ mod tests {
     }
 
     #[test]
-    fn recorded_decision_wins_over_policy() {
+    fn recorded_request_decision_wins_over_policy() {
         let state = Arc::new(ApprovalState::default());
         let session_id = SessionId::new();
+        let approval_request = ApprovalRequest {
+            session_id,
+            call_id: ToolCallId::new("call-shell"),
+            tool_name: "shell".to_owned(),
+            arguments: json!({"command": "cargo test --workspace"}),
+            requirement: ApprovalRequirement::Always,
+            tool_metadata: metadata_for("shell"),
+            requested_at: time::OffsetDateTime::now_utc(),
+        };
         state
-            .record_call(
-                ToolCallId::new("call-shell"),
+            .record_for_request(
+                &approval_request,
                 ApprovalDecision::Denied {
                     decided_at: time::OffsetDateTime::now_utc(),
                     decided_by: "user".to_owned(),
@@ -434,15 +492,7 @@ mod tests {
             .expect("record decision");
         let evaluator = PolicyApprovalEvaluator::new(state, vec!["cargo test".to_owned()]);
         let decision = evaluator
-            .evaluate(&ApprovalRequest {
-                session_id,
-                call_id: ToolCallId::new("call-shell"),
-                tool_name: "shell".to_owned(),
-                arguments: json!({"command": "cargo test --workspace"}),
-                requirement: ApprovalRequirement::Always,
-                tool_metadata: metadata_for("shell"),
-                requested_at: time::OffsetDateTime::now_utc(),
-            })
+            .evaluate(&approval_request)
             .expect("evaluation should succeed");
         assert!(matches!(
             decision,
@@ -451,6 +501,98 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn once_decision_for_reused_call_id_does_not_cross_sessions() {
+        let state = ApprovalState::default();
+        let first_session = SessionId::new();
+        let second_session = SessionId::new();
+        let first = request(first_session, "shell", json!({"command":"pwd"}));
+        state
+            .record_for_request(
+                &first,
+                ApprovalDecision::Denied {
+                    decided_at: time::OffsetDateTime::now_utc(),
+                    decided_by: "user".to_owned(),
+                    reason: Some("not in this session".to_owned()),
+                    scope: ApprovalScope::Once,
+                    source: ApprovalDecisionSource::Human,
+                },
+            )
+            .expect("record decision");
+
+        let second = ApprovalRequest {
+            session_id: second_session,
+            call_id: first.call_id,
+            tool_name: first.tool_name,
+            arguments: first.arguments,
+            requirement: first.requirement,
+            tool_metadata: first.tool_metadata,
+            requested_at: time::OffsetDateTime::now_utc(),
+        };
+        assert!(state.evaluate(&second).expect("evaluate").is_none());
+    }
+
+    #[test]
+    fn once_decision_for_reused_call_id_does_not_cross_request_fingerprints() {
+        let state = ApprovalState::default();
+        let session_id = SessionId::new();
+        let first = request(session_id, "shell", json!({"command":"pwd"}));
+        state
+            .record_for_request(
+                &first,
+                ApprovalDecision::Approved {
+                    decided_at: time::OffsetDateTime::now_utc(),
+                    decided_by: "user".to_owned(),
+                    scope: ApprovalScope::Once,
+                    source: ApprovalDecisionSource::Human,
+                },
+            )
+            .expect("record decision");
+
+        let second = ApprovalRequest {
+            session_id,
+            call_id: first.call_id,
+            tool_name: first.tool_name,
+            arguments: json!({"command":"rm example.txt"}),
+            requirement: first.requirement,
+            tool_metadata: first.tool_metadata,
+            requested_at: time::OffsetDateTime::now_utc(),
+        };
+        assert!(state.evaluate(&second).expect("evaluate").is_none());
+    }
+
+    #[test]
+    fn once_decision_is_consumed_by_the_resumed_request() {
+        let state = ApprovalState::default();
+        let session_id = SessionId::new();
+        let request = request(session_id, "shell", json!({"command":"pwd"}));
+        state
+            .record_for_request(
+                &request,
+                ApprovalDecision::Approved {
+                    decided_at: time::OffsetDateTime::now_utc(),
+                    decided_by: "user".to_owned(),
+                    scope: ApprovalScope::Once,
+                    source: ApprovalDecisionSource::Human,
+                },
+            )
+            .expect("record decision");
+
+        assert!(matches!(
+            state.evaluate(&request).expect("first evaluation"),
+            Some(ApprovalDecision::Approved {
+                scope: ApprovalScope::Once,
+                ..
+            })
+        ));
+        assert!(
+            state
+                .evaluate(&request)
+                .expect("second evaluation")
+                .is_none()
+        );
     }
 
     #[test]

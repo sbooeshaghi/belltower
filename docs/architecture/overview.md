@@ -240,8 +240,23 @@ Remains pure:
 It must not absorb server, auth, or storage lifecycle logic.
 It should not depend on `bt-session`, `bt-runtime`, `bt-server`, or `bt-auth`, and that boundary is now enforced mechanically with a dependency-closure guard that keeps `bt-agent` limited to `bt-core` and `bt-tools` among workspace crates.
 
-The runtime-facing contract from `bt-agent` should stay typed and storage-free.
-The agent emits turn outcomes and messages/tool results/chunks for the runtime to persist; it does not write directly to the canonical store.
+The runtime-facing contract from `bt-agent` stays typed and storage-free. The
+agent emits turn outcomes and transcript data, while synchronous lifecycle
+observers let the runtime commit tool requests before execution and terminal
+tool results together with their model-visible messages before they enter model
+context. The same message value and identifier are used for both persistence and
+provider context, and context manifests retain that identity for later
+inspection. The observer is implemented by `bt-runtime`; `bt-agent` never
+writes to or depends on the canonical store.
+
+The runtime binds approval reuse and inspection to the current request instance,
+not merely a provider-supplied call identifier. A repeated identifier with
+different arguments has a different request fingerprint and cannot inherit a
+one-shot approval or stale terminal projection.
+Reusable approval scopes are rehydrated from canonical approval-resolution
+events rather than mutable projections. Runtime also refreshes context-manifest
+source references before every provider call, so same-turn continuations point
+to the exact committed tool messages they consume.
 
 ### `bt-context`
 

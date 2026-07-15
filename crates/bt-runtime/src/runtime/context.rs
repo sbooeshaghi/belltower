@@ -4,6 +4,40 @@ use super::*;
 use std::time::Instant;
 
 impl BelltowerRuntime {
+    pub(crate) fn context_message_sources_for_request(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        request: &bt_core::CompletionRequest,
+    ) -> Result<(Option<i64>, Vec<bt_core::ContextMessageSourceRef>)> {
+        let context_messages = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?
+            .load_context_messages(session_id, branch_id)?;
+        let context_boundary_seq_id = context_messages
+            .iter()
+            .filter_map(|record| record.source_seq_id)
+            .max();
+        let message_sources = context_messages
+            .iter()
+            .filter(|record| {
+                request
+                    .messages
+                    .iter()
+                    .any(|message| message.message_id == record.message.message_id)
+            })
+            .filter_map(|record| {
+                Some(bt_core::ContextMessageSourceRef {
+                    message_id: record.message.message_id,
+                    branch_id: record.source_branch_id?,
+                    seq_id: record.source_seq_id?,
+                })
+            })
+            .collect();
+        Ok((context_boundary_seq_id, message_sources))
+    }
+
     pub fn messages(
         &self,
         session_id: SessionId,

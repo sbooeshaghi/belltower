@@ -75,6 +75,27 @@ pub(super) async fn execute_tool_call(
     .await
 }
 
+pub(super) fn tool_execution_error_result(
+    tool_call: &ToolCall,
+    error: &bt_core::BelltowerError,
+) -> ToolResultEnvelope {
+    ToolResultEnvelope {
+        call_id: bt_core::ToolCallId::new(tool_call.call_id.clone()),
+        tool_name: tool_call.tool_name.clone(),
+        is_error: true,
+        output: serde_json::json!({
+            "command": tool_call.arguments.get("command"),
+            "error": {
+                "class": error.class(),
+                "code": error.code(),
+                "message": error.to_string(),
+                "retryable": error.retryable(),
+            }
+        }),
+        duration_ms: None,
+    }
+}
+
 fn validation_preflight_warning(
     state: &AppState,
     session: &SessionRecord,
@@ -358,6 +379,14 @@ pub(super) fn format_shell_command_output(result: &ToolResultEnvelope) -> String
         .unwrap_or(false)
     {
         lines.push("timed out".to_owned());
+    }
+    if let Some(error) = output.get("error") {
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("shell command failed");
+        lines.push("error:".to_owned());
+        lines.push(message.to_owned());
     }
     lines.join("\n")
 }

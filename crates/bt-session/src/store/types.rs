@@ -59,6 +59,16 @@ pub struct ReusableApprovalProjection {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ToolOperationRecoveryRecord {
+    pub session_id: SessionId,
+    pub branch_id: BranchId,
+    pub call_id: ToolCallId,
+    pub tool_name: String,
+    pub operation: bt_core::ToolOperationContext,
+    pub requested_seq_id: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct SessionControlProjection {
     pub session_id: SessionId,
     pub cancel_requested: bool,
@@ -170,6 +180,7 @@ pub struct TurnRecoveryRecord {
     pub provider: String,
     pub model: String,
     pub source: TurnStartSource,
+    pub resumed_from_call_id: Option<bt_core::ToolCallId>,
     pub started_seq_id: i64,
 }
 

@@ -238,7 +238,9 @@ impl BelltowerRuntime {
                     branch_id = Some(event.branch_id);
                     turn_id = event.turn_id;
                     requested_seq_id = event.seq_id;
+                    completed_seq_id = None;
                     requested_at = Some(event.occurred_at);
+                    completed_at = None;
                     event_tool_name = Some(tool_name.clone());
                 }
                 EventPayload::ToolApprovalRequested {
@@ -262,13 +264,17 @@ impl BelltowerRuntime {
                     tool_name,
                     ..
                 } if *event_call_id == call_id => {
-                    branch_id.get_or_insert(event.branch_id);
-                    if turn_id.is_none() {
-                        turn_id = event.turn_id;
+                    if requested_seq_id.is_none_or(|requested| {
+                        event.seq_id.is_some_and(|completed| completed > requested)
+                    }) {
+                        branch_id.get_or_insert(event.branch_id);
+                        if turn_id.is_none() {
+                            turn_id = event.turn_id;
+                        }
+                        completed_seq_id = event.seq_id;
+                        completed_at = Some(event.occurred_at);
+                        event_tool_name.get_or_insert_with(|| tool_name.clone());
                     }
-                    completed_seq_id = event.seq_id;
-                    completed_at = Some(event.occurred_at);
-                    event_tool_name.get_or_insert_with(|| tool_name.clone());
                 }
                 _ => {}
             }
@@ -523,7 +529,7 @@ impl BelltowerRuntime {
                 EventPayload::ToolCallRequested {
                     call_id, tool_name, ..
                 } => {
-                    ensure_turn_tool_call(turn, call_id.clone(), tool_name.clone());
+                    reset_turn_tool_call(turn, call_id.clone(), tool_name.clone());
                 }
                 EventPayload::ToolApprovalRequested {
                     call_id, tool_name, ..

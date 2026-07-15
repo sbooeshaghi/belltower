@@ -224,7 +224,7 @@ impl SqliteSessionStore {
                 tx.execute(
                     "INSERT INTO approval_projection (session_id, call_id, tool_name, status, request_fingerprint, request_snapshot_json, decision_json, resolution_json, updated_at)
                      VALUES (?1, ?2, ?3, 'pending', ?4, ?5, NULL, NULL, ?6)
-                     ON CONFLICT(session_id, call_id) DO UPDATE SET status = 'pending', tool_name = excluded.tool_name, request_fingerprint = excluded.request_fingerprint, request_snapshot_json = excluded.request_snapshot_json, updated_at = excluded.updated_at",
+                     ON CONFLICT(session_id, call_id) DO UPDATE SET status = 'pending', tool_name = excluded.tool_name, request_fingerprint = excluded.request_fingerprint, request_snapshot_json = excluded.request_snapshot_json, decision_json = NULL, resolution_json = NULL, updated_at = excluded.updated_at",
                     params![
                         event.session_id.to_string(),
                         call_id.to_string(),
@@ -271,9 +271,14 @@ impl SqliteSessionStore {
                 arguments,
             } => {
                 tx.execute(
+                    "DELETE FROM approval_projection WHERE session_id = ?1 AND call_id = ?2",
+                    params![event.session_id.to_string(), call_id.to_string()],
+                )
+                .map_err(storage_error)?;
+                tx.execute(
                     "INSERT INTO tool_run_projection (session_id, call_id, tool_name, status, arguments_json, result_json, updated_at)
                      VALUES (?1, ?2, ?3, 'requested', ?4, NULL, ?5)
-                     ON CONFLICT(session_id, call_id) DO UPDATE SET status = 'requested', arguments_json = excluded.arguments_json, updated_at = excluded.updated_at",
+                     ON CONFLICT(session_id, call_id) DO UPDATE SET tool_name = excluded.tool_name, status = 'requested', arguments_json = excluded.arguments_json, result_json = NULL, updated_at = excluded.updated_at",
                     params![
                         event.session_id.to_string(),
                         call_id.to_string(),

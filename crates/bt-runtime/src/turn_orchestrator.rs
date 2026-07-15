@@ -6,15 +6,18 @@
 use crate::{
     BelltowerRuntime, BudgetEnforcementOutcome, ContextCompactionReport, PostTurnControlAction,
 };
-use bt_agent::{TurnLoop, TurnRequest};
+use bt_agent::{
+    ToolLifecycleObserver, TurnApproval, TurnApprovalRequest, TurnLoop, TurnRequest,
+    TurnToolCallRequest,
+};
 use bt_context::{SystemPromptBuilder, SystemPromptInput};
 use bt_core::{
-    BelltowerError, BranchId, BranchRecord, CompletionChunk, ConnectionDescriptor, ErrorClass,
+    BelltowerError, BranchId, BranchRecord, CompletionChunk, ConnectionDescriptor,
     InstructionDocument, PlanInspection, Result, SessionId, SessionRecord, SpanKind, ToolCallId,
-    ToolSpec, TurnId, TurnInstructionProvenance, TurnStartSource, traits::Provider,
+    ToolResultEnvelope, ToolSpec, TurnId, TurnInstructionProvenance, TurnStartSource,
+    traits::Provider,
 };
 use bt_tools::BuiltInToolRegistry;
-use serde_json::json;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -81,13 +84,85 @@ pub struct TurnOrchestrator<'runtime> {
     runtime: &'runtime BelltowerRuntime,
 }
 
+struct RuntimeToolLifecycleObserver<'runtime> {
+    runtime: &'runtime BelltowerRuntime,
+    session_id: SessionId,
+    branch_id: BranchId,
+    turn_id: TurnId,
+    pending_terminal: Option<ToolResultEnvelope>,
+}
+
+impl ToolLifecycleObserver for RuntimeToolLifecycleObserver<'_> {
+    fn tool_call_requested(
+        &mut self,
+        request: &TurnToolCallRequest,
+        message: &bt_core::Message,
+    ) -> Result<()> {
+        self.runtime.record_tool_request_transition(
+            self.session_id,
+            self.branch_id,
+            self.turn_id,
+            request.call_id.clone(),
+            request.tool_name.clone(),
+            request.arguments.clone(),
+            bt_core::ToolOperationContext {
+                initiator: bt_core::ToolOperationInitiator::Agent,
+                risk_class: Some(request.metadata.risk_class),
+                is_read_only: Some(request.metadata.is_read_only),
+                execution_mode: Some(request.metadata.execution_mode),
+                artifact_refs: Vec::new(),
+            },
+            message.clone(),
+        )?;
+        Ok(())
+    }
+
+    fn tool_approval_requested(&mut self, request: &TurnApprovalRequest) -> Result<()> {
+        self.runtime.record_approval_requested_for_request(
+            self.session_id,
+            self.branch_id,
+            &request.request,
+            Some(self.turn_id),
+        )?;
+        Ok(())
+    }
+
+    fn tool_approval_resolved(&mut self, approval: &TurnApproval) -> Result<()> {
+        self.runtime.record_evaluated_approval_for_request(
+            self.session_id,
+            self.branch_id,
+            &approval.request,
+            approval.decision.clone(),
+            Some(self.turn_id),
+        )?;
+        Ok(())
+    }
+
+    fn tool_execution_finished(
+        &mut self,
+        result: &ToolResultEnvelope,
+        message: &bt_core::Message,
+    ) -> Result<()> {
+        self.pending_terminal = Some(result.clone());
+        self.runtime.record_tool_terminal_transition(
+            self.session_id,
+            self.branch_id,
+            self.turn_id,
+            result.clone(),
+            message.clone(),
+        )?;
+        self.pending_terminal = None;
+        Ok(())
+    }
+}
+
 impl BelltowerRuntime {
     #[must_use]
     pub fn turn_orchestrator(&self) -> TurnOrchestrator<'_> {
         TurnOrchestrator { runtime: self }
     }
 
-    pub fn record_turn_result(
+    fn record_turn_result(
         &self,
         session: &SessionRecord,
         branch: &BranchRecord,
@@ -99,83 +174,23 @@ impl BelltowerRuntime {
     ) -> Result<TurnResultPersistenceStatus> {
         let bt_agent::TurnResult {
             messages,
-            tool_results,
+            tool_results: _,
             completion_chunks: _completion_chunks,
             usage: _,
-            approvals,
+            approvals: _,
             approval_requests,
             input_requests,
-            tool_call_requests_durably_recorded,
             finish_reason,
         } = result;
         let awaiting_input = !input_requests.is_empty();
         let awaiting_approval = !approval_requests.is_empty();
         let finish_reason_label = format!("{finish_reason:?}");
 
-        for approval in approvals {
-            self.record_approval_for_request(
-                session.session_id,
-                branch.branch_id,
-                &approval.request,
-                approval.decision,
-                Some(turn_id),
-            )?;
-        }
-
-        for approval_request in approval_requests {
-            self.record_approval_requested_for_request(
-                session.session_id,
-                branch.branch_id,
-                &approval_request.request,
-                Some(turn_id),
-            )?;
-        }
-
-        if !tool_call_requests_durably_recorded {
-            for input_request in &input_requests {
-                self.record_tool_call_requested(
-                    session.session_id,
-                    branch.branch_id,
-                    input_request.call_id.clone(),
-                    input_request.tool_name.clone(),
-                    json!({
-                        "question": input_request.prompt,
-                        "choices": input_request.choices,
-                    }),
-                    Some(turn_id),
-                )?;
-            }
-        }
-
-        for message in messages {
-            if let Some(call) = message.tool_call() {
-                let call_id = bt_core::ToolCallId::new(&call.call_id);
-                let already_recorded = call.tool_name == "ask"
-                    && self
-                        .pending_inputs(session.session_id)?
-                        .iter()
-                        .any(|pending| pending.call_id == call_id);
-                if !tool_call_requests_durably_recorded && !already_recorded {
-                    self.record_tool_call_requested(
-                        session.session_id,
-                        branch.branch_id,
-                        call_id,
-                        call.tool_name.clone(),
-                        call.arguments.clone(),
-                        Some(turn_id),
-                    )?;
-                }
-            }
+        for message in messages
+            .into_iter()
+            .filter(|message| message.tool_call().is_none() && message.tool_result().is_none())
+        {
             self.append_raw_message(session, branch, message, Some(turn_id))?;
-        }
-
-        for tool_result in tool_results {
-            self.record_tool_execution(
-                session.session_id,
-                branch.branch_id,
-                tool_result,
-                Some(turn_id),
-            )?;
         }
 
         self.record_turn_finished(
@@ -236,41 +251,6 @@ impl BelltowerRuntime {
             Some(turn_id),
         )?;
 
-        Ok(())
-    }
-
-    pub fn record_turn_failure(
-        &self,
-        session: &SessionRecord,
-        branch: &BranchRecord,
-        connection: &ConnectionDescriptor,
-        model_id: &str,
-        turn_id: TurnId,
-        error: &BelltowerError,
-        latency_ms: u64,
-    ) -> Result<()> {
-        let span_kind = match error.class() {
-            ErrorClass::Provider | ErrorClass::Protocol => SpanKind::Llm,
-            ErrorClass::Tool => SpanKind::Tool,
-            _ => SpanKind::Agent,
-        };
-        self.record_session_error(
-            session.session_id,
-            branch.branch_id,
-            error,
-            Some(turn_id),
-            span_kind,
-        )?;
-        self.record_turn_finished(
-            session.session_id,
-            branch.branch_id,
-            turn_id,
-            connection.provider.clone(),
-            model_id.to_owned(),
-            "failed".to_owned(),
-            Some(error.code().to_owned()),
-            latency_ms,
-        )?;
         Ok(())
     }
 }
@@ -355,8 +335,6 @@ impl TurnOrchestrator<'_> {
                     )?;
                     let connection = prepared.connection;
                     let model_id = prepared.model_id;
-                    let context_boundary_seq_id = prepared.context_boundary_seq_id;
-                    let message_sources = prepared.message_sources;
                     let context_compaction = prepared.compaction.clone();
                     let completion_request = prepared.request;
                     Ok((
@@ -366,8 +344,6 @@ impl TurnOrchestrator<'_> {
                         built_system_prompt,
                         prepared.settings_revision_id,
                         context_compaction,
-                        context_boundary_seq_id,
-                        message_sources,
                         connection,
                         model_id,
                         completion_request,
@@ -382,8 +358,6 @@ impl TurnOrchestrator<'_> {
                     built_system_prompt,
                     prepared_settings_revision_id,
                     context_compaction,
-                    context_boundary_seq_id,
-                    message_sources,
                     connection,
                     model_id,
                     completion_request,
@@ -439,14 +413,27 @@ impl TurnOrchestrator<'_> {
                     let started = Instant::now();
                     let turn_loop =
                         TurnLoop::new(provider.clone(), tools, self.runtime.approval_evaluator());
+                    let mut tool_lifecycle = RuntimeToolLifecycleObserver {
+                        runtime: self.runtime,
+                        session_id: turn_session.session_id,
+                        branch_id: current_branch.branch_id,
+                        turn_id,
+                        pending_terminal: None,
+                    };
                     let result = match turn_loop
-                        .run_turn_with_tool_callbacks(
+                        .run_turn_with_tool_observer(
                             TurnRequest {
                                 session_id: turn_session.session_id,
                                 project_root: turn_session.project_root.clone(),
                                 request: completion_request,
                             },
                             |llm_call| {
+                                let (context_boundary_seq_id, message_sources) =
+                                    self.runtime.context_message_sources_for_request(
+                                        turn_session.session_id,
+                                        current_branch.branch_id,
+                                        &llm_call.request,
+                                    )?;
                                 let mut manifest =
                                     bt_core::ContextManifest::from_completion_request(
                                         turn_id,
@@ -502,37 +489,20 @@ impl TurnOrchestrator<'_> {
                                 )?;
                                 Ok(())
                             },
-                            |tool_call| {
-                                self.runtime.record_tool_call_requested_with_context(
-                                    turn_session.session_id,
-                                    current_branch.branch_id,
-                                    tool_call.call_id.clone(),
-                                    tool_call.tool_name.clone(),
-                                    tool_call.arguments.clone(),
-                                    bt_core::ToolOperationContext {
-                                        initiator: bt_core::ToolOperationInitiator::Agent,
-                                        risk_class: Some(tool_call.metadata.risk_class),
-                                        is_read_only: Some(tool_call.metadata.is_read_only),
-                                        execution_mode: Some(tool_call.metadata.execution_mode),
-                                        artifact_refs: Vec::new(),
-                                    },
-                                    Some(turn_id),
-                                )?;
-                                Ok(())
-                            },
-                            true,
+                            &mut tool_lifecycle,
                         )
                         .await
                     {
                         Ok(result) => result,
                         Err(error) => {
                             let latency_ms = started.elapsed().as_millis() as u64;
-                            self.runtime.record_turn_failure(
-                                &turn_session,
-                                &current_branch,
-                                &connection,
+                            self.runtime.record_turn_failure_transition(
+                                turn_session.session_id,
+                                current_branch.branch_id,
+                                &connection.provider,
                                 &model_id,
                                 turn_id,
+                                tool_lifecycle.pending_terminal.take().into_iter().collect(),
                                 &error,
                                 latency_ms,
                             )?;

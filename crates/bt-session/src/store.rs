@@ -1,8 +1,8 @@
 use crate::{CompletionCostReprojector, ReprojectionReport, StoredSessionEvent, apply_migrations};
 use bt_core::{
-    BelltowerError, BranchHead, BranchId, BranchRecord, BudgetConfig, EventEnvelope, EventPayload,
-    Message, Result, Role, SessionId, SessionRecord, SessionSettingsSnapshot, SessionToolMode,
-    ToolCallId, TurnId, TurnStartSource,
+    ApprovalScope, BelltowerError, BranchHead, BranchId, BranchRecord, BudgetConfig, EventEnvelope,
+    EventPayload, Message, Result, Role, SessionId, SessionRecord, SessionSettingsSnapshot,
+    SessionToolMode, ToolCallId, ToolOperationContext, TurnId, TurnStartSource,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::HashMap;
@@ -32,7 +32,7 @@ pub use types::{
     RecordedOperatorCommandRecord, ResumedTurnRecoveryRecord, ReusableApprovalProjection,
     SequencedMessageRecord, SessionBudgetProjection, SessionControlProjection,
     SessionInspectionMetrics, SessionSettingsRevisionProjection, SteerProjection,
-    ToolRunProjection, TranscriptPage, TurnRecoveryRecord,
+    ToolOperationRecoveryRecord, ToolRunProjection, TranscriptPage, TurnRecoveryRecord,
 };
 
 impl SqliteSessionStore {
@@ -723,6 +723,7 @@ impl SqliteSessionStore {
                     provider,
                     model,
                     source,
+                    resumed_from_call_id,
                     ..
                 } => {
                     unfinished.insert(
@@ -734,6 +735,7 @@ impl SqliteSessionStore {
                             provider,
                             model,
                             source,
+                            resumed_from_call_id,
                             started_seq_id: seq_id,
                         },
                     );
@@ -1298,28 +1300,122 @@ impl SqliteSessionStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT session_id, request_fingerprint, decision_json
-                 FROM approval_projection
-                 WHERE request_fingerprint IS NOT NULL AND decision_json IS NOT NULL
-                 ORDER BY updated_at ASC",
+                "SELECT event_json, seq_id
+                 FROM events
+                 WHERE event_kind = 'tool.approval.resolved'
+                 ORDER BY seq_id ASC",
             )
             .map_err(storage_error)?;
         let rows = statement
             .query_map([], |row| {
-                let decision_json: String = row.get(2)?;
-                Ok(ReusableApprovalProjection {
-                    session_id: SessionId(
-                        row.get::<_, String>(0)?
-                            .parse()
-                            .map_err(to_sql_conversion)?,
-                    ),
-                    request_fingerprint: row.get(1)?,
-                    decision: serde_json::from_str(&decision_json).map_err(to_sql_conversion)?,
-                })
+                let raw: String = row.get(0)?;
+                let seq_id: i64 = row.get(1)?;
+                let mut event: EventEnvelope =
+                    serde_json::from_str(&raw).map_err(to_sql_conversion)?;
+                event.seq_id = Some(seq_id);
+                Ok(event)
             })
             .map_err(storage_error)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(storage_error)
+        let mut approvals = Vec::new();
+        for row in rows {
+            let event = row.map_err(storage_error)?;
+            let EventPayload::ToolApprovalResolved {
+                request_fingerprint,
+                resolution,
+                decision,
+                ..
+            } = event.payload
+            else {
+                continue;
+            };
+            let fingerprint = resolution
+                .map(|resolution| resolution.request_fingerprint)
+                .or(request_fingerprint);
+            let scope = match &decision {
+                bt_core::ApprovalDecision::Approved { scope, .. }
+                | bt_core::ApprovalDecision::Denied { scope, .. } => *scope,
+            };
+            if !matches!(scope, ApprovalScope::Session | ApprovalScope::Always) {
+                continue;
+            }
+            if let Some(request_fingerprint) = fingerprint {
+                approvals.push(ReusableApprovalProjection {
+                    session_id: event.session_id,
+                    request_fingerprint,
+                    decision,
+                });
+            }
+        }
+        Ok(approvals)
+    }
+
+    pub fn load_unfinished_unbound_tool_operations(
+        &self,
+    ) -> Result<Vec<ToolOperationRecoveryRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT event_json, seq_id
+                 FROM events
+                 WHERE event_kind IN (
+                    'tool.operation.recorded',
+                    'tool.call.requested',
+                    'tool.execution.finished'
+                 )
+                 ORDER BY seq_id ASC",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                let raw: String = row.get(0)?;
+                let seq_id: i64 = row.get(1)?;
+                let mut event: EventEnvelope =
+                    serde_json::from_str(&raw).map_err(to_sql_conversion)?;
+                event.seq_id = Some(seq_id);
+                Ok(event)
+            })
+            .map_err(storage_error)?;
+
+        let mut operations: HashMap<(SessionId, ToolCallId), ToolOperationRecoveryRecord> =
+            HashMap::new();
+        let mut contexts: HashMap<(SessionId, ToolCallId), ToolOperationContext> = HashMap::new();
+        for row in rows {
+            let event = row.map_err(storage_error)?;
+            if event.turn_id.is_some() {
+                continue;
+            }
+            let key_for = |call_id: &ToolCallId| (event.session_id, call_id.clone());
+            match event.payload {
+                EventPayload::ToolOperationRecorded {
+                    call_id, operation, ..
+                } => {
+                    contexts.insert(key_for(&call_id), operation);
+                }
+                EventPayload::ToolCallRequested {
+                    call_id, tool_name, ..
+                } => {
+                    let key = key_for(&call_id);
+                    operations.insert(
+                        key.clone(),
+                        ToolOperationRecoveryRecord {
+                            session_id: event.session_id,
+                            branch_id: event.branch_id,
+                            call_id,
+                            tool_name,
+                            operation: contexts.get(&key).cloned().unwrap_or_default(),
+                            requested_seq_id: event.seq_id.expect("stored event has seq id"),
+                        },
+                    );
+                }
+                EventPayload::ToolExecutionFinished { call_id, .. } => {
+                    operations.remove(&key_for(&call_id));
+                }
+                _ => {}
+            }
+        }
+        let mut unfinished = operations.into_values().collect::<Vec<_>>();
+        unfinished.sort_by_key(|record| record.requested_seq_id);
+        Ok(unfinished)
     }
 
     pub fn load_tool_runs(&self, session_id: SessionId) -> Result<Vec<ToolRunProjection>> {

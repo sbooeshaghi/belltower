@@ -137,7 +137,7 @@ impl BelltowerRuntime {
         let event = apply_turn_id(event, turn_id);
         let seq_id = self.append_event(event)?;
         self.approvals
-            .record_call(call_id_for_state, decision_for_state)?;
+            .record_call(session_id, call_id_for_state, decision_for_state)?;
         Ok(seq_id)
     }
 
@@ -149,12 +149,46 @@ impl BelltowerRuntime {
         decision: ApprovalDecision,
         turn_id: Option<TurnId>,
     ) -> Result<i64> {
+        let decision_for_state = decision.clone();
+        let (seq_id, _) =
+            self.persist_approval_for_request(session_id, branch_id, request, decision, turn_id)?;
+        self.approvals
+            .record_for_request(request, decision_for_state)?;
+        Ok(seq_id)
+    }
+
+    pub(crate) fn record_evaluated_approval_for_request(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        request: &ApprovalRequest,
+        decision: ApprovalDecision,
+        turn_id: Option<TurnId>,
+    ) -> Result<i64> {
+        let decision_for_state = decision.clone();
+        let (seq_id, request_fingerprint) =
+            self.persist_approval_for_request(session_id, branch_id, request, decision, turn_id)?;
+        self.approvals.seed_reusable_decision(
+            request.session_id,
+            request_fingerprint,
+            decision_for_state,
+        )?;
+        Ok(seq_id)
+    }
+
+    fn persist_approval_for_request(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        request: &ApprovalRequest,
+        decision: ApprovalDecision,
+        turn_id: Option<TurnId>,
+    ) -> Result<(i64, String)> {
         let request_fingerprint = approval_request_fingerprint(request);
         let resolution = bt_core::ApprovalResolution {
             request_fingerprint: request_fingerprint.clone(),
             decision: decision.clone(),
         };
-        let decision_for_state = decision.clone();
         let event = EventEnvelope::new(
             session_id,
             branch_id,
@@ -162,16 +196,14 @@ impl BelltowerRuntime {
             EventPayload::ToolApprovalResolved {
                 call_id: request.call_id.clone(),
                 tool_name: request.tool_name.clone(),
-                request_fingerprint: Some(request_fingerprint),
+                request_fingerprint: Some(request_fingerprint.clone()),
                 resolution: Some(resolution),
                 decision,
             },
         );
         let event = apply_turn_id(event, turn_id);
         let seq_id = self.append_event(event)?;
-        self.approvals
-            .record_for_request(request, decision_for_state)?;
-        Ok(seq_id)
+        Ok((seq_id, request_fingerprint))
     }
 
     pub fn record_approval_requested(
@@ -828,7 +860,7 @@ impl BelltowerRuntime {
         Ok(seq_ids)
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     /// Injects a one-shot storage failure for cross-crate invariant tests.
     ///
     /// This is feature-gated so production runtime construction cannot
@@ -841,7 +873,7 @@ impl BelltowerRuntime {
             Some(bt_core::BelltowerError::Storage(message.into()));
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     fn take_store_append_fault_for_test(&self) -> Result<()> {
         match self
             .store_append_fault
@@ -854,7 +886,7 @@ impl BelltowerRuntime {
         }
     }
 
-    #[cfg(not(feature = "test-support"))]
+    #[cfg(not(any(test, feature = "test-support")))]
     fn take_store_append_fault_for_test(&self) -> Result<()> {
         Ok(())
     }

@@ -51,7 +51,6 @@ pub struct TurnResult {
     pub approvals: Vec<TurnApproval>,
     pub approval_requests: Vec<TurnApprovalRequest>,
     pub input_requests: Vec<TurnInputRequest>,
-    pub tool_call_requests_durably_recorded: bool,
     pub finish_reason: FinishReason,
 }
 
@@ -86,6 +85,28 @@ pub struct TurnToolCallRequest {
     pub metadata: bt_core::ToolMetadata,
 }
 
+/// Synchronously observes tool lifecycle boundaries before the turn can advance.
+///
+/// Returning an error aborts the turn. In particular, a request error prevents
+/// execution and a result error prevents the result from entering model context.
+pub trait ToolLifecycleObserver {
+    fn tool_call_requested(
+        &mut self,
+        request: &TurnToolCallRequest,
+        message: &Message,
+    ) -> Result<()>;
+
+    fn tool_approval_requested(&mut self, request: &TurnApprovalRequest) -> Result<()>;
+
+    fn tool_approval_resolved(&mut self, approval: &TurnApproval) -> Result<()>;
+
+    fn tool_execution_finished(
+        &mut self,
+        result: &ToolResultEnvelope,
+        message: &Message,
+    ) -> Result<()>;
+}
+
 #[derive(Clone, Debug)]
 pub struct LlmCallStarted {
     pub ordinal: u32,
@@ -99,6 +120,34 @@ pub struct LlmCallStarted {
 pub struct LlmCallFinished {
     pub ordinal: u32,
     pub summary: CompletionSummary,
+}
+
+struct NoopToolLifecycleObserver;
+
+impl ToolLifecycleObserver for NoopToolLifecycleObserver {
+    fn tool_call_requested(
+        &mut self,
+        _request: &TurnToolCallRequest,
+        _message: &Message,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn tool_approval_requested(&mut self, _request: &TurnApprovalRequest) -> Result<()> {
+        Ok(())
+    }
+
+    fn tool_approval_resolved(&mut self, _approval: &TurnApproval) -> Result<()> {
+        Ok(())
+    }
+
+    fn tool_execution_finished(
+        &mut self,
+        _result: &ToolResultEnvelope,
+        _message: &Message,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl TurnLoop {
@@ -144,31 +193,30 @@ impl TurnLoop {
         FChunk: FnMut(&CompletionChunk) -> Result<()>,
         FFinish: FnMut(&LlmCallFinished) -> Result<()>,
     {
-        self.run_turn_with_tool_callbacks(
+        let mut tool_lifecycle = NoopToolLifecycleObserver;
+        self.run_turn_with_tool_observer(
             turn,
             on_llm_call_started,
             on_chunk,
             on_llm_call_finished,
-            |_| Ok(()),
-            false,
+            &mut tool_lifecycle,
         )
         .await
     }
 
-    pub async fn run_turn_with_tool_callbacks<FStart, FChunk, FFinish, FTool>(
+    pub async fn run_turn_with_tool_observer<FStart, FChunk, FFinish, O>(
         &self,
         mut turn: TurnRequest,
         mut on_llm_call_started: FStart,
         mut on_chunk: FChunk,
         mut on_llm_call_finished: FFinish,
-        mut on_tool_call_requested: FTool,
-        record_tool_requests_durably: bool,
+        tool_lifecycle: &mut O,
     ) -> Result<TurnResult>
     where
         FStart: FnMut(&LlmCallStarted) -> Result<()>,
         FChunk: FnMut(&CompletionChunk) -> Result<()>,
         FFinish: FnMut(&LlmCallFinished) -> Result<()>,
-        FTool: FnMut(&TurnToolCallRequest) -> Result<()>,
+        O: ToolLifecycleObserver + ?Sized,
     {
         let mut emitted_messages = Vec::new();
         let mut tool_results = Vec::new();
@@ -177,7 +225,6 @@ impl TurnLoop {
         let mut approvals = Vec::new();
         let mut approval_requests = Vec::new();
         let mut input_requests = Vec::new();
-        let tool_call_requests_durably_recorded = record_tool_requests_durably;
         let mut llm_call_ordinal = 0_u32;
 
         loop {
@@ -244,7 +291,6 @@ impl TurnLoop {
                     approvals,
                     approval_requests,
                     input_requests,
-                    tool_call_requests_durably_recorded,
                     finish_reason: response.finish_reason,
                 });
             }
@@ -252,8 +298,6 @@ impl TurnLoop {
             for tool_call in response.tool_calls {
                 let parsed = parse_tool_call(turn.session_id, &tool_call)?;
                 let tool_call_message = tool_call_message(&parsed);
-                turn.request.messages.push(tool_call_message.clone());
-                emitted_messages.push(tool_call_message);
 
                 let tool = self.tools.get(&parsed.tool_name).ok_or_else(|| {
                     bt_core::BelltowerError::Unsupported(format!(
@@ -263,15 +307,24 @@ impl TurnLoop {
                 })?;
                 let spec = tool.spec();
                 let requirement = tool.approval_requirement(&parsed.arguments);
-                on_tool_call_requested(&TurnToolCallRequest {
-                    call_id: parsed.call_id.clone(),
-                    tool_name: parsed.tool_name.clone(),
-                    arguments: parsed.arguments.clone(),
-                    metadata: spec.metadata.clone(),
-                })?;
+                let input_request =
+                    matches!(spec.metadata.execution_mode, ToolExecutionMode::UserInput)
+                        .then(|| parse_input_request(&parsed))
+                        .transpose()?;
+                tool_lifecycle.tool_call_requested(
+                    &TurnToolCallRequest {
+                        call_id: parsed.call_id.clone(),
+                        tool_name: parsed.tool_name.clone(),
+                        arguments: parsed.arguments.clone(),
+                        metadata: spec.metadata.clone(),
+                    },
+                    &tool_call_message,
+                )?;
+                turn.request.messages.push(tool_call_message.clone());
+                emitted_messages.push(tool_call_message);
 
-                if matches!(spec.metadata.execution_mode, ToolExecutionMode::UserInput) {
-                    input_requests.push(parse_input_request(&parsed)?);
+                if let Some(input_request) = input_request {
+                    input_requests.push(input_request);
                     return Ok(TurnResult {
                         messages: emitted_messages,
                         tool_results,
@@ -280,34 +333,51 @@ impl TurnLoop {
                         approvals,
                         approval_requests,
                         input_requests,
-                        tool_call_requests_durably_recorded,
                         finish_reason: FinishReason::ToolUse,
                     });
                 }
 
-                let result = match self.approval_outcome(&parsed, requirement, spec.metadata)? {
+                let approval_outcome =
+                    match self.approval_outcome(&parsed, requirement, spec.metadata) {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            observe_tool_lifecycle_failure(tool_lifecycle, &parsed, &error)?;
+                            return Err(error);
+                        }
+                    };
+                let result = match approval_outcome {
                     ApprovalOutcome::NotNeeded => self
                         .execute_tool_call(&parsed, &turn.project_root)
                         .await
                         .unwrap_or_else(|error| tool_error_result(&parsed, error)),
                     ApprovalOutcome::Approved(request, decision) => {
-                        approvals.push(TurnApproval {
+                        let approval = TurnApproval {
                             call_id: parsed.call_id.clone(),
                             tool_name: parsed.tool_name.clone(),
                             request,
                             decision,
-                        });
+                        };
+                        if let Err(error) = tool_lifecycle.tool_approval_resolved(&approval) {
+                            observe_tool_lifecycle_failure(tool_lifecycle, &parsed, &error)?;
+                            return Err(error);
+                        }
+                        approvals.push(approval);
                         self.execute_tool_call(&parsed, &turn.project_root)
                             .await
                             .unwrap_or_else(|error| tool_error_result(&parsed, error))
                     }
                     ApprovalOutcome::Denied(request, decision) => {
-                        approvals.push(TurnApproval {
+                        let approval = TurnApproval {
                             call_id: parsed.call_id.clone(),
                             tool_name: parsed.tool_name.clone(),
                             request,
                             decision: decision.clone(),
-                        });
+                        };
+                        if let Err(error) = tool_lifecycle.tool_approval_resolved(&approval) {
+                            observe_tool_lifecycle_failure(tool_lifecycle, &parsed, &error)?;
+                            return Err(error);
+                        }
+                        approvals.push(approval);
                         tool_error_result(
                             &parsed,
                             bt_core::BelltowerError::InvalidState(format!(
@@ -317,11 +387,18 @@ impl TurnLoop {
                         )
                     }
                     ApprovalOutcome::Pending(request) => {
-                        approval_requests.push(TurnApprovalRequest {
+                        let approval_request = TurnApprovalRequest {
                             call_id: parsed.call_id.clone(),
                             tool_name: parsed.tool_name.clone(),
                             request,
-                        });
+                        };
+                        if let Err(error) =
+                            tool_lifecycle.tool_approval_requested(&approval_request)
+                        {
+                            observe_tool_lifecycle_failure(tool_lifecycle, &parsed, &error)?;
+                            return Err(error);
+                        }
+                        approval_requests.push(approval_request);
                         return Ok(TurnResult {
                             messages: emitted_messages,
                             tool_results,
@@ -330,19 +407,12 @@ impl TurnLoop {
                             approvals,
                             approval_requests,
                             input_requests,
-                            tool_call_requests_durably_recorded,
                             finish_reason: FinishReason::ToolUse,
                         });
                     }
                 };
-                let message = Message {
-                    message_id: bt_core::MessageId::new(),
-                    role: Role::Tool,
-                    parts: vec![MessagePart::ToolResult {
-                        result: result.clone(),
-                    }],
-                    created_at: time::OffsetDateTime::now_utc(),
-                };
+                let message = tool_result_message(result.clone());
+                tool_lifecycle.tool_execution_finished(&result, &message)?;
                 turn.request.messages.push(message.clone());
                 emitted_messages.push(message);
                 tool_results.push(result);
@@ -665,6 +735,40 @@ fn tool_error_result(
     }
 }
 
+fn observe_tool_lifecycle_failure<O>(
+    observer: &mut O,
+    tool_call: &ParsedToolCall,
+    error: &bt_core::BelltowerError,
+) -> Result<()>
+where
+    O: ToolLifecycleObserver + ?Sized,
+{
+    let result = ToolResultEnvelope {
+        call_id: tool_call.call_id.clone(),
+        tool_name: tool_call.tool_name.clone(),
+        is_error: true,
+        output: serde_json::json!({
+            "error": {
+                "class": error.class(),
+                "code": error.code(),
+                "message": error.to_string(),
+                "retryable": error.retryable(),
+            }
+        }),
+        duration_ms: None,
+    };
+    observer.tool_execution_finished(&result, &tool_result_message(result.clone()))
+}
+
+fn tool_result_message(result: ToolResultEnvelope) -> Message {
+    Message {
+        message_id: bt_core::MessageId::new(),
+        role: Role::Tool,
+        parts: vec![MessagePart::ToolResult { result }],
+        created_at: time::OffsetDateTime::now_utc(),
+    }
+}
+
 fn execution_arguments(tool_call: &ParsedToolCall) -> Value {
     match tool_call.arguments.clone() {
         Value::Object(mut object) => {
@@ -775,12 +879,12 @@ fn finalize_tool_call(accumulator: StreamingToolCallAccumulator) -> Result<Compl
 
 #[cfg(test)]
 mod tests {
-    use super::{TurnLoop, TurnRequest};
+    use super::{ToolLifecycleObserver, TurnLoop, TurnRequest, TurnToolCallRequest};
     use bt_core::{
-        ApprovalDecision, ApprovalDecisionSource, ApprovalRequest, ApprovalScope, CompletionChunk,
-        CompletionDelta, CompletionRequest, ConnectionId, ConnectionStatus, ModelPricing, Result,
-        Role, SessionId, ToolContext, ToolDisplayGroup, ToolExecutionMode, ToolInterruptBehavior,
-        ToolMetadata, ToolRiskClass, ToolSpec,
+        ApprovalDecision, ApprovalDecisionSource, ApprovalRequest, ApprovalScope, BelltowerError,
+        CompletionChunk, CompletionDelta, CompletionRequest, ConnectionId, ConnectionStatus,
+        ModelPricing, Result, Role, SessionId, ToolContext, ToolDisplayGroup, ToolExecutionMode,
+        ToolInterruptBehavior, ToolMetadata, ToolResultEnvelope, ToolRiskClass, ToolSpec,
         traits::{ApprovalEvaluator, BoxFuture, BoxStream, Provider, ToolExecutor},
     };
     use bt_tools::BuiltInToolRegistry;
@@ -788,18 +892,38 @@ mod tests {
     use futures_util::stream;
     use serde_json::json;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     struct MockProvider {
         responses: Mutex<VecDeque<Vec<CompletionChunk>>>,
+        call_count: AtomicUsize,
+        lifecycle_events: Option<Arc<Mutex<Vec<String>>>>,
     }
 
     impl MockProvider {
         fn new(responses: Vec<Vec<CompletionChunk>>) -> Self {
             Self {
                 responses: Mutex::new(VecDeque::from(responses)),
+                call_count: AtomicUsize::new(0),
+                lifecycle_events: None,
             }
+        }
+
+        fn recording(
+            responses: Vec<Vec<CompletionChunk>>,
+            lifecycle_events: Arc<Mutex<Vec<String>>>,
+        ) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                call_count: AtomicUsize::new(0),
+                lifecycle_events: Some(lifecycle_events),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.call_count.load(Ordering::SeqCst)
         }
     }
 
@@ -817,6 +941,13 @@ mod tests {
             _request: CompletionRequest,
         ) -> BoxFuture<'_, Result<BoxStream<Result<CompletionChunk>>>> {
             Box::pin(async move {
+                let call_number = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Some(events) = &self.lifecycle_events {
+                    events
+                        .lock()
+                        .expect("lock")
+                        .push(format!("provider_call_{call_number}"));
+                }
                 let response = self
                     .responses
                     .lock()
@@ -831,6 +962,118 @@ mod tests {
 
         fn pricing(&self, _model: &str) -> Option<ModelPricing> {
             None
+        }
+    }
+
+    struct TestToolLifecycleObserver {
+        events: Arc<Mutex<Vec<String>>>,
+        fail_request: bool,
+        fail_approval_requested: bool,
+        fail_approval_resolved: bool,
+        fail_result: bool,
+    }
+
+    impl TestToolLifecycleObserver {
+        fn new(fail_request: bool, fail_result: bool) -> Self {
+            Self {
+                events: Arc::new(Mutex::new(Vec::new())),
+                fail_request,
+                fail_approval_requested: false,
+                fail_approval_resolved: false,
+                fail_result,
+            }
+        }
+
+        fn failing_approval_requested() -> Self {
+            Self {
+                events: Arc::new(Mutex::new(Vec::new())),
+                fail_request: false,
+                fail_approval_requested: true,
+                fail_approval_resolved: false,
+                fail_result: false,
+            }
+        }
+
+        fn failing_approval_resolved() -> Self {
+            Self {
+                events: Arc::new(Mutex::new(Vec::new())),
+                fail_request: false,
+                fail_approval_requested: false,
+                fail_approval_resolved: true,
+                fail_result: false,
+            }
+        }
+
+        fn recording(events: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                events,
+                fail_request: false,
+                fail_approval_requested: false,
+                fail_approval_resolved: false,
+                fail_result: false,
+            }
+        }
+    }
+
+    impl ToolLifecycleObserver for TestToolLifecycleObserver {
+        fn tool_call_requested(
+            &mut self,
+            request: &TurnToolCallRequest,
+            _message: &bt_core::Message,
+        ) -> Result<()> {
+            self.events
+                .lock()
+                .expect("lock")
+                .push(format!("tool_requested:{}", request.call_id));
+            if self.fail_request {
+                return Err(BelltowerError::Storage(
+                    "tool request observation failed".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn tool_approval_requested(&mut self, request: &super::TurnApprovalRequest) -> Result<()> {
+            self.events
+                .lock()
+                .expect("lock")
+                .push(format!("approval_requested:{}", request.call_id));
+            if self.fail_approval_requested {
+                return Err(BelltowerError::Storage(
+                    "approval request observation failed".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn tool_approval_resolved(&mut self, approval: &super::TurnApproval) -> Result<()> {
+            self.events
+                .lock()
+                .expect("lock")
+                .push(format!("approval_resolved:{}", approval.call_id));
+            if self.fail_approval_resolved {
+                return Err(BelltowerError::Storage(
+                    "approval resolution observation failed".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn tool_execution_finished(
+            &mut self,
+            result: &ToolResultEnvelope,
+            _message: &bt_core::Message,
+        ) -> Result<()> {
+            self.events
+                .lock()
+                .expect("lock")
+                .push(format!("tool_finished:{}", result.call_id));
+            if self.fail_result {
+                return Err(BelltowerError::Storage(
+                    "tool result observation failed".to_owned(),
+                ));
+            }
+            Ok(())
         }
     }
 
@@ -852,6 +1095,16 @@ mod tests {
                 scope: ApprovalScope::Once,
                 source: ApprovalDecisionSource::Runtime,
             }))
+        }
+    }
+
+    struct FailingApprovalEvaluator;
+
+    impl ApprovalEvaluator for FailingApprovalEvaluator {
+        fn evaluate(&self, _request: &ApprovalRequest) -> Result<Option<ApprovalDecision>> {
+            Err(BelltowerError::Storage(
+                "approval evaluation failed".to_owned(),
+            ))
         }
     }
 
@@ -936,6 +1189,283 @@ mod tests {
             usage: None,
             raw: None,
         }
+    }
+
+    async fn assert_pre_execution_failure_is_terminalized(
+        approvals: Arc<dyn ApprovalEvaluator>,
+        mut observer: TestToolLifecycleObserver,
+        expected_events: &[&str],
+    ) {
+        let root = TempDir::new().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(root.path().to_path_buf()).expect("utf8 path");
+        let provider = Arc::new(MockProvider::new(vec![vec![tool_call_chunk(
+            "call-approval-failure",
+            "write",
+            json!({
+                "path": "should-not-exist.txt",
+                "content": "not durable"
+            }),
+        )]]));
+        let turn_loop = TurnLoop::new(provider.clone(), BuiltInToolRegistry::new(), approvals);
+
+        let error = turn_loop
+            .run_turn_with_tool_observer(
+                TurnRequest {
+                    session_id: SessionId::new(),
+                    project_root: project_root.clone(),
+                    request: CompletionRequest {
+                        connection_id: ConnectionId::new("local"),
+                        model: "test".to_owned(),
+                        system_prompt: None,
+                        messages: vec![bt_core::Message::text(Role::User, "write a file")],
+                        tools: BuiltInToolRegistry::new().specs(),
+                        structured_output: None,
+                        max_tokens: None,
+                        temperature: None,
+                        thinking: None,
+                    },
+                },
+                |_| Ok(()),
+                |_| Ok(()),
+                |_| Ok(()),
+                &mut observer,
+            )
+            .await
+            .expect_err("approval boundary should fail the turn");
+
+        assert!(matches!(error, BelltowerError::Storage(_)));
+        assert_eq!(provider.call_count(), 1);
+        assert!(!project_root.join("should-not-exist.txt").exists());
+        assert_eq!(
+            observer.events.lock().expect("lock").as_slice(),
+            expected_events
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_evaluator_failure_closes_committed_tool_request() {
+        assert_pre_execution_failure_is_terminalized(
+            Arc::new(FailingApprovalEvaluator),
+            TestToolLifecycleObserver::new(false, false),
+            &[
+                "tool_requested:call-approval-failure",
+                "tool_finished:call-approval-failure",
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn approval_request_observer_failure_closes_committed_tool_request() {
+        assert_pre_execution_failure_is_terminalized(
+            Arc::new(PendingApprovalEvaluator),
+            TestToolLifecycleObserver::failing_approval_requested(),
+            &[
+                "tool_requested:call-approval-failure",
+                "approval_requested:call-approval-failure",
+                "tool_finished:call-approval-failure",
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn approval_resolution_observer_failure_closes_committed_tool_request() {
+        assert_pre_execution_failure_is_terminalized(
+            Arc::new(AlwaysApproveEvaluator),
+            TestToolLifecycleObserver::failing_approval_resolved(),
+            &[
+                "tool_requested:call-approval-failure",
+                "approval_resolved:call-approval-failure",
+                "tool_finished:call-approval-failure",
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn tool_request_observer_failure_prevents_execution() {
+        let root = TempDir::new().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(root.path().to_path_buf()).expect("utf8 path");
+        let provider = Arc::new(MockProvider::new(vec![vec![tool_call_chunk(
+            "call-request-failure",
+            "write",
+            json!({
+                "path": "should-not-exist.txt",
+                "content": "not durable"
+            }),
+        )]]));
+        let turn_loop = TurnLoop::new(
+            provider.clone(),
+            BuiltInToolRegistry::new(),
+            Arc::new(AlwaysApproveEvaluator),
+        );
+        let mut observer = TestToolLifecycleObserver::new(true, false);
+
+        let error = turn_loop
+            .run_turn_with_tool_observer(
+                TurnRequest {
+                    session_id: SessionId::new(),
+                    project_root: project_root.clone(),
+                    request: CompletionRequest {
+                        connection_id: ConnectionId::new("local"),
+                        model: "test".to_owned(),
+                        system_prompt: None,
+                        messages: vec![bt_core::Message::text(Role::User, "write a file")],
+                        tools: BuiltInToolRegistry::new().specs(),
+                        structured_output: None,
+                        max_tokens: None,
+                        temperature: None,
+                        thinking: None,
+                    },
+                },
+                |_| Ok(()),
+                |_| Ok(()),
+                |_| Ok(()),
+                &mut observer,
+            )
+            .await
+            .expect_err("request observation should fail the turn");
+
+        assert!(matches!(error, BelltowerError::Storage(_)));
+        assert_eq!(provider.call_count(), 1);
+        assert!(!project_root.join("should-not-exist.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn tool_result_observer_failure_prevents_reentry_and_sibling_execution() {
+        let root = TempDir::new().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(root.path().to_path_buf()).expect("utf8 path");
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                tool_call_chunk(
+                    "call-first",
+                    "write",
+                    json!({
+                        "path": "first.txt",
+                        "content": "executed"
+                    }),
+                ),
+                tool_call_chunk(
+                    "call-sibling",
+                    "write",
+                    json!({
+                        "path": "sibling.txt",
+                        "content": "must not execute"
+                    }),
+                ),
+            ],
+            vec![text_chunk("provider re-entry must not happen")],
+        ]));
+        let turn_loop = TurnLoop::new(
+            provider.clone(),
+            BuiltInToolRegistry::new(),
+            Arc::new(AlwaysApproveEvaluator),
+        );
+        let mut observer = TestToolLifecycleObserver::new(false, true);
+
+        let error = turn_loop
+            .run_turn_with_tool_observer(
+                TurnRequest {
+                    session_id: SessionId::new(),
+                    project_root: project_root.clone(),
+                    request: CompletionRequest {
+                        connection_id: ConnectionId::new("local"),
+                        model: "test".to_owned(),
+                        system_prompt: None,
+                        messages: vec![bt_core::Message::text(Role::User, "write two files")],
+                        tools: BuiltInToolRegistry::new().specs(),
+                        structured_output: None,
+                        max_tokens: None,
+                        temperature: None,
+                        thinking: None,
+                    },
+                },
+                |_| Ok(()),
+                |_| Ok(()),
+                |_| Ok(()),
+                &mut observer,
+            )
+            .await
+            .expect_err("result observation should fail the turn");
+
+        assert!(matches!(error, BelltowerError::Storage(_)));
+        assert_eq!(provider.call_count(), 1);
+        assert_eq!(
+            std::fs::read_to_string(project_root.join("first.txt").as_std_path())
+                .expect("first tool should execute"),
+            "executed"
+        );
+        assert!(!project_root.join("sibling.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn terminal_tool_observation_precedes_provider_reentry() {
+        let root = TempDir::new().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(root.path().to_path_buf()).expect("utf8 path");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(MockProvider::recording(
+            vec![
+                vec![tool_call_chunk(
+                    "call-success",
+                    "write",
+                    json!({
+                        "path": "observed.txt",
+                        "content": "durable boundary"
+                    }),
+                )],
+                vec![text_chunk("done")],
+            ],
+            events.clone(),
+        ));
+        let turn_loop = TurnLoop::new(
+            provider.clone(),
+            BuiltInToolRegistry::new(),
+            Arc::new(AlwaysApproveEvaluator),
+        );
+        let mut observer = TestToolLifecycleObserver::recording(events.clone());
+
+        let result = turn_loop
+            .run_turn_with_tool_observer(
+                TurnRequest {
+                    session_id: SessionId::new(),
+                    project_root,
+                    request: CompletionRequest {
+                        connection_id: ConnectionId::new("local"),
+                        model: "test".to_owned(),
+                        system_prompt: None,
+                        messages: vec![bt_core::Message::text(Role::User, "write a file")],
+                        tools: BuiltInToolRegistry::new().specs(),
+                        structured_output: None,
+                        max_tokens: None,
+                        temperature: None,
+                        thinking: None,
+                    },
+                },
+                |_| Ok(()),
+                |_| Ok(()),
+                |_| Ok(()),
+                &mut observer,
+            )
+            .await
+            .expect("turn should complete");
+
+        assert_eq!(provider.call_count(), 2);
+        assert_eq!(result.tool_results.len(), 1);
+        assert_eq!(
+            *events.lock().expect("lock"),
+            vec![
+                "provider_call_1".to_owned(),
+                "tool_requested:call-success".to_owned(),
+                "approval_resolved:call-success".to_owned(),
+                "tool_finished:call-success".to_owned(),
+                "provider_call_2".to_owned(),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1340,5 +1870,46 @@ mod tests {
                 .tool_call()
                 .is_some_and(|call| call.call_id == "call-later")
         }));
+    }
+
+    #[tokio::test]
+    async fn invalid_user_input_is_rejected_before_canonical_request_observation() {
+        let provider = Arc::new(MockProvider::new(vec![vec![tool_call_chunk(
+            "call-invalid-ask",
+            "ask",
+            json!({"choices": ["one", "two"]}),
+        )]]));
+        let mut tools = BuiltInToolRegistry::new();
+        tools.register(AskTool);
+        let turn_loop = TurnLoop::new(provider, tools.clone(), Arc::new(AlwaysApproveEvaluator));
+        let mut observer = TestToolLifecycleObserver::new(false, false);
+
+        let error = turn_loop
+            .run_turn_with_tool_observer(
+                TurnRequest {
+                    session_id: SessionId::new(),
+                    project_root: Utf8PathBuf::from("."),
+                    request: CompletionRequest {
+                        connection_id: ConnectionId::new("local"),
+                        model: "test".to_owned(),
+                        system_prompt: None,
+                        messages: vec![bt_core::Message::text(Role::User, "ask me something")],
+                        tools: tools.specs(),
+                        structured_output: None,
+                        max_tokens: None,
+                        temperature: None,
+                        thinking: None,
+                    },
+                },
+                |_| Ok(()),
+                |_| Ok(()),
+                |_| Ok(()),
+                &mut observer,
+            )
+            .await
+            .expect_err("invalid ask arguments should fail the turn");
+
+        assert!(matches!(error, BelltowerError::Tool(_)));
+        assert!(observer.events.lock().expect("lock").is_empty());
     }
 }

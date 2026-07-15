@@ -107,6 +107,10 @@ duplicating full prompt or message bodies already stored in canonical events.
 The session store projects these records into `context_manifest_projection` so
 inspection and export consumers do not need to reconstruct provider-call
 boundaries from the raw event stream.
+Runtime recomputes the message source references immediately before every
+provider call, including same-turn continuations after tools that do not pause
+for approval. A continuation therefore describes the exact committed context it
+uses rather than inheriting a pre-tool manifest snapshot.
 
 ### Tools and Approvals
 
@@ -118,7 +122,25 @@ boundaries from the raw event stream.
 
 `tool.operation.recorded` is the durable envelope for tool-operation metadata such as initiator, risk/read-only/execution-mode classification, and artifact references. The call and result events remain the canonical argument/result events; operation metadata exists so built-in tools, MCP tools, and human-invoked operations can converge on the same telemetry shape without overloading `tool.call.requested`.
 
-Every `tool.call.requested` must have exactly one terminal `tool.execution.finished`, including denied, cancelled, timed-out, aborted, and failed execution. The terminal tool result and the closing turn/error events are one canonical transition so restart and inspection cannot observe a tool as permanently requested after execution has ended.
+Every `tool.call.requested` must have exactly one terminal
+`tool.execution.finished`, including denied, cancelled, timed-out, aborted, and
+failed execution. For agent-invoked tools, runtime atomically commits operation
+metadata, the request, and its canonical assistant tool-call message before
+execution. It atomically commits the terminal result and canonical tool-result
+message before model re-entry. Those are the exact message identities later
+referenced by the provider-call context manifest; runtime does not persist one
+copy while passing a separately constructed copy to the model. For
+human-invoked operator tools, runtime
+atomically commits operation metadata and the request before execution, then
+atomically commits the terminal result and `operator.command.recorded` audit
+event. Operator tools do not fabricate assistant tool-call or tool-result
+messages because their output is not model transcript history. Persistence
+failure stops execution or provider re-entry at the relevant boundary; closing
+turn/error events describe a stopped agent transition without allowing later
+provider work to observe uncommitted tool evidence. If an operator terminal
+batch encounters a recoverable append failure after execution, runtime retries
+as a terminal/audit/error recovery batch so the durable request is not left
+permanently open.
 
 `tool.approval.requested` carries optional `ApprovalRequestSnapshot` evidence:
 request fingerprint, argument hash, redacted argument preview, approval
@@ -127,6 +149,16 @@ identifiers. `tool.approval.resolved` carries optional `ApprovalResolution`
 evidence tying the final decision back to that fingerprint. This preserves the
 request-time policy facts separately from the later decision while keeping
 `tool.call.requested` as the canonical executable argument source.
+One-shot approval is a consumable authorization bound to session, call
+identifier, and request fingerprint. It unlocks the suspended request exactly
+once and is removed from runtime approval state when consumed; a later request
+never inherits it, even when a provider repeats the same call identifier and
+arguments. Projections and inspection similarly treat the newest
+`tool.call.requested` as the current request instance, clearing stale terminal
+and approval state until matching newer events arrive.
+Reusable Session and Always approval scopes are reconstructed at startup by
+replaying canonical `tool.approval.resolved` events in sequence order. The
+mutable approval projection is an inspection cache, not the rehydration source.
 
 ### Runtime Control and Maintenance
 

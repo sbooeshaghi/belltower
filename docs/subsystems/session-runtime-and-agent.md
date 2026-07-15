@@ -137,13 +137,53 @@ user message
 -> turn.instructions.recorded
 -> assistant streamed response
 -> assistant tool call finalized
+-> operation metadata, tool request, and assistant tool-call message persisted atomically
 -> approval or policy decision
 -> tool execution
--> tool result persisted
+-> terminal tool result and tool message persisted atomically
 -> assistant continuation turn
 -> completion
 -> turn.finished
 ```
+
+The tool request and terminal result boundaries are synchronous. The operation
+metadata, request event, and corresponding model-visible assistant tool-call
+message are one runtime-owned atomic transition. Failure to persist that
+transition prevents execution. The terminal event and corresponding
+model-visible tool-result message form a second atomic transition; failure to
+persist it prevents the result from entering context or triggering another
+provider call. Persistence and provider context share the exact tool-call and
+tool-result message identities; the following context manifest points back to
+those canonical message rows and sequence identifiers. Final turn-result
+persistence filters lifecycle-owned tool-call and tool-result messages while
+persisting the remaining transcript messages, so the lifecycle observer cannot
+create duplicate rows.
+Runtime refreshes source branch and sequence references immediately before each
+provider call, including same-turn continuations after safe tools that require
+no approval. It does not reuse the pre-tool manifest boundary for later calls.
+
+Human-invoked operator tools use the same canonical operation, request, and
+terminal lifecycle without pretending to be assistant transcript output. Their
+admission pair is `tool.operation.recorded` plus `tool.call.requested`; their
+terminal pair is `tool.execution.finished` plus
+`operator.command.recorded`. Both pairs are atomic. This keeps inspection and
+telemetry uniform while preserving the distinction between model context and
+operator audit history. If the initial terminal batch fails after execution,
+runtime writes a terminal/command/session-error recovery batch before returning
+the original persistence failure, preventing a recoverable append fault from
+leaving the operation indefinitely requested.
+
+Request identity is more specific than a provider-supplied call identifier.
+One-shot approvals are consumable authorizations bound to session, call
+identifier, and request fingerprint. They unlock only the suspended request
+that received the decision; a later request cannot reuse that decision even if
+the provider repeats the same call identifier and arguments. If a call
+identifier is reused, projections and inspection resolve it to the latest
+request instance and clear stale result or approval state until that instance
+receives its own terminal and decision events.
+Session and Always approval scopes survive restart because runtime replays the
+canonical `tool.approval.resolved` stream in sequence order. It does not treat
+the mutable approval projection as durable policy state.
 
 For a paused approval:
 
@@ -186,6 +226,15 @@ session as idle again. Resumed approval/input turns retain the
 `interrupted_after_resume` finish reason; ordinary active turns use
 `interrupted_after_restart`. This keeps recovery visible in session execution,
 telemetry, and export rather than leaving stale live state in memory.
+If execution may have begun but no terminal transition exists, recovery appends
+a non-retryable `tool_outcome_unknown_after_restart` result for that specific
+request instance. It never retries a potentially side-effecting tool
+automatically. A durably denied request receives a deterministic denied result;
+calls still waiting for an approval decision or user input remain explicitly
+pending rather than being misclassified as interrupted execution.
+The same unknown, non-retryable terminalization applies to interrupted unbound
+human operator requests. Recovery preserves their operator origin and never
+silently promotes them into agent transcript context or retries them.
 
 ## Turn Contract
 

@@ -516,6 +516,92 @@ fn tool_and_approval_projections_isolate_equal_call_ids_by_session() {
 }
 
 #[test]
+fn reused_call_id_projects_only_the_latest_request_instance() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    let call_id = ToolCallId::new("reused-call-id");
+
+    for payload in [
+        EventPayload::ToolCallRequested {
+            call_id: call_id.clone(),
+            tool_name: "shell".to_owned(),
+            arguments: serde_json::json!({"command":"pwd"}),
+        },
+        EventPayload::ToolApprovalRequested {
+            call_id: call_id.clone(),
+            tool_name: "shell".to_owned(),
+            snapshot: None,
+        },
+        EventPayload::ToolApprovalResolved {
+            call_id: call_id.clone(),
+            tool_name: "shell".to_owned(),
+            request_fingerprint: Some("first-request".to_owned()),
+            resolution: None,
+            decision: ApprovalDecision::Approved {
+                decided_at: OffsetDateTime::UNIX_EPOCH,
+                decided_by: "operator".to_owned(),
+                scope: ApprovalScope::Once,
+                source: ApprovalDecisionSource::Human,
+            },
+        },
+        EventPayload::ToolExecutionFinished {
+            call_id: call_id.clone(),
+            tool_name: "shell".to_owned(),
+            result: ToolResultEnvelope {
+                call_id: call_id.clone(),
+                tool_name: "shell".to_owned(),
+                is_error: false,
+                output: serde_json::json!({"stdout":"first"}),
+                duration_ms: Some(1),
+            },
+        },
+        EventPayload::ToolCallRequested {
+            call_id: call_id.clone(),
+            tool_name: "shell".to_owned(),
+            arguments: serde_json::json!({"command":"ls"}),
+        },
+        EventPayload::ToolApprovalRequested {
+            call_id: call_id.clone(),
+            tool_name: "shell".to_owned(),
+            snapshot: None,
+        },
+    ] {
+        store
+            .append_event(&EventEnvelope::new(
+                session.session_id,
+                branch.branch_id,
+                SpanKind::Tool,
+                payload,
+            ))
+            .expect("append lifecycle event");
+    }
+
+    let tool_run = store
+        .load_tool_runs(session.session_id)
+        .expect("load tool runs")
+        .pop()
+        .expect("tool run");
+    assert_eq!(tool_run.status, "requested");
+    assert_eq!(
+        tool_run.arguments,
+        Some(serde_json::json!({"command":"ls"}))
+    );
+    assert!(tool_run.result.is_none());
+
+    let approval = store
+        .load_approvals(session.session_id)
+        .expect("load approvals")
+        .pop()
+        .expect("approval");
+    assert_eq!(approval.status, "pending");
+    assert!(approval.decision.is_none());
+    assert!(approval.resolution.is_none());
+}
+
+#[test]
 fn migration_rebuilds_tool_and_approval_projections_with_composite_identity() {
     let file = NamedTempFile::new().expect("tempfile");
     let (first_session, first_branch) = sample_session();

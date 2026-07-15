@@ -48,26 +48,14 @@ impl BelltowerRuntime {
         output: String,
         success: bool,
     ) -> Result<i64> {
-        let event = EventEnvelope::new(
+        self.append_event(operator_command_event(
             session_id,
             branch_id,
-            SpanKind::Agent,
-            EventPayload::OperatorCommandRecorded {
-                command_type,
-                raw_input: raw_input.clone(),
-                output: output.clone(),
-                success,
-            },
-        )
-        .with_attribute(
-            bt_core::oi_attrs::INPUT_VALUE,
-            serde_json::Value::String(raw_input),
-        )
-        .with_attribute(
-            bt_core::oi_attrs::OUTPUT_VALUE,
-            serde_json::Value::String(output),
-        );
-        self.append_event(event)
+            command_type,
+            raw_input,
+            output,
+            success,
+        ))
     }
 
     pub fn bootstrap_resumed_approval_turn(
@@ -134,81 +122,175 @@ impl BelltowerRuntime {
             self.is_cancelled(resumable.session.session_id)?,
         );
         self.append_events(events)?;
-        self.approvals
-            .record_for_request(approval_request, decision)?;
+        self.approvals.seed_reusable_decision(
+            approval_request.session_id,
+            approval_request_fingerprint(approval_request),
+            decision,
+        )?;
         Ok(BootstrappedTurn {
             turn_id,
             settings_revision_id: resumable.settings_revision_id,
         })
     }
 
-    /// Records the terminal outcome when an approved, resumed tool call cannot execute.
-    ///
-    /// The tool result, execution state, error, and failed turn form one canonical
-    /// transition so restart and inspection cannot observe a permanently requested
-    /// tool after the server has already returned an execution error.
-    pub fn record_resumed_tool_failure(
+    pub fn record_tool_terminal_transition(
         &self,
-        session: &SessionRecord,
-        branch: &BranchRecord,
-        connection: &ConnectionDescriptor,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        turn_id: TurnId,
+        result: ToolResultEnvelope,
+        message: Message,
+    ) -> Result<()> {
+        self.append_events(tool_terminal_events(
+            session_id, branch_id, turn_id, result, message,
+        ))?;
+        Ok(())
+    }
+
+    pub fn record_tool_request_transition(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        turn_id: TurnId,
+        call_id: ToolCallId,
+        tool_name: String,
+        arguments: serde_json::Value,
+        operation: bt_core::ToolOperationContext,
+        message: Message,
+    ) -> Result<()> {
+        self.append_events(tool_request_events(
+            session_id, branch_id, turn_id, call_id, tool_name, arguments, operation, message,
+        ))?;
+        Ok(())
+    }
+
+    pub fn record_tool_operation_request_transition(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        call_id: ToolCallId,
+        tool_name: String,
+        arguments: serde_json::Value,
+        operation: bt_core::ToolOperationContext,
+        turn_id: Option<TurnId>,
+    ) -> Result<()> {
+        self.append_events(tool_operation_request_events(
+            session_id, branch_id, call_id, tool_name, arguments, operation, turn_id,
+        ))?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_operator_tool_terminal_transition(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        result: ToolResultEnvelope,
+        command_type: String,
+        raw_input: String,
+        output: String,
+        success: bool,
+    ) -> Result<()> {
+        self.append_events(vec![
+            tool_execution_finished_event(session_id, branch_id, None, result),
+            operator_command_event(
+                session_id,
+                branch_id,
+                command_type,
+                raw_input,
+                output,
+                success,
+            ),
+        ])?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_operator_tool_terminal_transition(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        result: ToolResultEnvelope,
+        command_type: String,
+        raw_input: String,
+        output: String,
+        success: bool,
+        persistence_error: &bt_core::BelltowerError,
+    ) -> Result<()> {
+        self.append_events(vec![
+            tool_execution_finished_event(session_id, branch_id, None, result),
+            operator_command_event(
+                session_id,
+                branch_id,
+                command_type,
+                raw_input,
+                output,
+                success,
+            ),
+            session_error_event(
+                session_id,
+                branch_id,
+                None,
+                SpanKind::Tool,
+                persistence_error,
+            ),
+        ])?;
+        Ok(())
+    }
+
+    pub fn record_turn_failure_transition(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        provider: &str,
         model_id: &str,
         turn_id: TurnId,
-        tool_call: &bt_core::ToolCall,
+        terminal_results: Vec<ToolResultEnvelope>,
         error: &bt_core::BelltowerError,
         latency_ms: u64,
     ) -> Result<()> {
-        let call_id = ToolCallId::new(tool_call.call_id.clone());
-        let tool_name = tool_call.tool_name.clone();
-        let result = ToolResultEnvelope {
-            call_id: call_id.clone(),
-            tool_name: tool_name.clone(),
-            is_error: true,
-            output: serde_json::json!({
-                "error": {
-                    "class": error.class().to_string(),
-                    "code": error.code(),
-                    "message": error.to_string(),
-                    "retryable": error.retryable(),
-                }
-            }),
-            duration_ms: Some(latency_ms),
-        };
+        self.record_turn_failure_transition_with_reason(
+            session_id,
+            branch_id,
+            provider,
+            model_id,
+            turn_id,
+            terminal_results,
+            error,
+            error.code(),
+            latency_ms,
+        )
+    }
 
-        let message = apply_turn_id(
+    pub(super) fn record_turn_failure_transition_with_reason(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        provider: &str,
+        model_id: &str,
+        turn_id: TurnId,
+        terminal_results: Vec<ToolResultEnvelope>,
+        error: &bt_core::BelltowerError,
+        finish_reason: &str,
+        latency_ms: u64,
+    ) -> Result<()> {
+        let mut events = terminal_results
+            .into_iter()
+            .flat_map(|result| {
+                let message = tool_result_message(result.clone());
+                tool_terminal_events(session_id, branch_id, turn_id, result, message)
+            })
+            .collect::<Vec<_>>();
+        let error_span_kind = match error.class() {
+            bt_core::ErrorClass::Provider | bt_core::ErrorClass::Protocol => SpanKind::Llm,
+            bt_core::ErrorClass::Tool => SpanKind::Tool,
+            _ => SpanKind::Agent,
+        };
+        events.push(apply_turn_id(
             EventEnvelope::new(
-                session.session_id,
-                branch.branch_id,
-                SpanKind::Agent,
-                EventPayload::MessageAppended {
-                    message: Message::from_part(
-                        Role::Tool,
-                        MessagePart::ToolResult {
-                            result: result.clone(),
-                        },
-                    ),
-                },
-            ),
-            Some(turn_id),
-        );
-        let tool_finished = apply_turn_id(
-            EventEnvelope::new(
-                session.session_id,
-                branch.branch_id,
-                SpanKind::Tool,
-                EventPayload::ToolExecutionFinished {
-                    call_id,
-                    tool_name,
-                    result,
-                },
-            ),
-            Some(turn_id),
-        );
-        let session_error = apply_turn_id(
-            EventEnvelope::new(
-                session.session_id,
-                branch.branch_id,
-                SpanKind::Tool,
+                session_id,
+                branch_id,
+                error_span_kind,
                 EventPayload::SessionError {
                     class: error.class(),
                     code: error.code().to_owned(),
@@ -229,40 +311,79 @@ impl BelltowerRuntime {
                 serde_json::Value::Bool(error.retryable()),
             ),
             Some(turn_id),
+        ));
+        events.push(
+            EventEnvelope::new(
+                session_id,
+                branch_id,
+                SpanKind::Agent,
+                EventPayload::TurnFinished {
+                    turn_id,
+                    provider: provider.to_owned(),
+                    model: model_id.to_owned(),
+                    status: "failed".to_owned(),
+                    finish_reason: Some(finish_reason.to_owned()),
+                    latency_ms,
+                },
+            )
+            .with_turn_id(turn_id)
+            .with_attribute(
+                bt_core::oi_attrs::LLM_PROVIDER,
+                serde_json::Value::String(provider.to_owned()),
+            )
+            .with_attribute(
+                bt_core::oi_attrs::LLM_MODEL_NAME,
+                serde_json::Value::String(model_id.to_owned()),
+            )
+            .with_attribute(
+                "turn.status",
+                serde_json::Value::String("failed".to_owned()),
+            )
+            .with_attribute(
+                "turn.finish_reason",
+                serde_json::Value::String(finish_reason.to_owned()),
+            ),
         );
-        let turn_finished = EventEnvelope::new(
+        self.append_events(events)?;
+        Ok(())
+    }
+
+    /// Records the terminal outcome when an approved, resumed tool call cannot execute.
+    pub fn record_resumed_tool_failure(
+        &self,
+        session: &SessionRecord,
+        branch: &BranchRecord,
+        connection: &ConnectionDescriptor,
+        model_id: &str,
+        turn_id: TurnId,
+        tool_call: &bt_core::ToolCall,
+        error: &bt_core::BelltowerError,
+        latency_ms: u64,
+    ) -> Result<()> {
+        let result = ToolResultEnvelope {
+            call_id: ToolCallId::new(tool_call.call_id.clone()),
+            tool_name: tool_call.tool_name.clone(),
+            is_error: true,
+            output: serde_json::json!({
+                "error": {
+                    "class": error.class().to_string(),
+                    "code": error.code(),
+                    "message": error.to_string(),
+                    "retryable": error.retryable(),
+                }
+            }),
+            duration_ms: Some(latency_ms),
+        };
+        self.record_turn_failure_transition(
             session.session_id,
             branch.branch_id,
-            SpanKind::Agent,
-            EventPayload::TurnFinished {
-                turn_id,
-                provider: connection.provider.clone(),
-                model: model_id.to_owned(),
-                status: "failed".to_owned(),
-                finish_reason: Some(error.code().to_owned()),
-                latency_ms,
-            },
+            &connection.provider,
+            model_id,
+            turn_id,
+            vec![result],
+            error,
+            latency_ms,
         )
-        .with_turn_id(turn_id)
-        .with_attribute(
-            bt_core::oi_attrs::LLM_PROVIDER,
-            serde_json::Value::String(connection.provider.clone()),
-        )
-        .with_attribute(
-            bt_core::oi_attrs::LLM_MODEL_NAME,
-            serde_json::Value::String(model_id.to_owned()),
-        )
-        .with_attribute(
-            "turn.status",
-            serde_json::Value::String("failed".to_owned()),
-        )
-        .with_attribute(
-            "turn.finish_reason",
-            serde_json::Value::String(error.code().to_owned()),
-        );
-
-        self.append_events(vec![message, tool_finished, session_error, turn_finished])?;
-        Ok(())
     }
 
     pub fn bootstrap_resumed_input_turn(
@@ -287,43 +408,24 @@ impl BelltowerRuntime {
             combine_steer_messages(pending_steers.iter().map(|steer| steer.message.clone()))
         });
         let message_count = current_message_count as u32 + 1 + u32::from(combined_steer.is_some());
-        let mut events = vec![
-            self.turn_started_event(
-                resumable.session.session_id,
-                resumable.branch.branch_id,
-                turn_id,
-                connection.provider.clone(),
-                model_id,
-                message_count,
-                resumable.settings_revision_id,
-                TurnStartSource::InputResume,
-                Some(ToolCallId::new(resumable.tool_call.call_id.clone())),
-            ),
-            apply_turn_id(
-                EventEnvelope::new(
-                    resumable.session.session_id,
-                    resumable.branch.branch_id,
-                    SpanKind::Agent,
-                    EventPayload::MessageAppended {
-                        message: tool_result_message(tool_result.clone()),
-                    },
-                ),
-                Some(turn_id),
-            ),
-            apply_turn_id(
-                EventEnvelope::new(
-                    resumable.session.session_id,
-                    resumable.branch.branch_id,
-                    SpanKind::Tool,
-                    EventPayload::ToolExecutionFinished {
-                        call_id: tool_result.call_id.clone(),
-                        tool_name: tool_result.tool_name.clone(),
-                        result: tool_result,
-                    },
-                ),
-                Some(turn_id),
-            ),
-        ];
+        let mut events = vec![self.turn_started_event(
+            resumable.session.session_id,
+            resumable.branch.branch_id,
+            turn_id,
+            connection.provider.clone(),
+            model_id,
+            message_count,
+            resumable.settings_revision_id,
+            TurnStartSource::InputResume,
+            Some(ToolCallId::new(resumable.tool_call.call_id.clone())),
+        )];
+        events.extend(tool_terminal_events(
+            resumable.session.session_id,
+            resumable.branch.branch_id,
+            turn_id,
+            tool_result.clone(),
+            tool_result_message(tool_result),
+        ));
         self.append_resumed_control_events(
             &mut events,
             resumable.session.session_id,
@@ -916,4 +1018,181 @@ impl BelltowerRuntime {
             .load_session_control(session_id)?
             .is_some_and(|state| state.cancel_requested))
     }
+}
+
+fn tool_terminal_events(
+    session_id: SessionId,
+    branch_id: bt_core::BranchId,
+    turn_id: TurnId,
+    result: ToolResultEnvelope,
+    message: Message,
+) -> Vec<EventEnvelope> {
+    vec![
+        tool_execution_finished_event(session_id, branch_id, Some(turn_id), result.clone()),
+        apply_turn_id(
+            EventEnvelope::new(
+                session_id,
+                branch_id,
+                SpanKind::Agent,
+                EventPayload::MessageAppended { message },
+            ),
+            Some(turn_id),
+        ),
+    ]
+}
+
+fn tool_request_events(
+    session_id: SessionId,
+    branch_id: bt_core::BranchId,
+    turn_id: TurnId,
+    call_id: ToolCallId,
+    tool_name: String,
+    arguments: serde_json::Value,
+    operation: bt_core::ToolOperationContext,
+    message: Message,
+) -> Vec<EventEnvelope> {
+    let mut events = tool_operation_request_events(
+        session_id,
+        branch_id,
+        call_id,
+        tool_name,
+        arguments,
+        operation,
+        Some(turn_id),
+    );
+    events.push(apply_turn_id(
+        EventEnvelope::new(
+            session_id,
+            branch_id,
+            SpanKind::Agent,
+            EventPayload::MessageAppended { message },
+        ),
+        Some(turn_id),
+    ));
+    events
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tool_operation_request_events(
+    session_id: SessionId,
+    branch_id: bt_core::BranchId,
+    call_id: ToolCallId,
+    tool_name: String,
+    arguments: serde_json::Value,
+    operation: bt_core::ToolOperationContext,
+    turn_id: Option<TurnId>,
+) -> Vec<EventEnvelope> {
+    vec![
+        apply_turn_id(
+            EventEnvelope::new(
+                session_id,
+                branch_id,
+                SpanKind::Tool,
+                EventPayload::ToolOperationRecorded {
+                    call_id: call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    operation,
+                },
+            ),
+            turn_id,
+        ),
+        apply_turn_id(
+            EventEnvelope::new(
+                session_id,
+                branch_id,
+                SpanKind::Tool,
+                EventPayload::ToolCallRequested {
+                    call_id,
+                    tool_name,
+                    arguments,
+                },
+            ),
+            turn_id,
+        ),
+    ]
+}
+
+fn tool_execution_finished_event(
+    session_id: SessionId,
+    branch_id: bt_core::BranchId,
+    turn_id: Option<TurnId>,
+    result: ToolResultEnvelope,
+) -> EventEnvelope {
+    apply_turn_id(
+        EventEnvelope::new(
+            session_id,
+            branch_id,
+            SpanKind::Tool,
+            EventPayload::ToolExecutionFinished {
+                call_id: result.call_id.clone(),
+                tool_name: result.tool_name.clone(),
+                result,
+            },
+        ),
+        turn_id,
+    )
+}
+
+fn session_error_event(
+    session_id: SessionId,
+    branch_id: bt_core::BranchId,
+    turn_id: Option<TurnId>,
+    span_kind: SpanKind,
+    error: &bt_core::BelltowerError,
+) -> EventEnvelope {
+    apply_turn_id(
+        EventEnvelope::new(
+            session_id,
+            branch_id,
+            span_kind,
+            EventPayload::SessionError {
+                class: error.class(),
+                code: error.code().to_owned(),
+                message: error.to_string(),
+                retryable: error.retryable(),
+            },
+        )
+        .with_attribute(
+            "error.class",
+            serde_json::Value::String(error.class().to_string()),
+        )
+        .with_attribute(
+            "error.code",
+            serde_json::Value::String(error.code().to_owned()),
+        )
+        .with_attribute(
+            "error.retryable",
+            serde_json::Value::Bool(error.retryable()),
+        ),
+        turn_id,
+    )
+}
+
+fn operator_command_event(
+    session_id: SessionId,
+    branch_id: bt_core::BranchId,
+    command_type: String,
+    raw_input: String,
+    output: String,
+    success: bool,
+) -> EventEnvelope {
+    EventEnvelope::new(
+        session_id,
+        branch_id,
+        SpanKind::Agent,
+        EventPayload::OperatorCommandRecorded {
+            command_type,
+            raw_input: raw_input.clone(),
+            output: output.clone(),
+            success,
+        },
+    )
+    .with_attribute(
+        bt_core::oi_attrs::INPUT_VALUE,
+        serde_json::Value::String(raw_input),
+    )
+    .with_attribute(
+        bt_core::oi_attrs::OUTPUT_VALUE,
+        serde_json::Value::String(output),
+    )
 }

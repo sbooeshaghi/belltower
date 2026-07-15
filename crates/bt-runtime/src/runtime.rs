@@ -56,7 +56,7 @@ pub(super) use types::{PendingToolCallContext, ResumableToolCallKind, TurnBudget
 pub struct BelltowerRuntime {
     config: BelltowerConfig,
     store: Mutex<SqliteSessionStore>,
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     store_append_fault: Mutex<Option<bt_core::BelltowerError>>,
     approvals: Arc<ApprovalState>,
     approval_evaluator: Arc<PolicyApprovalEvaluator>,
