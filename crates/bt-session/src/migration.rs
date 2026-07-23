@@ -218,6 +218,33 @@ CREATE INDEX IF NOT EXISTS idx_queued_message_projection_pending
 CREATE INDEX IF NOT EXISTS idx_steer_projection_pending
     ON steer_projection(session_id, status, source_seq);
 
+CREATE TABLE IF NOT EXISTS related_session_message_projection (
+    session_id             TEXT NOT NULL,
+    message_id             TEXT NOT NULL,
+    direction              TEXT NOT NULL,
+    event_id               TEXT NOT NULL UNIQUE,
+    counterpart_event_id   TEXT NOT NULL,
+    source_session_id      TEXT NOT NULL,
+    source_branch_id       TEXT NOT NULL,
+    caused_by_turn_id      TEXT,
+    destination_session_id TEXT NOT NULL,
+    destination_branch_id  TEXT NOT NULL,
+    kind                   TEXT NOT NULL,
+    delivery_mode          TEXT NOT NULL,
+    in_reply_to            TEXT,
+    message_json           TEXT NOT NULL,
+    status                 TEXT NOT NULL,
+    source_seq             INTEGER NOT NULL,
+    resulting_turn_id      TEXT,
+    created_at             TEXT NOT NULL,
+    resolved_at            TEXT,
+    PRIMARY KEY (session_id, message_id, direction)
+);
+CREATE INDEX IF NOT EXISTS idx_related_session_message_pending
+    ON related_session_message_projection(session_id, direction, status, source_seq);
+CREATE INDEX IF NOT EXISTS idx_related_session_message_peer
+    ON related_session_message_projection(session_id, source_session_id, destination_session_id, source_seq);
+
 CREATE TABLE IF NOT EXISTS session_settings_revision_projection (
     session_id      TEXT NOT NULL,
     settings_revision_id INTEGER NOT NULL,
@@ -296,6 +323,21 @@ pub fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS idx_session_settings_revision_projection_lookup ON session_settings_revision_projection(session_id, settings_revision_id);
          CREATE INDEX IF NOT EXISTS idx_context_manifest_projection_session_branch_seq
              ON context_manifest_projection(session_id, branch_id, recorded_seq_id);
+         CREATE TABLE IF NOT EXISTS related_session_message_projection (
+             session_id TEXT NOT NULL, message_id TEXT NOT NULL, direction TEXT NOT NULL,
+             event_id TEXT NOT NULL UNIQUE, counterpart_event_id TEXT NOT NULL,
+             source_session_id TEXT NOT NULL, source_branch_id TEXT NOT NULL,
+             caused_by_turn_id TEXT, destination_session_id TEXT NOT NULL,
+             destination_branch_id TEXT NOT NULL, kind TEXT NOT NULL,
+             delivery_mode TEXT NOT NULL, in_reply_to TEXT, message_json TEXT NOT NULL,
+             status TEXT NOT NULL, source_seq INTEGER NOT NULL, resulting_turn_id TEXT,
+             created_at TEXT NOT NULL, resolved_at TEXT,
+             PRIMARY KEY (session_id, message_id, direction)
+         );
+         CREATE INDEX IF NOT EXISTS idx_related_session_message_pending
+             ON related_session_message_projection(session_id, direction, status, source_seq);
+         CREATE INDEX IF NOT EXISTS idx_related_session_message_peer
+             ON related_session_message_projection(session_id, source_session_id, destination_session_id, source_seq);
          CREATE TABLE IF NOT EXISTS session_budget_projection (
              session_id TEXT PRIMARY KEY,
              max_wall_clock_seconds INTEGER,

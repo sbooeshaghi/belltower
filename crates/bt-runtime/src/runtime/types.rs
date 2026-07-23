@@ -70,6 +70,16 @@ impl AdmittedTurn {
     }
 
     #[must_use]
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    #[must_use]
+    pub fn branch_id(&self) -> bt_core::BranchId {
+        self.branch_id
+    }
+
+    #[must_use]
     pub fn turn_id(&self) -> TurnId {
         self.turn_id
     }
@@ -116,6 +126,7 @@ pub enum PostTurnControlAction {
     Stop,
     ContinueCurrentBranch(QueuedDispatch),
     ContinueQueuedBranch(QueuedDispatch),
+    ContinueRelatedSessionBranch(QueuedDispatch),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

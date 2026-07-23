@@ -8,11 +8,28 @@ use super::{
     steer_resolution_status, storage_error,
 };
 use bt_core::{
-    BelltowerError, BudgetConfig, CostBreakdown, EventEnvelope, EventPayload, Result, SessionId,
-    TokenUsage,
+    BelltowerError, BudgetConfig, CostBreakdown, EventEnvelope, EventPayload,
+    RelatedSessionDeliveryMode, RelatedSessionMessageDirection, RelatedSessionMessageStatus,
+    Result, SessionId, TokenUsage,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 use time::OffsetDateTime;
+
+fn related_message_direction(direction: &RelatedSessionMessageDirection) -> &'static str {
+    match direction {
+        RelatedSessionMessageDirection::Sent => "sent",
+        RelatedSessionMessageDirection::Received => "received",
+    }
+}
+
+fn related_message_status(status: &RelatedSessionMessageStatus) -> &'static str {
+    match status {
+        RelatedSessionMessageStatus::Delivered => "delivered",
+        RelatedSessionMessageStatus::Pending => "pending",
+        RelatedSessionMessageStatus::Claimed => "claimed",
+        RelatedSessionMessageStatus::Dropped => "dropped",
+    }
+}
 
 impl SqliteSessionStore {
     pub(super) fn refresh_cost_summary_projection(
@@ -187,6 +204,83 @@ impl SqliteSessionStore {
                         format!("{:?}", message.role),
                         serde_json::to_string(message)?,
                         format_time(message.created_at)?
+                    ],
+                )
+                .map_err(storage_error)?;
+            }
+            EventPayload::RelatedSessionMessageRecorded {
+                direction,
+                counterpart_event_id,
+                message,
+            } => {
+                let resolved_pair = tx
+                    .query_row(
+                        "SELECT status, resulting_turn_id, resolved_at
+                         FROM related_session_message_projection
+                         WHERE message_id = ?1 AND status IN ('claimed', 'dropped')
+                         LIMIT 1",
+                        params![message.message_id.to_string()],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(storage_error)?;
+                let default_status =
+                    if matches!(direction, RelatedSessionMessageDirection::Received)
+                        && matches!(message.delivery_mode, RelatedSessionDeliveryMode::Wake)
+                    {
+                        "pending"
+                    } else {
+                        "delivered"
+                    };
+                let (status, resulting_turn_id, resolved_at) = resolved_pair
+                    .map(|(status, turn_id, resolved_at)| (status, turn_id, resolved_at))
+                    .unwrap_or_else(|| (default_status.to_owned(), None, None));
+                tx.execute(
+                    "INSERT INTO related_session_message_projection (
+                        session_id, message_id, direction, event_id, counterpart_event_id,
+                        source_session_id, source_branch_id, caused_by_turn_id,
+                        destination_session_id, destination_branch_id, kind, delivery_mode,
+                        in_reply_to, message_json, status, source_seq, resulting_turn_id,
+                        created_at, resolved_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                    params![
+                        event.session_id.to_string(), message.message_id.to_string(),
+                        related_message_direction(direction), event.event_id.to_string(),
+                        counterpart_event_id.to_string(), message.source_session_id.to_string(),
+                        message.source_branch_id.to_string(),
+                        message.caused_by_turn_id.map(|turn_id| turn_id.to_string()),
+                        message.destination_session_id.to_string(),
+                        message.destination_branch_id.to_string(),
+                        serde_json::to_string(&message.kind)?,
+                        serde_json::to_string(&message.delivery_mode)?,
+                        message.in_reply_to.map(|message_id| message_id.to_string()),
+                        serde_json::to_string(message)?, status, seq_id, resulting_turn_id,
+                        format_time(message.created_at)?, resolved_at,
+                    ],
+                )
+                .map_err(storage_error)?;
+            }
+            EventPayload::RelatedSessionMessageResolved {
+                message_id,
+                status,
+                resulting_turn_id,
+                ..
+            } => {
+                tx.execute(
+                    "UPDATE related_session_message_projection
+                     SET status = ?1, resulting_turn_id = ?2, resolved_at = ?3
+                     WHERE message_id = ?4",
+                    params![
+                        related_message_status(status),
+                        resulting_turn_id.map(|turn_id| turn_id.to_string()),
+                        format_time(event.occurred_at)?,
+                        message_id.to_string(),
                     ],
                 )
                 .map_err(storage_error)?;

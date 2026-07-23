@@ -656,6 +656,41 @@ fn otlp_event_from_envelope(event: &EventEnvelope) -> Value {
     );
     push_optional_string_attr(
         &mut attributes,
+        "belltower.related_message.id",
+        mirrored.related_message_id.as_deref(),
+    );
+    push_optional_string_attr(
+        &mut attributes,
+        "belltower.related_message.direction",
+        mirrored.related_message_direction.as_deref(),
+    );
+    push_optional_string_attr(
+        &mut attributes,
+        "belltower.related_message.peer_session_id",
+        mirrored.related_message_peer_session_id.as_deref(),
+    );
+    push_optional_string_attr(
+        &mut attributes,
+        "belltower.related_message.delivery_mode",
+        mirrored.related_message_delivery_mode.as_deref(),
+    );
+    push_optional_string_attr(
+        &mut attributes,
+        "belltower.related_message.kind",
+        mirrored.related_message_kind.as_deref(),
+    );
+    push_optional_string_attr(
+        &mut attributes,
+        "belltower.related_message.status",
+        mirrored.related_message_status.as_deref(),
+    );
+    push_optional_string_attr(
+        &mut attributes,
+        "belltower.related_message.resulting_turn_id",
+        mirrored.related_message_resulting_turn_id.as_deref(),
+    );
+    push_optional_string_attr(
+        &mut attributes,
         "belltower.status",
         mirrored.status.as_deref(),
     );

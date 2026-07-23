@@ -286,6 +286,64 @@ impl BelltowerRuntime {
         connection_id: Option<ConnectionId>,
         model_id: Option<String>,
     ) -> Result<(SessionRecord, BranchRecord)> {
+        let (session, branch, _) = self.spawn_child_session_transition(
+            parent_session_id,
+            parent_branch_id,
+            parent_turn_id,
+            objective,
+            display_name,
+            connection_id,
+            model_id,
+            false,
+        )?;
+        Ok((session, branch))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_child_session_with_initial_objective(
+        &self,
+        parent_session_id: SessionId,
+        parent_branch_id: bt_core::BranchId,
+        parent_turn_id: Option<TurnId>,
+        objective: String,
+        display_name: Option<String>,
+        connection_id: Option<ConnectionId>,
+        model_id: Option<String>,
+    ) -> Result<(SessionRecord, BranchRecord, RelatedSessionMessageReceipt)> {
+        let (session, branch, receipt) = self.spawn_child_session_transition(
+            parent_session_id,
+            parent_branch_id,
+            parent_turn_id,
+            objective,
+            display_name,
+            connection_id,
+            model_id,
+            true,
+        )?;
+        Ok((
+            session,
+            branch,
+            receipt.expect("initial objective requested"),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_child_session_transition(
+        &self,
+        parent_session_id: SessionId,
+        parent_branch_id: bt_core::BranchId,
+        parent_turn_id: Option<TurnId>,
+        objective: String,
+        display_name: Option<String>,
+        connection_id: Option<ConnectionId>,
+        model_id: Option<String>,
+        include_initial_objective: bool,
+    ) -> Result<(
+        SessionRecord,
+        BranchRecord,
+        Option<RelatedSessionMessageReceipt>,
+    )> {
+        self.validate_subagent_spawn(parent_session_id)?;
         let objective = objective.trim().to_owned();
         if objective.is_empty() {
             return Err(bt_core::BelltowerError::Protocol(
@@ -401,37 +459,79 @@ impl BelltowerRuntime {
                 EventPayload::SessionSpawned {
                     child_session_id: child_session.session_id,
                     child_branch_id: child_branch.branch_id,
-                    objective,
+                    objective: objective.clone(),
                 },
             ),
             origin_turn_id,
         );
 
         self.take_store_append_fault_for_test()?;
-        let events = vec![
+        let mut events = vec![
             spawn_requested,
             child_started,
             child_handoff,
             spawn_completed,
         ];
+        let initial_message = include_initial_objective
+            .then(|| {
+                Self::related_session_message_events(
+                    parent_session.session_id,
+                    parent_branch.branch_id,
+                    origin_turn_id,
+                    child_session.session_id,
+                    child_branch.branch_id,
+                    RelatedSessionMessageKind::Instruction,
+                    RelatedSessionDeliveryMode::Wake,
+                    None,
+                    objective.clone(),
+                    Vec::new(),
+                )
+            })
+            .transpose()?;
+        if let Some((_, sent, received)) = &initial_message {
+            events.push(sent.clone());
+            events.push(received.clone());
+        }
         let mut store = self
             .store
             .lock()
             .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
-        let seq_ids = store.commit_child_session_spawn(
-            &child_session,
-            &child_branch,
-            &events[0],
-            &events[1],
-            &events[2],
-            &events[3],
-        )?;
+        let seq_ids = if initial_message.is_some() {
+            store.commit_child_session_spawn_with_initial_message(
+                &child_session,
+                &child_branch,
+                &events[0],
+                &events[1],
+                &events[2],
+                &events[3],
+                &events[4],
+                &events[5],
+            )?
+        } else {
+            store.commit_child_session_spawn(
+                &child_session,
+                &child_branch,
+                &events[0],
+                &events[1],
+                &events[2],
+                &events[3],
+            )?
+        };
         drop(store);
+        let receipt =
+            initial_message.map(|(message, sent, received)| RelatedSessionMessageReceipt {
+                message_id: message.message_id,
+                sent_event_id: sent.event_id,
+                sent_seq_id: seq_ids[4],
+                received_event_id: received.event_id,
+                received_seq_id: seq_ids[5],
+                status: RelatedSessionMessageStatus::Pending,
+            });
         for (event, seq_id) in events.into_iter().zip(seq_ids) {
             self.publish_committed_event(event, seq_id);
         }
 
-        Ok((child_session, child_branch))
+        Ok((child_session, child_branch, receipt))
     }
 
     pub fn update_session_settings(

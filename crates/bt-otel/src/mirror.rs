@@ -27,6 +27,13 @@ pub(crate) struct MirroredEventFields {
     pub(crate) model: Option<String>,
     pub(crate) tool_name: Option<String>,
     pub(crate) call_id: Option<String>,
+    pub(crate) related_message_id: Option<String>,
+    pub(crate) related_message_direction: Option<String>,
+    pub(crate) related_message_peer_session_id: Option<String>,
+    pub(crate) related_message_delivery_mode: Option<String>,
+    pub(crate) related_message_kind: Option<String>,
+    pub(crate) related_message_status: Option<String>,
+    pub(crate) related_message_resulting_turn_id: Option<String>,
     pub(crate) status: Option<String>,
     pub(crate) finish_reason: Option<String>,
     pub(crate) approval_decision: Option<String>,
@@ -87,6 +94,13 @@ pub fn mirror_event(event: &EventEnvelope) {
         model = ?fields.model,
         tool_name = ?fields.tool_name,
         call_id = ?fields.call_id,
+        related_message_id = ?fields.related_message_id,
+        related_message_direction = ?fields.related_message_direction,
+        related_message_peer_session_id = ?fields.related_message_peer_session_id,
+        related_message_delivery_mode = ?fields.related_message_delivery_mode,
+        related_message_kind = ?fields.related_message_kind,
+        related_message_status = ?fields.related_message_status,
+        related_message_resulting_turn_id = ?fields.related_message_resulting_turn_id,
         status = ?fields.status,
         finish_reason = ?fields.finish_reason,
         approval_decision = ?fields.approval_decision,
@@ -146,6 +160,13 @@ pub(crate) fn mirrored_event_fields(event: &EventEnvelope) -> MirroredEventField
         model: None,
         tool_name: None,
         call_id: None,
+        related_message_id: None,
+        related_message_direction: None,
+        related_message_peer_session_id: None,
+        related_message_delivery_mode: None,
+        related_message_kind: None,
+        related_message_status: None,
+        related_message_resulting_turn_id: None,
         status: None,
         finish_reason: None,
         approval_decision: None,
@@ -244,6 +265,64 @@ pub(crate) fn mirrored_event_fields(event: &EventEnvelope) -> MirroredEventField
         } => {
             fields.status = Some(child_session_id.to_string());
             fields.output_preview = Some(truncate_string(reason));
+        }
+        EventPayload::RelatedSessionMessageRecorded {
+            direction,
+            counterpart_event_id,
+            message,
+        } => {
+            fields.status = Some(format!("{direction:?}"));
+            fields.related_message_id = Some(message.message_id.to_string());
+            fields.related_message_direction = Some(format!("{direction:?}"));
+            fields.related_message_peer_session_id = Some(
+                if matches!(direction, bt_core::RelatedSessionMessageDirection::Sent) {
+                    message.destination_session_id
+                } else {
+                    message.source_session_id
+                }
+                .to_string(),
+            );
+            fields.related_message_delivery_mode = Some(format!("{:?}", message.delivery_mode));
+            fields.related_message_kind = Some(format!("{:?}", message.kind));
+            fields.related_message_status = Some(
+                if matches!(direction, bt_core::RelatedSessionMessageDirection::Received)
+                    && matches!(
+                        message.delivery_mode,
+                        bt_core::RelatedSessionDeliveryMode::Wake
+                    )
+                {
+                    "Pending"
+                } else {
+                    "Delivered"
+                }
+                .to_owned(),
+            );
+            fields.finish_reason = Some(format!(
+                "delivery={:?} peer={} counterpart_event={counterpart_event_id}",
+                message.delivery_mode,
+                if matches!(direction, bt_core::RelatedSessionMessageDirection::Sent) {
+                    message.destination_session_id
+                } else {
+                    message.source_session_id
+                }
+            ));
+            fields.text_preview = Some(truncate_string(&message.text));
+        }
+        EventPayload::RelatedSessionMessageResolved {
+            message_id,
+            status,
+            resulting_turn_id,
+            reason,
+        } => {
+            fields.status = Some(format!("{status:?}"));
+            fields.related_message_id = Some(message_id.to_string());
+            fields.related_message_status = Some(format!("{status:?}"));
+            fields.related_message_resulting_turn_id =
+                resulting_turn_id.map(|turn_id| turn_id.to_string());
+            fields.finish_reason = Some(format!(
+                "message={message_id} resulting_turn={resulting_turn_id:?}"
+            ));
+            fields.output_preview = reason.as_ref().map(|reason| truncate_string(reason));
         }
         EventPayload::SessionSettingsUpdated {
             settings_revision_id,
@@ -611,5 +690,6 @@ pub(crate) fn turn_start_source_label(source: &bt_core::TurnStartSource) -> &'st
         bt_core::TurnStartSource::InputResume => "input_resume",
         bt_core::TurnStartSource::SteerFollowUp => "steer_follow_up",
         bt_core::TurnStartSource::QueuedFollowUp => "queued_follow_up",
+        bt_core::TurnStartSource::RelatedSessionMessage => "related_session_message",
     }
 }

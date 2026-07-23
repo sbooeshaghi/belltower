@@ -13,10 +13,13 @@ use crate::{
 use bt_core::{
     ApprovalDecision, ApprovalDecisionSource, ApprovalScope, BelltowerError, BranchRecord,
     BudgetConfig, CompletionRequest, ConnectionId, ContextManifest, ContextMessageSourceRef,
-    EventEnvelope, EventPayload, InstructionDocument, Message, PortableHash, Role,
-    SessionBundleArtifactMode, SessionBundleManifest, SessionNodeRef, SessionRecord, SessionStatus,
-    SessionToolMode, SpanKind, ToolCallId, ToolOperationContext, ToolResultEnvelope, TurnId,
-    TurnInstructionProvenance, TurnStartSource, default_settings_revision_id,
+    EventEnvelope, EventId, EventPayload, InstructionDocument, MAX_RELATED_SESSION_DESCENDANTS,
+    Message, PortableHash, RelatedSessionDeliveryMode, RelatedSessionMessage,
+    RelatedSessionMessageDirection, RelatedSessionMessageId, RelatedSessionMessageKind,
+    RelatedSessionMessageStatus, Role, SessionBundleArtifactMode, SessionBundleManifest,
+    SessionNodeRef, SessionRecord, SessionStatus, SessionToolMode, SpanKind, ToolCallId,
+    ToolOperationContext, ToolResultEnvelope, TurnId, TurnInstructionProvenance, TurnStartSource,
+    default_settings_revision_id,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -150,6 +153,121 @@ fn cancel_clear_event(session: &SessionRecord, branch: &BranchRecord) -> EventEn
     )
 }
 
+fn child_session(
+    parent: &SessionRecord,
+    parent_branch: &BranchRecord,
+) -> (SessionRecord, BranchRecord) {
+    let (mut child, child_branch) = sample_session();
+    child.parent_session_id = Some(parent.session_id);
+    child.parent_branch_id = Some(parent_branch.branch_id);
+    child.objective = Some("investigate the delegated question".to_owned());
+    (child, child_branch)
+}
+
+fn related_message_events(
+    source: &SessionRecord,
+    source_branch: &BranchRecord,
+    destination: &SessionRecord,
+    destination_branch: &BranchRecord,
+    message_id: RelatedSessionMessageId,
+    text: &str,
+    delivery_mode: RelatedSessionDeliveryMode,
+) -> (EventEnvelope, EventEnvelope) {
+    let message = RelatedSessionMessage {
+        message_id,
+        context_message_id: bt_core::MessageId::new(),
+        source_session_id: source.session_id,
+        source_branch_id: source_branch.branch_id,
+        caused_by_turn_id: None,
+        destination_session_id: destination.session_id,
+        destination_branch_id: destination_branch.branch_id,
+        kind: RelatedSessionMessageKind::Instruction,
+        delivery_mode,
+        in_reply_to: None,
+        text: text.to_owned(),
+        artifact_refs: Vec::new(),
+        created_at: OffsetDateTime::now_utc(),
+    };
+    let sent_event_id = EventId::new();
+    let received_event_id = EventId::new();
+    let mut sent = EventEnvelope::new(
+        source.session_id,
+        source_branch.branch_id,
+        SpanKind::Chain,
+        EventPayload::RelatedSessionMessageRecorded {
+            direction: RelatedSessionMessageDirection::Sent,
+            counterpart_event_id: received_event_id,
+            message: message.clone(),
+        },
+    );
+    sent.event_id = sent_event_id;
+    let mut received = EventEnvelope::new(
+        destination.session_id,
+        destination_branch.branch_id,
+        SpanKind::Chain,
+        EventPayload::RelatedSessionMessageRecorded {
+            direction: RelatedSessionMessageDirection::Received,
+            counterpart_event_id: sent_event_id,
+            message,
+        },
+    );
+    received.event_id = received_event_id;
+    (sent, received)
+}
+
+fn child_spawn_events(
+    parent: &SessionRecord,
+    parent_branch: &BranchRecord,
+    child: &SessionRecord,
+    child_branch: &BranchRecord,
+) -> [EventEnvelope; 4] {
+    let objective = child.objective.clone().expect("child objective");
+    [
+        EventEnvelope::new(
+            parent.session_id,
+            parent_branch.branch_id,
+            SpanKind::Chain,
+            EventPayload::SessionSpawnRequested {
+                child_session_id: child.session_id,
+                objective: objective.clone(),
+                connection_id: child.connection_id.to_string(),
+                model_id: child.model_id.clone(),
+            },
+        ),
+        EventEnvelope::new(
+            child.session_id,
+            child_branch.branch_id,
+            SpanKind::Session,
+            EventPayload::SessionStarted {
+                project_root: child.project_root.to_string(),
+                connection_id: child.connection_id.to_string(),
+            },
+        ),
+        EventEnvelope::new(
+            child.session_id,
+            child_branch.branch_id,
+            SpanKind::Chain,
+            EventPayload::SessionHandoffRecorded {
+                parent_session_id: parent.session_id,
+                parent_branch_id: parent_branch.branch_id,
+                parent_turn_id: child.parent_turn_id,
+                objective: objective.clone(),
+                summary: objective.clone(),
+            },
+        ),
+        EventEnvelope::new(
+            parent.session_id,
+            parent_branch.branch_id,
+            SpanKind::Chain,
+            EventPayload::SessionSpawned {
+                child_session_id: child.session_id,
+                child_branch_id: child_branch.branch_id,
+                objective,
+            },
+        ),
+    ]
+}
+
 #[test]
 fn migrations_and_session_creation_work() {
     let file = NamedTempFile::new().expect("tempfile");
@@ -172,7 +290,207 @@ fn migrations_and_session_creation_work() {
 }
 
 #[test]
-fn failed_child_spawn_rolls_back_child_and_workflow_events() {
+fn related_session_delivery_is_atomic_idempotent_and_lineage_scoped() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (parent, parent_branch) = sample_session();
+    store
+        .create_session(&parent, &parent_branch)
+        .expect("create parent");
+    let (child, child_branch) = child_session(&parent, &parent_branch);
+    store
+        .create_session(&child, &child_branch)
+        .expect("create child");
+
+    let message_id = RelatedSessionMessageId::new();
+    let (sent, received) = related_message_events(
+        &parent,
+        &parent_branch,
+        &child,
+        &child_branch,
+        message_id,
+        "test the counterexample",
+        RelatedSessionDeliveryMode::Wake,
+    );
+    let receipt = store
+        .commit_related_session_message(&sent, &received)
+        .expect("commit message");
+    let retried = store
+        .commit_related_session_message(&sent, &received)
+        .expect("retry message");
+    assert_eq!(receipt, retried);
+    assert_eq!(receipt.status, RelatedSessionMessageStatus::Pending);
+
+    let parent_messages = store
+        .load_related_session_messages(parent.session_id)
+        .expect("parent messages");
+    let child_messages = store
+        .load_related_session_messages(child.session_id)
+        .expect("child messages");
+    assert_eq!(parent_messages.len(), 1);
+    assert_eq!(child_messages.len(), 1);
+    assert_eq!(
+        parent_messages[0].direction,
+        RelatedSessionMessageDirection::Sent
+    );
+    assert_eq!(
+        child_messages[0].direction,
+        RelatedSessionMessageDirection::Received
+    );
+
+    let (changed_sent, changed_received) = related_message_events(
+        &parent,
+        &parent_branch,
+        &child,
+        &child_branch,
+        message_id,
+        "different content",
+        RelatedSessionDeliveryMode::Wake,
+    );
+    assert!(matches!(
+        store.commit_related_session_message(&changed_sent, &changed_received),
+        Err(BelltowerError::Protocol(_))
+    ));
+
+    let (unrelated, unrelated_branch) = sample_session();
+    store
+        .create_session(&unrelated, &unrelated_branch)
+        .expect("create unrelated session");
+    let (unrelated_sent, unrelated_received) = related_message_events(
+        &parent,
+        &parent_branch,
+        &unrelated,
+        &unrelated_branch,
+        RelatedSessionMessageId::new(),
+        "this must not cross unrelated sessions",
+        RelatedSessionDeliveryMode::Notify,
+    );
+    assert!(matches!(
+        store.commit_related_session_message(&unrelated_sent, &unrelated_received),
+        Err(BelltowerError::Protocol(_))
+    ));
+}
+
+#[test]
+fn related_session_wake_survives_restart_and_claims_in_order() {
+    let file = NamedTempFile::new().expect("tempfile");
+    let (parent, parent_branch) = sample_session();
+    let (child, child_branch) = child_session(&parent, &parent_branch);
+    let first_message_id = RelatedSessionMessageId::new();
+    let second_message_id = RelatedSessionMessageId::new();
+    {
+        let mut store = SqliteSessionStore::open(file.path()).expect("store");
+        store
+            .create_session(&parent, &parent_branch)
+            .expect("create parent");
+        store
+            .create_session(&child, &child_branch)
+            .expect("create child");
+        for (message_id, text) in [
+            (first_message_id, "first instruction"),
+            (second_message_id, "second instruction"),
+        ] {
+            let (sent, received) = related_message_events(
+                &parent,
+                &parent_branch,
+                &child,
+                &child_branch,
+                message_id,
+                text,
+                RelatedSessionDeliveryMode::Wake,
+            );
+            store
+                .commit_related_session_message(&sent, &received)
+                .expect("commit wake message");
+        }
+    }
+
+    let mut store = SqliteSessionStore::open(file.path()).expect("reopen store");
+    let pending = store
+        .load_pending_related_session_messages(child.session_id)
+        .expect("pending messages");
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].message.message_id, first_message_id);
+
+    let stale_turn_id = TurnId::new();
+    let stale_events = vec![
+        EventEnvelope::new(
+            child.session_id,
+            child_branch.branch_id,
+            SpanKind::Chain,
+            EventPayload::RelatedSessionMessageResolved {
+                message_id: second_message_id,
+                status: RelatedSessionMessageStatus::Claimed,
+                resulting_turn_id: Some(stale_turn_id),
+                reason: None,
+            },
+        ),
+        turn_started_event_with_source(
+            &child,
+            &child_branch,
+            stale_turn_id,
+            TurnStartSource::RelatedSessionMessage,
+        ),
+    ];
+    assert_eq!(
+        store
+            .claim_related_message_continuation(
+                child.session_id,
+                second_message_id,
+                child.settings_revision_id,
+                &stale_events,
+            )
+            .expect("out-of-order claim"),
+        ContinuationClaim::Stale
+    );
+
+    let turn_id = TurnId::new();
+    let claim_events = vec![
+        EventEnvelope::new(
+            child.session_id,
+            child_branch.branch_id,
+            SpanKind::Chain,
+            EventPayload::RelatedSessionMessageResolved {
+                message_id: first_message_id,
+                status: RelatedSessionMessageStatus::Claimed,
+                resulting_turn_id: Some(turn_id),
+                reason: None,
+            },
+        ),
+        turn_started_event_with_source(
+            &child,
+            &child_branch,
+            turn_id,
+            TurnStartSource::RelatedSessionMessage,
+        ),
+    ];
+    assert!(matches!(
+        store
+            .claim_related_message_continuation(
+                child.session_id,
+                first_message_id,
+                child.settings_revision_id,
+                &claim_events,
+            )
+            .expect("claim first message"),
+        ContinuationClaim::Claimed { .. }
+    ));
+    let pending = store
+        .load_pending_related_session_messages(child.session_id)
+        .expect("remaining pending messages");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].message.message_id, second_message_id);
+    let sender_messages = store
+        .load_related_session_messages(parent.session_id)
+        .expect("sender messages");
+    assert_eq!(
+        sender_messages[0].status,
+        RelatedSessionMessageStatus::Claimed
+    );
+    assert_eq!(sender_messages[0].resulting_turn_id, Some(turn_id));
+}
+
+#[test]
+fn failed_child_spawn_with_initial_message_rolls_back_everything() {
     let mut store = SqliteSessionStore::open_in_memory().expect("store");
     let (parent_session, parent_branch) = sample_session();
     store
@@ -225,16 +543,27 @@ fn failed_child_spawn_rolls_back_child_and_workflow_events() {
             objective: "inspect the evidence".to_owned(),
         },
     );
-    spawn_completed.event_id = spawn_requested.event_id;
+    let (sent, received) = related_message_events(
+        &parent_session,
+        &parent_branch,
+        &child_session,
+        &child_branch,
+        RelatedSessionMessageId::new(),
+        "inspect the evidence",
+        RelatedSessionDeliveryMode::Wake,
+    );
+    spawn_completed.event_id = sent.event_id;
 
     let error = store
-        .commit_child_session_spawn(
+        .commit_child_session_spawn_with_initial_message(
             &child_session,
             &child_branch,
             &spawn_requested,
             &child_started,
             &child_handoff,
             &spawn_completed,
+            &sent,
+            &received,
         )
         .expect_err("duplicate event id must fail the spawn transaction");
     assert!(matches!(error, BelltowerError::Storage(_)));
@@ -255,6 +584,50 @@ fn failed_child_spawn_rolls_back_child_and_workflow_events() {
             .load_all_events(child_session.session_id)
             .expect("child events")
             .is_empty()
+    );
+}
+
+#[test]
+fn child_spawn_transaction_enforces_lineage_descendant_limit() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (parent, parent_branch) = sample_session();
+    store
+        .create_session(&parent, &parent_branch)
+        .expect("create parent");
+
+    for _ in 0..MAX_RELATED_SESSION_DESCENDANTS {
+        let (child, child_branch) = child_session(&parent, &parent_branch);
+        let events = child_spawn_events(&parent, &parent_branch, &child, &child_branch);
+        store
+            .commit_child_session_spawn(
+                &child,
+                &child_branch,
+                &events[0],
+                &events[1],
+                &events[2],
+                &events[3],
+            )
+            .expect("spawn within lineage bound");
+    }
+
+    let (overflow, overflow_branch) = child_session(&parent, &parent_branch);
+    let events = child_spawn_events(&parent, &parent_branch, &overflow, &overflow_branch);
+    let error = store
+        .commit_child_session_spawn(
+            &overflow,
+            &overflow_branch,
+            &events[0],
+            &events[1],
+            &events[2],
+            &events[3],
+        )
+        .expect_err("the store must reject a lineage overflow");
+    assert!(error.to_string().contains("subagent lineage limit"));
+    assert!(
+        store
+            .load_session(overflow.session_id)
+            .expect("overflow child lookup")
+            .is_none()
     );
 }
 
@@ -3253,6 +3626,117 @@ fn portable_session_bundle_import_round_trips_canonical_evidence() {
         bundle_event_hashes(reexported_dir.path()),
         original_event_hashes
     );
+}
+
+#[test]
+fn portable_session_bundles_round_trip_related_session_mailboxes() {
+    let file = NamedTempFile::new().expect("tempfile");
+    let mut source = SqliteSessionStore::open(file.path()).expect("source store");
+    let (parent, parent_branch) = sample_session();
+    source
+        .create_session(&parent, &parent_branch)
+        .expect("create parent");
+    let (child, child_branch) = child_session(&parent, &parent_branch);
+    source
+        .create_session(&child, &child_branch)
+        .expect("create child");
+
+    let message_id = RelatedSessionMessageId::new();
+    let (sent, received) = related_message_events(
+        &parent,
+        &parent_branch,
+        &child,
+        &child_branch,
+        message_id,
+        "try the alternate model",
+        RelatedSessionDeliveryMode::Wake,
+    );
+    source
+        .commit_related_session_message(&sent, &received)
+        .expect("commit related message");
+    let turn_id = TurnId::new();
+    let claim_events = vec![
+        EventEnvelope::new(
+            child.session_id,
+            child_branch.branch_id,
+            SpanKind::Chain,
+            EventPayload::RelatedSessionMessageResolved {
+                message_id,
+                status: RelatedSessionMessageStatus::Claimed,
+                resulting_turn_id: Some(turn_id),
+                reason: Some("claimed before export".to_owned()),
+            },
+        ),
+        turn_started_event_with_source(
+            &child,
+            &child_branch,
+            turn_id,
+            TurnStartSource::RelatedSessionMessage,
+        ),
+    ];
+    assert!(matches!(
+        source
+            .claim_related_message_continuation(
+                child.session_id,
+                message_id,
+                child.settings_revision_id,
+                &claim_events,
+            )
+            .expect("claim related message"),
+        ContinuationClaim::Claimed { .. }
+    ));
+
+    let parent_bundle = tempdir().expect("parent bundle");
+    let child_bundle = tempdir().expect("child bundle");
+    source
+        .export_session_bundle_directory(parent.session_id, parent_bundle.path())
+        .expect("export parent bundle");
+    source
+        .export_session_bundle_directory(child.session_id, child_bundle.path())
+        .expect("export child bundle");
+
+    for bundle in [&parent_bundle, &child_bundle] {
+        let events = fs::read_to_string(bundle.path().join(SESSION_BT_EVENTS))
+            .expect("related-session events");
+        assert!(events.contains("session.related_message.recorded"));
+    }
+
+    let mut imported = SqliteSessionStore::open_in_memory().expect("import store");
+    imported
+        .import_session_bundle_directory(child_bundle.path())
+        .expect("import child bundle");
+    imported
+        .import_session_bundle_directory(parent_bundle.path())
+        .expect("import parent bundle after child bundle");
+
+    let parent_messages = imported
+        .load_related_session_messages(parent.session_id)
+        .expect("parent mailbox");
+    let child_messages = imported
+        .load_related_session_messages(child.session_id)
+        .expect("child mailbox");
+    assert_eq!(parent_messages.len(), 1);
+    assert_eq!(child_messages.len(), 1);
+    assert_eq!(parent_messages[0].message.message_id, message_id);
+    assert_eq!(child_messages[0].message.message_id, message_id);
+    assert_eq!(
+        parent_messages[0].direction,
+        RelatedSessionMessageDirection::Sent
+    );
+    assert_eq!(
+        child_messages[0].direction,
+        RelatedSessionMessageDirection::Received
+    );
+    assert_eq!(
+        parent_messages[0].status,
+        RelatedSessionMessageStatus::Claimed
+    );
+    assert_eq!(
+        child_messages[0].status,
+        RelatedSessionMessageStatus::Claimed
+    );
+    assert_eq!(parent_messages[0].resulting_turn_id, Some(turn_id));
+    assert_eq!(child_messages[0].resulting_turn_id, Some(turn_id));
 }
 
 #[test]

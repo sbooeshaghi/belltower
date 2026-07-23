@@ -1,9 +1,11 @@
 use crate::{CompletionCostReprojector, ReprojectionReport, StoredSessionEvent, apply_migrations};
 use bt_core::{
     ApprovalScope, BelltowerError, BranchHead, BranchId, BranchRecord, BudgetConfig, ConnectionId,
-    EventEnvelope, EventPayload, Message, Result, Role, SessionId, SessionRecord,
-    SessionSettingsSnapshot, SessionToolMode, SpanKind, ToolCallId, ToolOperationContext, TurnId,
-    TurnStartSource,
+    EventEnvelope, EventPayload, MAX_RELATED_SESSION_DEPTH, MAX_RELATED_SESSION_DESCENDANTS,
+    Message, RelatedSessionDeliveryMode, RelatedSessionMessage, RelatedSessionMessageDirection,
+    RelatedSessionMessageId, RelatedSessionMessageReceipt, RelatedSessionMessageRecord,
+    RelatedSessionMessageStatus, Result, Role, SessionId, SessionRecord, SessionSettingsSnapshot,
+    SessionToolMode, SpanKind, ToolCallId, ToolOperationContext, TurnId, TurnStartSource,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::HashMap;
@@ -12,6 +14,51 @@ use std::time::Duration;
 use time::OffsetDateTime;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn parse_related_message_status(value: &str) -> Result<RelatedSessionMessageStatus> {
+    match value {
+        "delivered" => Ok(RelatedSessionMessageStatus::Delivered),
+        "pending" => Ok(RelatedSessionMessageStatus::Pending),
+        "claimed" => Ok(RelatedSessionMessageStatus::Claimed),
+        "dropped" => Ok(RelatedSessionMessageStatus::Dropped),
+        other => Err(BelltowerError::Storage(format!(
+            "unknown related-session message status `{other}`"
+        ))),
+    }
+}
+
+fn parse_related_message_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RelatedSessionMessageRecord> {
+    let message_json: String = row.get(0)?;
+    let direction: String = row.get(1)?;
+    let status: String = row.get(2)?;
+    let event_id: String = row.get(3)?;
+    let counterpart_event_id: String = row.get(4)?;
+    let resulting_turn_id: Option<String> = row.get(6)?;
+    let resolved_at: Option<String> = row.get(7)?;
+    Ok(RelatedSessionMessageRecord {
+        message: serde_json::from_str(&message_json).map_err(to_sql_conversion)?,
+        direction: match direction.as_str() {
+            "sent" => RelatedSessionMessageDirection::Sent,
+            "received" => RelatedSessionMessageDirection::Received,
+            other => {
+                return Err(to_sql_conversion(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown related-session message direction `{other}`"),
+                )));
+            }
+        },
+        status: parse_related_message_status(&status).map_err(to_sql_conversion)?,
+        event_id: event_id.parse().map_err(to_sql_conversion)?,
+        counterpart_event_id: counterpart_event_id.parse().map_err(to_sql_conversion)?,
+        seq_id: row.get(5)?,
+        resulting_turn_id: resulting_turn_id
+            .map(|turn_id| turn_id.parse().map_err(to_sql_conversion))
+            .transpose()?,
+        resolved_at: resolved_at.map(parse_time).transpose()?,
+    })
+}
 
 #[derive(Debug)]
 pub struct SqliteSessionStore {
@@ -39,11 +86,12 @@ pub use types::{
     ApprovalProjection, ChunkPage, CommittedBudgetCheckpoint, CommittedBudgetConfiguration,
     CommittedSessionSettingsUpdate, ContextManifestProjection, ContextMessageRecord,
     ContinuationClaim, CostSummaryProjection, PlanProjection, QueuedMessageProjection,
-    RawChunkInsert, RawChunkRecord, RecordedOperatorCommandRecord, ResumedContinuationKind,
-    ResumedTurnRecoveryRecord, ReusableApprovalProjection, SequencedMessageRecord,
-    SessionBudgetProjection, SessionControlProjection, SessionInspectionMetrics,
-    SessionSettingsRevisionProjection, SessionTurnAdmission, SteerProjection,
-    ToolOperationRecoveryRecord, ToolRunProjection, TranscriptPage, TurnRecoveryRecord,
+    RawChunkInsert, RawChunkRecord, RecordedOperatorCommandRecord, RelatedMessageProjection,
+    ResumedContinuationKind, ResumedTurnRecoveryRecord, ReusableApprovalProjection,
+    SequencedMessageRecord, SessionBudgetProjection, SessionControlProjection,
+    SessionInspectionMetrics, SessionSettingsRevisionProjection, SessionTurnAdmission,
+    SteerProjection, ToolOperationRecoveryRecord, ToolRunProjection, TranscriptPage,
+    TurnRecoveryRecord,
 };
 
 impl SqliteSessionStore {
@@ -82,6 +130,51 @@ impl SqliteSessionStore {
         child_started: &EventEnvelope,
         child_handoff: &EventEnvelope,
         spawn_completed: &EventEnvelope,
+    ) -> Result<Vec<i64>> {
+        self.commit_child_session_spawn_transition(
+            child_session,
+            child_branch,
+            spawn_requested,
+            child_started,
+            child_handoff,
+            spawn_completed,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_child_session_spawn_with_initial_message(
+        &mut self,
+        child_session: &SessionRecord,
+        child_branch: &BranchRecord,
+        spawn_requested: &EventEnvelope,
+        child_started: &EventEnvelope,
+        child_handoff: &EventEnvelope,
+        spawn_completed: &EventEnvelope,
+        sent: &EventEnvelope,
+        received: &EventEnvelope,
+    ) -> Result<Vec<i64>> {
+        self.commit_child_session_spawn_transition(
+            child_session,
+            child_branch,
+            spawn_requested,
+            child_started,
+            child_handoff,
+            spawn_completed,
+            Some((sent, received)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_child_session_spawn_transition(
+        &mut self,
+        child_session: &SessionRecord,
+        child_branch: &BranchRecord,
+        spawn_requested: &EventEnvelope,
+        child_started: &EventEnvelope,
+        child_handoff: &EventEnvelope,
+        spawn_completed: &EventEnvelope,
+        initial_message: Option<(&EventEnvelope, &EventEnvelope)>,
     ) -> Result<Vec<i64>> {
         let objective = child_session.objective.as_deref().ok_or_else(|| {
             BelltowerError::InvalidState("child session spawn requires an objective".to_owned())
@@ -154,21 +247,338 @@ impl SqliteSessionStore {
             ));
         }
 
-        let tx = self.connection.transaction().map_err(storage_error)?;
+        if let Some((sent, received)) = initial_message {
+            let message = Self::validate_related_session_message_envelopes(sent, received)?;
+            if message.source_session_id != parent_session_id
+                || message.source_branch_id != parent_branch_id
+                || message.destination_session_id != child_session.session_id
+                || message.destination_branch_id != child_branch.branch_id
+                || !matches!(message.delivery_mode, RelatedSessionDeliveryMode::Wake)
+            {
+                return Err(BelltowerError::InvalidState(
+                    "initial child message does not match the canonical spawn".to_owned(),
+                ));
+            }
+        }
+
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        Self::ensure_child_spawn_bounds_in_tx(&tx, parent_session_id)?;
         Self::insert_session_in_tx(&tx, child_session)?;
         Self::insert_session_settings_revision_in_tx(&tx, child_session)?;
         Self::insert_branch_in_tx(&tx, child_branch)?;
-        let seq_ids = Self::append_events_in_tx(
-            &tx,
-            &[
-                spawn_requested.clone(),
-                child_started.clone(),
-                child_handoff.clone(),
-                spawn_completed.clone(),
-            ],
-        )?;
+        let mut events = vec![
+            spawn_requested.clone(),
+            child_started.clone(),
+            child_handoff.clone(),
+            spawn_completed.clone(),
+        ];
+        if let Some((sent, received)) = initial_message {
+            let message = Self::validate_related_session_message_envelopes(sent, received)?;
+            Self::ensure_related_session_message_constraints_in_tx(&tx, message)?;
+            events.push(sent.clone());
+            events.push(received.clone());
+        }
+        let seq_ids = Self::append_events_in_tx(&tx, &events)?;
         tx.commit().map_err(storage_error)?;
         Ok(seq_ids)
+    }
+
+    pub fn commit_related_session_message(
+        &mut self,
+        sent: &EventEnvelope,
+        received: &EventEnvelope,
+    ) -> Result<RelatedSessionMessageReceipt> {
+        let sent_message = Self::validate_related_session_message_envelopes(sent, received)?;
+
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        if let Some(receipt) = Self::load_related_message_receipt_in_tx(
+            &tx,
+            sent_message.source_session_id,
+            sent_message.destination_session_id,
+            sent_message.message_id,
+            Some(sent_message),
+        )? {
+            tx.commit().map_err(storage_error)?;
+            return Ok(receipt);
+        }
+
+        Self::ensure_related_session_message_constraints_in_tx(&tx, sent_message)?;
+
+        let sent_seq_id = Self::append_event_in_tx(&tx, sent)?;
+        let received_seq_id = Self::append_event_in_tx(&tx, received)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(RelatedSessionMessageReceipt {
+            message_id: sent_message.message_id,
+            sent_event_id: sent.event_id,
+            sent_seq_id,
+            received_event_id: received.event_id,
+            received_seq_id,
+            status: if matches!(sent_message.delivery_mode, RelatedSessionDeliveryMode::Wake) {
+                RelatedSessionMessageStatus::Pending
+            } else {
+                RelatedSessionMessageStatus::Delivered
+            },
+        })
+    }
+
+    fn validate_related_session_message_envelopes<'a>(
+        sent: &'a EventEnvelope,
+        received: &EventEnvelope,
+    ) -> Result<&'a RelatedSessionMessage> {
+        let (
+            EventPayload::RelatedSessionMessageRecorded {
+                direction: RelatedSessionMessageDirection::Sent,
+                counterpart_event_id: sent_counterpart,
+                message: sent_message,
+            },
+            EventPayload::RelatedSessionMessageRecorded {
+                direction: RelatedSessionMessageDirection::Received,
+                counterpart_event_id: received_counterpart,
+                message: received_message,
+            },
+        ) = (&sent.payload, &received.payload)
+        else {
+            return Err(BelltowerError::InvalidState(
+                "related-session delivery requires one sent and one received event".to_owned(),
+            ));
+        };
+        if sent_message != received_message
+            || sent.event_id != *received_counterpart
+            || received.event_id != *sent_counterpart
+            || sent.session_id != sent_message.source_session_id
+            || sent.branch_id != sent_message.source_branch_id
+            || sent.turn_id != sent_message.caused_by_turn_id
+            || received.session_id != sent_message.destination_session_id
+            || received.branch_id != sent_message.destination_branch_id
+            || received.turn_id.is_some()
+            || sent_message.text.trim().is_empty()
+        {
+            return Err(BelltowerError::InvalidState(
+                "related-session delivery envelopes do not match the canonical message".to_owned(),
+            ));
+        }
+        Ok(sent_message)
+    }
+
+    fn ensure_related_session_message_constraints_in_tx(
+        tx: &Transaction<'_>,
+        message: &RelatedSessionMessage,
+    ) -> Result<()> {
+        let source_parent = Self::parent_session_id_in_tx(tx, message.source_session_id)?;
+        let destination_parent = Self::parent_session_id_in_tx(tx, message.destination_session_id)?;
+        if source_parent != Some(message.destination_session_id)
+            && destination_parent != Some(message.source_session_id)
+        {
+            return Err(BelltowerError::Protocol(
+                "related-session messages are limited to direct parent-child sessions".to_owned(),
+            ));
+        }
+        Self::ensure_branch_owner_in_tx(tx, message.source_session_id, message.source_branch_id)?;
+        Self::ensure_branch_owner_in_tx(
+            tx,
+            message.destination_session_id,
+            message.destination_branch_id,
+        )?;
+        if let Some(turn_id) = message.caused_by_turn_id {
+            let owns_active_turn: i64 = tx
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM active_turn_projection
+                        WHERE session_id = ?1 AND branch_id = ?2 AND turn_id = ?3
+                    )",
+                    params![
+                        message.source_session_id.to_string(),
+                        message.source_branch_id.to_string(),
+                        turn_id.to_string(),
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(storage_error)?;
+            if owns_active_turn == 0 {
+                return Err(BelltowerError::Protocol(
+                    "related-session message causal turn is not the sender's active turn"
+                        .to_owned(),
+                ));
+            }
+        }
+        if let Some(reply_id) = message.in_reply_to {
+            let reply_exists: i64 = tx
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM related_session_message_projection
+                        WHERE message_id = ?1
+                          AND ((source_session_id = ?2 AND destination_session_id = ?3)
+                            OR (source_session_id = ?3 AND destination_session_id = ?2))
+                    )",
+                    params![
+                        reply_id.to_string(),
+                        message.source_session_id.to_string(),
+                        message.destination_session_id.to_string(),
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(storage_error)?;
+            if reply_exists == 0 {
+                return Err(BelltowerError::Protocol(
+                    "related-session reply target was not found between these sessions".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_child_spawn_bounds_in_tx(
+        tx: &Transaction<'_>,
+        parent_session_id: SessionId,
+    ) -> Result<()> {
+        let (root_id, ancestor_count): (String, i64) = tx
+            .query_row(
+                "WITH RECURSIVE ancestors(session_id, parent_session_id) AS (
+                    SELECT session_id, parent_session_id FROM sessions WHERE session_id = ?1
+                    UNION
+                    SELECT sessions.session_id, sessions.parent_session_id
+                    FROM sessions JOIN ancestors ON sessions.session_id = ancestors.parent_session_id
+                 )
+                 SELECT session_id, (SELECT COUNT(*) FROM ancestors)
+                 FROM ancestors WHERE parent_session_id IS NULL LIMIT 1",
+                params![parent_session_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| {
+                BelltowerError::InvalidState(
+                    "session lineage has no reachable root session".to_owned(),
+                )
+            })?;
+        let depth = ancestor_count.saturating_sub(1) as usize;
+        if depth >= MAX_RELATED_SESSION_DEPTH {
+            return Err(BelltowerError::Protocol(format!(
+                "subagent depth limit of {MAX_RELATED_SESSION_DEPTH} reached"
+            )));
+        }
+        let lineage_size: i64 = tx
+            .query_row(
+                "WITH RECURSIVE lineage(session_id) AS (
+                    SELECT ?1
+                    UNION
+                    SELECT sessions.session_id
+                    FROM sessions JOIN lineage ON sessions.parent_session_id = lineage.session_id
+                 )
+                 SELECT COUNT(*) FROM lineage",
+                params![root_id],
+                |row| row.get(0),
+            )
+            .map_err(storage_error)?;
+        let descendants = lineage_size.saturating_sub(1) as usize;
+        if descendants >= MAX_RELATED_SESSION_DESCENDANTS {
+            return Err(BelltowerError::Protocol(format!(
+                "subagent lineage limit of {MAX_RELATED_SESSION_DESCENDANTS} reached"
+            )));
+        }
+        Ok(())
+    }
+
+    fn parent_session_id_in_tx(
+        tx: &Transaction<'_>,
+        session_id: SessionId,
+    ) -> Result<Option<SessionId>> {
+        let raw = tx
+            .query_row(
+                "SELECT parent_session_id FROM sessions WHERE session_id = ?1",
+                params![session_id.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| BelltowerError::NotFound(format!("session `{session_id}`")))?;
+        raw.map(|value| {
+            value.parse().map_err(|error| {
+                BelltowerError::Storage(format!("invalid parent session id `{value}`: {error}"))
+            })
+        })
+        .transpose()
+    }
+
+    fn ensure_branch_owner_in_tx(
+        tx: &Transaction<'_>,
+        session_id: SessionId,
+        branch_id: BranchId,
+    ) -> Result<()> {
+        let owns_branch: i64 = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM branches WHERE branch_id = ?1 AND session_id = ?2)",
+                params![branch_id.to_string(), session_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(storage_error)?;
+        if owns_branch == 0 {
+            return Err(BelltowerError::Protocol(format!(
+                "branch `{branch_id}` does not belong to session `{session_id}`"
+            )));
+        }
+        Ok(())
+    }
+
+    fn load_related_message_receipt_in_tx(
+        tx: &Transaction<'_>,
+        source_session_id: SessionId,
+        destination_session_id: SessionId,
+        message_id: RelatedSessionMessageId,
+        expected: Option<&RelatedSessionMessage>,
+    ) -> Result<Option<RelatedSessionMessageReceipt>> {
+        let sent = tx
+            .query_row(
+                "SELECT event_id, counterpart_event_id, message_json, source_seq
+                 FROM related_session_message_projection
+                 WHERE session_id = ?1 AND message_id = ?2 AND direction = 'sent'",
+                params![source_session_id.to_string(), message_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        let Some((sent_event_id, received_event_id, message_json, sent_seq_id)) = sent else {
+            return Ok(None);
+        };
+        let stored_message: RelatedSessionMessage = serde_json::from_str(&message_json)?;
+        if expected.is_some_and(|expected| expected != &stored_message) {
+            return Err(BelltowerError::Protocol(format!(
+                "related-session message id `{message_id}` was reused with different content"
+            )));
+        }
+        let (received_seq_id, status) = tx
+            .query_row(
+                "SELECT source_seq, status FROM related_session_message_projection
+                 WHERE session_id = ?1 AND message_id = ?2 AND direction = 'received'",
+                params![destination_session_id.to_string(), message_id.to_string()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(storage_error)?;
+        Ok(Some(RelatedSessionMessageReceipt {
+            message_id,
+            sent_event_id: sent_event_id.parse().map_err(|error| {
+                BelltowerError::Storage(format!("invalid related message event id: {error}"))
+            })?,
+            sent_seq_id,
+            received_event_id: received_event_id.parse().map_err(|error| {
+                BelltowerError::Storage(format!("invalid related message event id: {error}"))
+            })?,
+            received_seq_id,
+            status: parse_related_message_status(&status)?,
+        }))
     }
 
     pub fn import_session_with_raw_chunks_and_events<F>(
@@ -657,6 +1067,85 @@ impl SqliteSessionStore {
             *settings_revision_id,
             events,
         )?;
+        let seq_ids = Self::append_events_in_tx(&tx, events)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(ContinuationClaim::Claimed { seq_ids })
+    }
+
+    pub fn claim_related_message_continuation(
+        &mut self,
+        session_id: SessionId,
+        message_id: RelatedSessionMessageId,
+        expected_settings_revision_id: u64,
+        events: &[EventEnvelope],
+    ) -> Result<ContinuationClaim> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        if Self::cancel_requested_in_tx(&tx, session_id)? {
+            return Ok(ContinuationClaim::CancelPending);
+        }
+        if Self::active_turn_exists_in_tx(&tx, session_id)? {
+            return Ok(ContinuationClaim::Busy);
+        }
+        if Self::session_budget_exhausted_in_tx(&tx, session_id)? {
+            return Ok(ContinuationClaim::BudgetExhausted);
+        }
+        let current_settings_revision_id = tx
+            .query_row(
+                "SELECT settings_revision_id FROM sessions WHERE session_id = ?1",
+                params![session_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if current_settings_revision_id != Some(expected_settings_revision_id) {
+            return Ok(ContinuationClaim::Stale);
+        }
+        let pending = tx
+            .query_row(
+                "SELECT message_id, message_json FROM related_session_message_projection
+                 WHERE session_id = ?1 AND direction = 'received' AND status = 'pending'
+                 ORDER BY source_seq ASC LIMIT 1",
+                params![session_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        let Some((pending_message_id, message_json)) = pending else {
+            return Ok(ContinuationClaim::Stale);
+        };
+        if pending_message_id != message_id.to_string() {
+            return Ok(ContinuationClaim::Stale);
+        }
+        let message: RelatedSessionMessage = serde_json::from_str(&message_json)?;
+        if events.len() != 2
+            || events.iter().any(|event| {
+                event.session_id != session_id || event.branch_id != message.destination_branch_id
+            })
+            || !matches!(
+                &events[0].payload,
+                EventPayload::RelatedSessionMessageResolved {
+                    message_id: event_message_id,
+                    status: RelatedSessionMessageStatus::Claimed,
+                    resulting_turn_id: Some(turn_id),
+                    ..
+                } if *event_message_id == message_id && events[1].turn_id == Some(*turn_id)
+            )
+            || !matches!(
+                &events[1].payload,
+                EventPayload::TurnStarted {
+                    source: TurnStartSource::RelatedSessionMessage,
+                    settings_revision_id,
+                    ..
+                } if *settings_revision_id == expected_settings_revision_id
+            )
+        {
+            return Err(BelltowerError::InvalidState(
+                "related-session continuation events are malformed".to_owned(),
+            ));
+        }
         let seq_ids = Self::append_events_in_tx(&tx, events)?;
         tx.commit().map_err(storage_error)?;
         Ok(ContinuationClaim::Claimed { seq_ids })
@@ -1282,6 +1771,73 @@ impl SqliteSessionStore {
         ).map_err(storage_error)?;
         let rows = statement
             .query_map(params![parent_session_id.to_string()], parse_session_record)
+            .map_err(storage_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_error)
+    }
+
+    pub fn load_related_session_messages(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<RelatedMessageProjection>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT message_json, direction, status, event_id, counterpart_event_id,
+                        source_seq, resulting_turn_id, resolved_at
+                 FROM related_session_message_projection
+                 WHERE session_id = ?1 ORDER BY source_seq ASC",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params![session_id.to_string()],
+                parse_related_message_record,
+            )
+            .map_err(storage_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_error)
+    }
+
+    pub fn load_pending_related_session_messages(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<RelatedMessageProjection>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT message_json, direction, status, event_id, counterpart_event_id,
+                        source_seq, resulting_turn_id, resolved_at
+                 FROM related_session_message_projection
+                 WHERE session_id = ?1 AND direction = 'received' AND status = 'pending'
+                 ORDER BY source_seq ASC",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params![session_id.to_string()],
+                parse_related_message_record,
+            )
+            .map_err(storage_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_error)
+    }
+
+    pub fn load_all_pending_related_session_messages(
+        &self,
+    ) -> Result<Vec<RelatedMessageProjection>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT message_json, direction, status, event_id, counterpart_event_id,
+                        source_seq, resulting_turn_id, resolved_at
+                 FROM related_session_message_projection
+                 WHERE direction = 'received' AND status = 'pending'
+                 ORDER BY source_seq ASC",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], parse_related_message_record)
             .map_err(storage_error)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(storage_error)

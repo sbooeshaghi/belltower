@@ -175,6 +175,24 @@ This removes the main `401 Unauthorized` failure mode that came from rotating on
 4. receive ordered events with monotonic IDs
 5. reconnect using `Last-Event-ID` if interrupted
 
+Extended-tool sessions also register four server-hosted model tools over the
+same runtime/store boundary:
+
+- `spawn_agent` creates and dispatches one bounded child session, optionally on
+  a different configured connection and model
+- `send_agent_message` records a typed direct parent-child message and may wake
+  an idle destination
+- `list_agents` returns canonical workflow lineage plus recent mailbox records
+- `wait_agent` performs a bounded mailbox wait without joining or cancelling
+  another session
+
+These are tool adapters, not an alternate control plane. The server does not
+own lineage, mailbox status, message claim, settings selection, or turn
+continuation semantics. `spawn_agent` is always approval-gated and requires
+explicit shared-workspace consent until isolated-worktree lifecycle exists.
+Mailbox events are ordinary committed events, so SSE replay and portable
+session bundles carry them without a tool-specific transport format.
+
 Server handlers stay thin in this flow. They may provide runtime adapters for
 tool-registry construction and provider construction, but turn semantics remain
 runtime-owned. Budget eligibility is part of the runtime/store admission or

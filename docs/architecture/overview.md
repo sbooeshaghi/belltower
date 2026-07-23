@@ -64,9 +64,11 @@ That means the canonical model must be able to represent and inspect:
 - cross-session provenance such as "this branch/session was created from that session/turn"
 - the operator-visible history of what each related session did
 
-Even before subagent execution is implemented, the data model and inspection surfaces should be prepared for session graphs rather than isolated session logs.
+The bounded subagent foundation now uses this session graph directly: child
+sessions may select independent configured models, and direct parent-child
+messages are durable canonical events rather than hidden runtime state.
 
-The intended execution model for future delegated work is documented in:
+The implemented foundation and the remaining worktree/workflow constraints are documented in:
 
 - [`./subagents-and-session-graphs.md`](./subagents-and-session-graphs.md)
 - [`./participants-and-collaboration.md`](./participants-and-collaboration.md)
@@ -290,7 +292,8 @@ touch both `bt-context` and `bt-runtime`:
 
 These concerns should not grow inside it:
 
-- subagent spawn or workflow orchestration logic
+- higher-order subagent scheduling or workflow policy beyond reusable
+  lineage, mailbox, context, and admission primitives
 - worktree lifecycle management
 - export formatting
 - provider-specific protocol behavior
@@ -426,16 +429,19 @@ In v1:
 - raw chunk persistence is first-class
 - OpenInference alignment is first-class
 - standalone provider catalog/config layering is first-class
+- bounded child-session spawn and direct parent-child messaging are first-class
 
 Deferred to v2:
 
 - session interop import/export with other runtimes
 - native inference backends
-- subagent execution
+- isolated-worktree lifecycle and higher-order workflow scheduling
 - plugin hosting beyond MCP/custom tools
 
-Even though subagent execution is deferred, lineage and observability requirements for future multi-session workflows are not deferred.
-The stable architecture should already preserve enough structure to inspect related sessions coherently once they exist.
+Bounded subagent execution is implemented as child sessions with explicit
+lineage, independent control state, mixed-model settings, and a durable typed
+mailbox. This does not imply that general workflow scheduling, role systems, or
+shared mutable workspace execution are stable product contracts.
 
 Experimental later:
 

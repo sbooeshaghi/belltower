@@ -60,8 +60,10 @@ The intended outcomes are:
 - mechanical enforcement of `bt-agent` purity
 - live OTLP validation against a real consumer
 
-This phase should stop short of autonomous spawning.
-It should make that later work easier rather than prematurely implementing it.
+This phase originally stopped short of autonomous spawning. The bounded
+approval-gated child-session slice now sits on top of these semantics without
+changing their ownership: lineage and mailbox state are canonical, while
+higher-order scheduling remains out of scope.
 
 The earlier coherence audit and release-hardening stack are now largely in
 place, so the near-term priority shifts again: first close the release gate
@@ -93,7 +95,8 @@ It must not introduce a second runtime.
 
 ## Phase 4. Delegated Sessions And Workflow Execution
 
-Only after workflow inspection and dataset/replay foundations are stable should Belltower add real delegated execution.
+Bounded delegated execution is now present; this phase remains open for the
+workflow and isolation capabilities needed before delegation can scale safely.
 
 Why:
 
@@ -102,11 +105,11 @@ Why:
 
 The intended outcomes are:
 
-- manual child-session spawn first
-- structured handoff and result-import contracts
+- manual and approval-gated model-facing child-session spawn
+- typed durable parent-child messages and structured handoff contracts
 - workflow-level operator surfaces
 - optional isolated worktree support for coding tasks
-- later autonomous spawn policy on top of that
+- later higher-order scheduling and recursive delegation policy in a separate composition layer
 
 The architectural rule remains:
 

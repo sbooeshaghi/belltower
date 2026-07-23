@@ -8,12 +8,15 @@ use bt_core::{
     ApprovalDecision, ApprovalDecisionSource, ApprovalRequest, ApprovalRequirement, ApprovalScope,
     BelltowerConfig, BelltowerError, BudgetConfig, CompletionRequest, CompletionSummary,
     ConnectionDescriptor, ConnectionId, ContextCompactionPhase, ContextCompactionStatus,
-    ContextCompactionTrigger, ContextManifest, ContextMessageSourceRef, EventPayload, FinishReason,
-    InstructionDocument, Message, MessagePart, PlanItem, PlanStatus, Role, SessionRuntimeState,
-    SessionToolMode, TokenUsage, ToolCall, ToolCallId, ToolDisplayGroup, ToolExecutionMode,
-    ToolInterruptBehavior, ToolMetadata, ToolOperationContext, ToolOperationInitiator,
-    ToolResultEnvelope, ToolRiskClass, TurnId, TurnInstructionProvenance, TurnStartSource,
+    ContextCompactionTrigger, ContextManifest, ContextMessageSourceRef, EventEnvelope,
+    EventPayload, FinishReason, InstructionDocument, Message, MessagePart, PlanItem, PlanStatus,
+    RelatedSessionDeliveryMode, RelatedSessionMessageDirection, RelatedSessionMessageKind,
+    RelatedSessionMessageStatus, Role, SessionRuntimeState, SessionToolMode, SpanKind, TokenUsage,
+    ToolCall, ToolCallId, ToolDisplayGroup, ToolExecutionMode, ToolInterruptBehavior, ToolMetadata,
+    ToolOperationContext, ToolOperationInitiator, ToolResultEnvelope, ToolRiskClass, TurnId,
+    TurnInstructionProvenance, TurnStartSource,
 };
+use bt_session::SqliteSessionStore;
 use bt_tools::BuiltInToolRegistry;
 use serde_json::json;
 use std::{sync::Arc, thread, time::Duration};
@@ -4108,6 +4111,301 @@ fn spawn_child_session_accepts_explicit_connection_and_model() {
             && connection_id == "openai"
             && model_id.as_deref() == Some("gpt-5.4-mini")
     )));
+}
+
+#[test]
+fn related_session_wake_uses_child_settings_and_enters_model_context() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (parent, parent_branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("coordinator".to_owned()),
+            None,
+        )
+        .expect("parent session");
+    let (child, child_branch) = runtime
+        .spawn_child_session(
+            parent.session_id,
+            parent_branch.branch_id,
+            None,
+            "seek a counterexample".to_owned(),
+            Some("critic".to_owned()),
+            Some(ConnectionId::new("openai")),
+            Some("gpt-5.4-mini".to_owned()),
+        )
+        .expect("child session");
+
+    let receipt = runtime
+        .send_related_session_message(
+            parent.session_id,
+            parent_branch.branch_id,
+            None,
+            child.session_id,
+            child_branch.branch_id,
+            RelatedSessionMessageKind::Instruction,
+            RelatedSessionDeliveryMode::Wake,
+            None,
+            "Try to disprove the theorem and report the smallest counterexample.".to_owned(),
+            Vec::new(),
+        )
+        .expect("send wake message");
+    assert_eq!(receipt.status, RelatedSessionMessageStatus::Pending);
+
+    let admitted = runtime
+        .claim_next_related_session_message(child.session_id)
+        .expect("claim wake")
+        .expect("admitted child turn");
+    assert_eq!(admitted.settings_revision_id(), child.settings_revision_id);
+    assert!(
+        runtime
+            .pending_related_session_messages(child.session_id)
+            .expect("pending messages")
+            .is_empty()
+    );
+    let messages = runtime
+        .related_session_messages(child.session_id)
+        .expect("child messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].direction,
+        RelatedSessionMessageDirection::Received
+    );
+    assert_eq!(messages[0].status, RelatedSessionMessageStatus::Claimed);
+    assert_eq!(messages[0].resulting_turn_id, Some(admitted.turn_id()));
+
+    let prepared = runtime
+        .prepare_turn_context(
+            &child,
+            &child_branch,
+            None,
+            Vec::new(),
+            None,
+            Some(admitted.turn_id()),
+            admitted.settings_revision_id(),
+        )
+        .expect("prepare child context");
+    assert_eq!(prepared.model_id, "gpt-5.4-mini");
+    assert!(prepared.request.messages.iter().any(|message| {
+        message.text_parts().any(|text| {
+            text.contains("Try to disprove the theorem and report the smallest counterexample.")
+        })
+    }));
+
+    runtime
+        .send_related_session_message(
+            child.session_id,
+            child_branch.branch_id,
+            Some(admitted.turn_id()),
+            parent.session_id,
+            parent_branch.branch_id,
+            RelatedSessionMessageKind::Progress,
+            RelatedSessionDeliveryMode::Notify,
+            Some(receipt.message_id),
+            "No counterexample below 100.".to_owned(),
+            Vec::new(),
+        )
+        .expect("send progress to parent");
+    let parent_messages = runtime
+        .related_session_messages(parent.session_id)
+        .expect("parent messages");
+    assert_eq!(parent_messages.len(), 2);
+    assert_eq!(
+        parent_messages
+            .last()
+            .expect("progress message")
+            .message
+            .text,
+        "No counterexample below 100."
+    );
+}
+
+#[test]
+fn reopened_runtime_reports_interrupted_subagent_without_retrying_it() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config.clone(), file.path()).expect("runtime");
+    let (parent, parent_branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("coordinator".to_owned()),
+            None,
+        )
+        .expect("parent session");
+    let (child, child_branch) = runtime
+        .spawn_child_session(
+            parent.session_id,
+            parent_branch.branch_id,
+            None,
+            "run a side-effecting experiment".to_owned(),
+            Some("experimenter".to_owned()),
+            Some(ConnectionId::new("openai")),
+            Some("gpt-5.4-mini".to_owned()),
+        )
+        .expect("child session");
+    let objective = runtime
+        .send_related_session_message(
+            parent.session_id,
+            parent_branch.branch_id,
+            None,
+            child.session_id,
+            child_branch.branch_id,
+            RelatedSessionMessageKind::Instruction,
+            RelatedSessionDeliveryMode::Wake,
+            None,
+            "Run the experiment once and report the result.".to_owned(),
+            Vec::new(),
+        )
+        .expect("send objective");
+    let admitted = runtime
+        .claim_next_related_session_message(child.session_id)
+        .expect("claim objective")
+        .expect("child turn");
+    drop(runtime);
+
+    let reopened = BelltowerRuntime::open(config.clone(), file.path()).expect("reopen runtime");
+    assert!(
+        reopened
+            .all_events(child.session_id)
+            .expect("child events")
+            .iter()
+            .any(|event| matches!(
+                &event.payload,
+                EventPayload::TurnFinished {
+                    turn_id,
+                    finish_reason: Some(reason),
+                    ..
+                } if *turn_id == admitted.turn_id() && reason == "interrupted_after_restart"
+            ))
+    );
+    let interruption = reopened
+        .related_session_messages(parent.session_id)
+        .expect("parent mailbox")
+        .into_iter()
+        .find(|record| {
+            record.direction == RelatedSessionMessageDirection::Received
+                && record.message.in_reply_to == Some(objective.message_id)
+                && record.message.kind == RelatedSessionMessageKind::Error
+        })
+        .expect("interruption notification");
+    assert!(
+        interruption
+            .message
+            .text
+            .contains("not retried automatically")
+    );
+    drop(reopened);
+
+    let reopened_again = BelltowerRuntime::open(config, file.path()).expect("second reopen");
+    let interruption_count = reopened_again
+        .related_session_messages(parent.session_id)
+        .expect("parent mailbox")
+        .into_iter()
+        .filter(|record| {
+            record.direction == RelatedSessionMessageDirection::Received
+                && record.message.in_reply_to == Some(objective.message_id)
+                && record.message.kind == RelatedSessionMessageKind::Error
+        })
+        .count();
+    assert_eq!(interruption_count, 1);
+}
+
+#[test]
+fn reopened_runtime_repairs_interrupted_subagent_notification_after_terminal_commit() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config.clone(), file.path()).expect("runtime");
+    let (parent, parent_branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("coordinator".to_owned()),
+            None,
+        )
+        .expect("parent session");
+    let (child, child_branch) = runtime
+        .spawn_child_session(
+            parent.session_id,
+            parent_branch.branch_id,
+            None,
+            "run a side-effecting experiment".to_owned(),
+            Some("experimenter".to_owned()),
+            None,
+            None,
+        )
+        .expect("child session");
+    let objective = runtime
+        .send_related_session_message(
+            parent.session_id,
+            parent_branch.branch_id,
+            None,
+            child.session_id,
+            child_branch.branch_id,
+            RelatedSessionMessageKind::Instruction,
+            RelatedSessionDeliveryMode::Wake,
+            None,
+            "Run the experiment once and report the result.".to_owned(),
+            Vec::new(),
+        )
+        .expect("send objective");
+    let admitted = runtime
+        .claim_next_related_session_message(child.session_id)
+        .expect("claim objective")
+        .expect("child turn");
+    drop(runtime);
+
+    let mut store = SqliteSessionStore::open(file.path()).expect("store");
+    let terminal = EventEnvelope::new(
+        child.session_id,
+        child_branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::TurnFinished {
+            turn_id: admitted.turn_id(),
+            provider: "openai-compatible".to_owned(),
+            model: "o4-mini".to_owned(),
+            status: "failed".to_owned(),
+            finish_reason: Some("interrupted_after_restart".to_owned()),
+            latency_ms: 0,
+        },
+    )
+    .with_turn_id(admitted.turn_id());
+    store
+        .commit_turn_terminal_transition(
+            child.session_id,
+            child_branch.branch_id,
+            admitted.turn_id(),
+            &[terminal],
+        )
+        .expect("terminalize child before notification");
+    drop(store);
+
+    let reopened = BelltowerRuntime::open(config, file.path()).expect("reopen runtime");
+    let notifications = reopened
+        .related_session_messages(parent.session_id)
+        .expect("parent mailbox")
+        .into_iter()
+        .filter(|record| {
+            record.direction == RelatedSessionMessageDirection::Received
+                && record.message.in_reply_to == Some(objective.message_id)
+                && record.message.kind == RelatedSessionMessageKind::Error
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(notifications.len(), 1);
+    assert!(
+        notifications[0]
+            .message
+            .text
+            .contains("not retried automatically")
+    );
 }
 
 #[test]

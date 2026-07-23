@@ -41,6 +41,8 @@ That record must be rich enough to reconstruct:
 - model-visible context manifests for each provider call
 - tool-operation metadata and artifact references
 - provider raw stream behavior
+- parent-child session lineage and typed related-session mailbox delivery,
+  claim, and resolution state
 
 The intended runtime wiring is:
 
@@ -167,6 +169,14 @@ The current `bt-otel` export now maps the canonical store into richer OpenInfere
   - approval and error metadata
   - operation metadata and artifact refs when present in canonical events
 - OTLP span events include payload previews and mirrored event attributes so the event stream is useful inside Phoenix instead of only showing bare event names
+- related-session mailbox events mirror message direction, peer session,
+  delivery mode, kind, status, and message/turn correlation; the canonical
+  paired session events remain the source of truth
+
+Portable session bundles preserve each session's own mailbox event copy. When
+related parent and child bundles are imported into the same store, projections
+reconstruct sent/received state from those canonical events; exporters do not
+flatten child history into the parent bundle or invent a workflow transcript.
 
 ## Cost Accounting
 
@@ -295,6 +305,10 @@ Current implemented state:
   - `llm_call`
   - `tool_execution`
 - turn OTLP spans now carry canonical turn provenance including `settings_revision_id`, start source, and resumed call linkage when the turn was bootstrapped from approval or input resume
+- related-session mailbox events carry explicit `belltower.related_message.*`
+  attributes for message id, direction, peer session, delivery mode, message
+  kind, resolution status, and resulting turn id instead of requiring consumers
+  to parse a display summary
 - canonical instruction provenance is stored as `turn.instructions.recorded`; exports consume that event as part of the session record instead of reconstructing prompts from current files
 - approval-resume and input-resume tool spans are reconstructed from canonical events and reuse the original tool-call input when the execution lands in a later resumed turn
 - every exported span carries the Belltower `session.id` correlation attribute

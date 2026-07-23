@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod agent_tools;
 mod exports;
 mod inspection_tools;
 mod metadata_routes;
@@ -161,6 +162,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     trace.mark("listener.bind.start");
     let listener = tokio::net::TcpListener::bind(socket).await?;
     trace.mark("listener.bind.done");
+    let recovered_agent_turns = agent_tools::recover_pending_agent_turns(state.clone())?;
+    if recovered_agent_turns > 0 {
+        tracing::info!(
+            recovered_agent_turns,
+            "resumed durable related-session wake messages"
+        );
+    }
     trace.mark("server.ready");
     axum::serve(listener, build_app(state)).await?;
     Ok(())
@@ -1437,16 +1445,16 @@ fn sse_event_for(event: bt_core::EventEnvelope) -> Event {
         .data(payload)
 }
 
-async fn run_session_turn(
+pub(crate) async fn run_session_turn(
     state: &AppState,
     session: &SessionRecord,
     branch: &BranchRecord,
     admitted_turn: bt_runtime::AdmittedTurn,
-) -> Result<(), ApiError> {
+) -> Result<bt_runtime::TurnRunOutcome, ApiError> {
     let adapters = ServerTurnAdapters {
         state: state.clone(),
     };
-    state
+    let outcome = state
         .runtime
         .turn_orchestrator()
         .run_session_turns(
@@ -1454,7 +1462,7 @@ async fn run_session_turn(
             TurnRunRequest::new(session.clone(), branch.clone(), admitted_turn)?,
         )
         .await?;
-    Ok(())
+    Ok(outcome)
 }
 
 #[cfg(test)]

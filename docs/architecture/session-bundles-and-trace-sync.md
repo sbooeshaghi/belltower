@@ -552,14 +552,16 @@ truth.
 
 ## Subagents And Multiplayer
 
-The same bundle primitives should support future subagents and multiplayer.
+The same bundle primitives support current child-session evidence and should
+support future multiplayer workflows without changing the canonical event log.
 
 For subagents:
 
 - parent emits a spawn or handoff event
 - child writes its own session log
-- child returns a structured artifact or bundle ref
-- parent imports the child result by reference
+- parent and child exchange typed durable related-session messages
+- each exported bundle preserves that session's mailbox event copy
+- richer child artifacts or bundle refs may be returned without flattening the child log
 - parent does not flatten the child history into its own log
 
 For multiplayer:

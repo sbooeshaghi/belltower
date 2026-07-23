@@ -5,8 +5,8 @@
 
 use bt_core::{
     ApprovalDecision, ApprovalRequestSnapshot, ApprovalResolution, BranchId, BudgetConfig,
-    ContextManifest, EventEnvelope, EventId, Message, PlanItem, SessionId, SessionRecord,
-    SessionToolMode, ToolCallId, TurnId, TurnStartSource,
+    ContextManifest, EventEnvelope, EventId, Message, PlanItem, RelatedSessionMessageRecord,
+    SessionId, SessionRecord, SessionToolMode, ToolCallId, TurnId, TurnStartSource,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -103,6 +103,8 @@ pub struct SteerProjection {
     pub enqueued_at: OffsetDateTime,
     pub resolved_at: Option<OffsetDateTime>,
 }
+
+pub type RelatedMessageProjection = RelatedSessionMessageRecord;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolRunProjection {

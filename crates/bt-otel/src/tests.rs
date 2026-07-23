@@ -7,10 +7,12 @@ use crate::mirror::mirrored_event_fields;
 use bt_core::{
     ApprovalDecision, ApprovalDecisionSource, ApprovalRequestSnapshot, ApprovalRequirement,
     ApprovalResolution, ApprovalScope, BranchId, CompletionDelta, ConnectionId, EventEnvelope,
-    EventPayload, Message, MessagePart, Role, SessionId, SessionRecord, SessionStatus,
-    SessionToolMode, SpanKind, ToolCall, ToolCallId, ToolDisplayGroup, ToolExecutionMode,
-    ToolInterruptBehavior, ToolMetadata, ToolOperationInitiator, ToolResultEnvelope, ToolRiskClass,
-    TurnId, TurnStartSource, default_settings_revision_id,
+    EventId, EventPayload, Message, MessageId, MessagePart, RelatedSessionDeliveryMode,
+    RelatedSessionMessage, RelatedSessionMessageDirection, RelatedSessionMessageId,
+    RelatedSessionMessageKind, RelatedSessionMessageStatus, Role, SessionId, SessionRecord,
+    SessionStatus, SessionToolMode, SpanKind, ToolCall, ToolCallId, ToolDisplayGroup,
+    ToolExecutionMode, ToolInterruptBehavior, ToolMetadata, ToolOperationInitiator,
+    ToolResultEnvelope, ToolRiskClass, TurnId, TurnStartSource, default_settings_revision_id,
 };
 use bt_protocol::ExportFormat;
 use camino::Utf8PathBuf;
@@ -377,6 +379,113 @@ fn mirrored_fields_capture_turn_start_provenance() {
         fields.resumed_from_call_id.as_deref(),
         Some(call_id.to_string().as_str())
     );
+}
+
+#[test]
+fn mirrored_fields_capture_related_session_delivery_and_resolution() {
+    let parent = session();
+    let parent_branch_id = BranchId::new();
+    let child_session_id = SessionId::new();
+    let child_branch_id = BranchId::new();
+    let message_id = RelatedSessionMessageId::new();
+    let counterpart_event_id = EventId::new();
+    let message = RelatedSessionMessage {
+        message_id,
+        context_message_id: MessageId::new(),
+        source_session_id: parent.session_id,
+        source_branch_id: parent_branch_id,
+        caused_by_turn_id: None,
+        destination_session_id: child_session_id,
+        destination_branch_id: child_branch_id,
+        kind: RelatedSessionMessageKind::Instruction,
+        delivery_mode: RelatedSessionDeliveryMode::Wake,
+        in_reply_to: None,
+        text: "check the counterexample".to_owned(),
+        artifact_refs: Vec::new(),
+        created_at: time::OffsetDateTime::now_utc(),
+    };
+    let recorded = EventEnvelope::new(
+        parent.session_id,
+        parent_branch_id,
+        SpanKind::Chain,
+        EventPayload::RelatedSessionMessageRecorded {
+            direction: RelatedSessionMessageDirection::Sent,
+            counterpart_event_id,
+            message,
+        },
+    );
+
+    let recorded_fields = mirrored_event_fields(&recorded);
+    assert_eq!(
+        recorded_fields.event_kind,
+        "session.related_message.recorded"
+    );
+    assert_eq!(recorded_fields.status.as_deref(), Some("Sent"));
+    assert_eq!(
+        recorded_fields.related_message_id.as_deref(),
+        Some(message_id.to_string().as_str())
+    );
+    assert_eq!(
+        recorded_fields.related_message_direction.as_deref(),
+        Some("Sent")
+    );
+    assert_eq!(
+        recorded_fields.related_message_peer_session_id.as_deref(),
+        Some(child_session_id.to_string().as_str())
+    );
+    assert_eq!(
+        recorded_fields.related_message_delivery_mode.as_deref(),
+        Some("Wake")
+    );
+    assert_eq!(
+        recorded_fields.related_message_kind.as_deref(),
+        Some("Instruction")
+    );
+    assert_eq!(
+        recorded_fields.related_message_status.as_deref(),
+        Some("Delivered")
+    );
+    assert_eq!(
+        recorded_fields.text_preview.as_deref(),
+        Some("check the counterexample")
+    );
+    let recorded_summary = recorded_fields.finish_reason.expect("delivery summary");
+    assert!(recorded_summary.contains("delivery=Wake"));
+    assert!(recorded_summary.contains(&child_session_id.to_string()));
+
+    let resulting_turn_id = TurnId::new();
+    let resolved = EventEnvelope::new(
+        child_session_id,
+        child_branch_id,
+        SpanKind::Chain,
+        EventPayload::RelatedSessionMessageResolved {
+            message_id,
+            status: RelatedSessionMessageStatus::Claimed,
+            resulting_turn_id: Some(resulting_turn_id),
+            reason: None,
+        },
+    );
+    let resolved_fields = mirrored_event_fields(&resolved);
+    assert_eq!(
+        resolved_fields.event_kind,
+        "session.related_message.resolved"
+    );
+    assert_eq!(resolved_fields.status.as_deref(), Some("Claimed"));
+    assert_eq!(
+        resolved_fields.related_message_id.as_deref(),
+        Some(message_id.to_string().as_str())
+    );
+    assert_eq!(
+        resolved_fields.related_message_status.as_deref(),
+        Some("Claimed")
+    );
+    assert_eq!(
+        resolved_fields.related_message_resulting_turn_id.as_deref(),
+        Some(resulting_turn_id.to_string().as_str())
+    );
+    let resolution_summary = resolved_fields.finish_reason.expect("resolution summary");
+    assert!(resolution_summary.contains(&message_id.to_string()));
+    assert!(resolution_summary.contains(&resulting_turn_id.to_string()));
 }
 
 #[test]

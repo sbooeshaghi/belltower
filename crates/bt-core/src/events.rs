@@ -2,8 +2,10 @@ use crate::{
     ApprovalDecision, ApprovalRequestSnapshot, ApprovalResolution, BranchId, BudgetConfig,
     CompactionId, CompletionDelta, ContextCompactionPhase, ContextCompactionStatus,
     ContextCompactionTrigger, ContextManifest, CostBreakdown, ErrorClass, EventId, Message,
-    MessageId, PlanItem, SessionId, SpanId, TokenUsage, ToolCallId, ToolOperationContext,
-    ToolResultEnvelope, TurnId, TurnInstructionProvenance, default_settings_revision_id,
+    MessageId, PlanItem, RelatedSessionMessage, RelatedSessionMessageDirection,
+    RelatedSessionMessageId, RelatedSessionMessageStatus, SessionId, SpanId, TokenUsage,
+    ToolCallId, ToolOperationContext, ToolResultEnvelope, TurnId, TurnInstructionProvenance,
+    default_settings_revision_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -62,6 +64,7 @@ pub enum TurnStartSource {
     InputResume,
     SteerFollowUp,
     QueuedFollowUp,
+    RelatedSessionMessage,
 }
 
 fn default_turn_start_source() -> TurnStartSource {
@@ -100,6 +103,17 @@ pub enum EventPayload {
     SessionResultRejected {
         child_session_id: SessionId,
         reason: String,
+    },
+    RelatedSessionMessageRecorded {
+        direction: RelatedSessionMessageDirection,
+        counterpart_event_id: EventId,
+        message: RelatedSessionMessage,
+    },
+    RelatedSessionMessageResolved {
+        message_id: RelatedSessionMessageId,
+        status: RelatedSessionMessageStatus,
+        resulting_turn_id: Option<TurnId>,
+        reason: Option<String>,
     },
     SessionSettingsUpdated {
         #[serde(default = "default_settings_revision_id")]
@@ -307,6 +321,8 @@ impl EventPayload {
             Self::SessionHandoffRecorded { .. } => "session.handoff.recorded",
             Self::SessionResultImported { .. } => "session.result.imported",
             Self::SessionResultRejected { .. } => "session.result.rejected",
+            Self::RelatedSessionMessageRecorded { .. } => "session.related_message.recorded",
+            Self::RelatedSessionMessageResolved { .. } => "session.related_message.resolved",
             Self::SessionSettingsUpdated { .. } => "session.settings.updated",
             Self::SessionEnded { .. } => "session.ended",
             Self::BranchCreated { .. } => "branch.created",

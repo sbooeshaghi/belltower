@@ -10,7 +10,7 @@ It should be read after:
 
 ## Purpose
 
-The point of this document is not to force immediate subagent work.
+The point of this document is to record the safe rollout boundary for subagent work.
 
 It is to answer:
 
@@ -30,26 +30,38 @@ Belltower already has some of the necessary substrate:
 - structured approval and queue state
 - canonical delegation events for spawn, handoff, and result-import intent
 - a manual child-session spawn path via runtime, protocol, server, and TUI (`/spawn`)
+- typed durable parent-child mailbox events and projections
+- model-facing `spawn_agent`, `send_agent_message`, `list_agents`, and
+  `wait_agent` tools for extended-tool sessions
+- per-child configured connection and model selection
+- bounded depth and lineage size, explicit shared-workspace consent, and
+  approval-gated autonomous spawn
 
-What it does not yet have is a complete workflow contract.
+What it does not yet have is a complete workflow framework.
 
 Missing pieces include:
 
 - a workflow-level inspection surface beyond single-session related-session summaries
 - worktree policy and lifecycle
-- a structured return-artifact model
-- real result-import or result-rejection flows
+- isolated-worktree ownership and lifecycle
+- explicit inherited tool/budget policy beyond ordinary session-local state
+- a richer artifact-first return contract beyond typed messages with artifact refs
+- higher-order scheduling, role, or recursive delegation policy
 
 ## Recommendation
 
-Do not implement fully autonomous subagent execution yet.
+Keep autonomous execution bounded to the implemented child-session and mailbox
+contract. Do not broaden it into a general scheduler until dogfooding shows a
+measured need.
 
 The next safe choices are:
 
-1. keep the current manual child-session spawn path operator-driven
-2. add workflow-level inspection over the canonical session graph
-3. add structured return artifacts and result-import flows
-4. only then consider autonomous spawn
+1. dogfood mixed-model parent-child coordination on real tasks
+2. evaluate isolated-worktree lifecycle before concurrent coding children
+3. add richer return artifacts only when typed result/error messages and
+   existing artifact refs are insufficient
+4. introduce higher-order workflow policy in a separate composition layer, not
+   by expanding per-session runtime ownership
 
 This preserves Belltower's core differentiator:
 
@@ -165,9 +177,23 @@ The current product surface is `/spawn <objective>`, which:
 
 What is still missing from this slice is explicit worktree policy and richer model/tool budget controls.
 
-### Slice D. Autonomous Spawn
+### Slice D. Bounded Autonomous Spawn
 
-Only after the above are solid should Belltower let one session decide to spawn another session autonomously.
+Status: complete.
+
+The implemented slice:
+
+- exposes model-facing spawn only in extended tool mode
+- always requires human approval and `allow_shared_workspace: true`
+- allows an explicit configured connection and model per child
+- limits messages to direct parent-child edges
+- limits depth to four and descendants to eight per lineage
+- gives every child independent queue, approval, cancel, steer, budget, and
+  settings state
+- persists paired source/destination mailbox evidence atomically
+- distinguishes `notify` from FIFO `wake` delivery
+- returns typed progress, result, or error messages and reports interrupted
+  claimed turns without retrying side effects after restart
 
 ## Decision Guidance
 
@@ -187,15 +213,15 @@ Use this rule when choosing what to build next.
 
 Given the current repo state, the best immediate next work is now:
 
-1. structured return artifacts and result-import events
-2. worktree policy and lifecycle
-3. only then autonomous spawn exploration
+1. dogfood the bounded contract with heterogeneous configured models
+2. design worktree policy and lifecycle before concurrent coding delegation
+3. evaluate return-artifact and higher-order workflow needs from observed traces
 
 That order keeps the observability story ahead of the autonomy story.
 
 ## Human Checkpoints For The Future Subagent Slice
 
-When we start this work for real, the first manual checkpoints should be:
+The manual checkpoints for this slice are:
 
 1. create a parent session
 2. create a child session from a specific parent turn
@@ -204,6 +230,10 @@ When we start this work for real, the first manual checkpoints should be:
 5. confirm the parent-child relationship is visible from both sides
 6. confirm approvals, queue state, and cancellations remain isolated
 7. confirm exported traces and canonical events agree on lineage and outcome
+8. spawn children on different configured providers/models and confirm each
+   turn captures the child's own immutable settings revision
+9. exchange messages in both directions, restart between delivery and claim,
+   and confirm no message is duplicated or silently lost
 
 ## Practical Conclusion
 
@@ -213,4 +243,5 @@ The design is now clear enough that we do not need to guess later:
 - child sessions should usually use isolated worktrees
 - lineage and delegation must be explicit in canonical events and inspection
 
-The remaining decision is scheduling, not architecture.
+The remaining decisions concern isolated execution and higher-order workflow
+policy, not the canonical child-session or communication model.

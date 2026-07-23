@@ -55,6 +55,7 @@ uuid_id!(BranchId);
 uuid_id!(EventId);
 uuid_id!(MessageId);
 uuid_id!(CompactionId);
+uuid_id!(RelatedSessionMessageId);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]

@@ -593,6 +593,19 @@ impl TurnOrchestrator<'_> {
                             })?;
                         continue;
                     }
+                    PostTurnControlAction::ContinueRelatedSessionBranch(dispatch) => {
+                        next_turn_id = Some(dispatch.turn_id);
+                        next_settings_revision_id = dispatch.settings_revision_id;
+                        current_branch = self
+                            .runtime
+                            .load_branch(turn_session.session_id, dispatch.branch_id)?
+                            .ok_or_else(|| {
+                                BelltowerError::InvalidState(
+                                    "related-session branch not found".to_owned(),
+                                )
+                            })?;
+                        continue;
+                    }
                     PostTurnControlAction::ContinueCurrentBranch(dispatch) => {
                         next_turn_id = Some(dispatch.turn_id);
                         next_settings_revision_id = dispatch.settings_revision_id;

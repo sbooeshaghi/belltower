@@ -450,13 +450,49 @@ closes unfinished resumed turns from durable turn boundary events
 (`turn.started` / `turn.finished`) rather than reconstructing full session
 inspection for every historical session.
 
+## Related Sessions And Subagents
+
+The current subagent foundation preserves the same ownership split as ordinary
+turns:
+
+- `bt-session` owns parent-child metadata, atomic paired mailbox events, message
+  status projection, FIFO wake claims, and restart reconstruction
+- `bt-runtime` owns lineage validation, spawn admission, message delivery and
+  claim APIs, model-visible context assembly, destination settings resolution,
+  and post-turn continuation ordering
+- `bt-server` owns only the model-facing adapters and asynchronous execution
+  host for `spawn_agent`, `send_agent_message`, `list_agents`, and `wait_agent`
+- `bt-agent` remains unaware of session graphs and continues to operate on an
+  ordinary typed turn request
+
+Related-session messages do not become transcript messages. Received messages
+are projected into model context with explicit source provenance only after
+delivery or claim. A `wake` message starts work through the same admitted-turn
+path as other continuations, and queued wakes are considered after cancel and
+steer but before ordinary queued user follow-ups. `notify` messages remain
+durable context for a later turn.
+
+Child sessions have independent settings revisions, approvals, queues, cancel,
+steer, and budgets. A child may use a different configured connection and model
+from its parent. The runtime constrains model-facing spawn to depth four and
+eight descendants per lineage; higher-order scheduling policy remains outside
+this crate.
+
+Recovery is deliberately conservative. Server startup claims one pending wake
+per idle destination through the ordinary related-message admission path. If
+the process restarts after a related message was claimed, runtime terminalizes
+the interrupted turn and emits one typed error notification to the sender
+instead of retrying possible tool side effects. Runtime reopening also repairs
+that notification when the interruption terminal event committed before the
+paired reply; an existing typed error reply suppresses duplication.
+
 ## Runtime Non-Goals
 
 `bt-runtime` should stay focused on composition.
 
 These concerns should be owned elsewhere when they land:
 
-- workflow or subagent orchestration
+- higher-order workflow scheduling, role policy, or recursive delegation policy
 - worktree lifecycle management
 - export formatting
 - provider-specific protocol behavior

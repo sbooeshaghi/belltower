@@ -5,6 +5,7 @@
 //! loop or canonical session state.
 
 use super::{ApiError, AppState};
+use crate::agent_tools::register_agent_tools;
 use crate::inspection_tools::register_inspection_tools;
 use crate::session_search_tool::register_session_search_tool;
 use crate::session_tools::register_session_tools;
@@ -427,6 +428,7 @@ pub(super) async fn build_tool_registry(
             session.session_id,
             branch_id,
         );
+        register_agent_tools(&mut tools, state.clone(), session.session_id, branch_id);
     }
     for tool in state.runtime.mcp_registered_tools().await? {
         tools.register_arc(tool.executor);

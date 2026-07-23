@@ -101,12 +101,17 @@ This stays feature-gated and outside the initial compatibility promise:
 
 - self-improvement
 - isolated worktree proposal flows
-- subagent execution
+- generalized multi-agent scheduling, recursive delegation policy, and role systems
 - plugin hosting beyond MCP/custom tools
 - trainer- and RL-specific integrations on top of canonical trajectory datasets
 
-Even though subagent execution is deferred, its architecture is not undefined.
-When Belltower eventually spawns delegated work, the default model should be child sessions with explicit lineage and usually isolated worktrees, not branches pretending to be independent workers.
+Belltower now has bounded child-session execution with explicit lineage,
+per-child provider/model settings, and typed durable parent-child messages.
+Autonomous model-facing spawn is approval-gated; manual spawn remains an
+explicit authenticated operator action that does not start child execution.
+This is not a general workflow scheduler. Delegated coding at scale still
+requires isolated worktrees, and broader recursion or role policy must land in
+a separate composition layer only when real workloads justify it.
 
 User-owned trajectory datasets are also part of the long-term design, but not the current release bar.
 When they land, they should be derived from the canonical session/event store as stable artifacts for replay, evaluation, and training rather than introducing a second runtime path.
@@ -285,7 +290,7 @@ The following requirements are the implementation target.
 
 ### FR-13a. Session Lineage And Multi-Session Inspectability
 
-- Belltower must treat session lineage as a first-class inspectability concern, even before subagent execution ships.
+- Belltower must treat session lineage as a first-class inspectability concern for manual and model-facing child-session execution.
 - The canonical session model must be able to represent:
   - parent/child session relationships
   - delegation or spawn origin
@@ -294,17 +299,26 @@ The following requirements are the implementation target.
   - which related sessions belong to the same higher-level workflow
   - what happened in each related session
   - how branch history and session lineage differ
-- This requirement exists so future autonomous and multi-agent workflows remain reproducible and auditable instead of becoming opaque side channels.
+- This requirement keeps bounded delegation reproducible and auditable and
+  prevents future multi-agent workflows from becoming opaque side channels.
 
 ### FR-13b. Delegated Session Semantics
 
-- When subagent execution is implemented, Belltower should model it as child sessions, not as ordinary branches.
+- Belltower models subagent execution as child sessions, not as ordinary branches.
 - Child sessions must have:
   - explicit parent session, branch, and turn origin
   - their own queue, approvals, cancel, and steer state
   - their own canonical session log and their own turn-scoped exported traces
-- Delegated coding work should use isolated worktrees by default unless the operator explicitly opts into a shared-worktree mode.
-- Parent-child relationships and result handoff must be visible through canonical events and inspection surfaces, not hidden runtime state.
+- Parent-child messages must use typed durable mailbox events with explicit
+  delivery and resolution state, not transcript reconstruction or hidden
+  process-local state.
+- Until isolated worktrees land, shared-project-root execution must be explicit
+  and described truthfully. Model-facing autonomous spawn must be
+  approval-gated; manual spawn is an authenticated operator action that creates
+  but does not execute a child. Delegated coding at scale should use isolated
+  worktrees by default.
+- Higher-order scheduling, role systems, and recursive delegation policy are
+  outside the per-session runtime contract.
 
 ### FR-14. First-Class MCP
 
@@ -629,14 +643,16 @@ Goal: Belltower can develop itself.
 
 These are intentionally not required for the first stable bar:
 
-- subagent execution
+- generalized multi-agent scheduling, role systems, and isolated-worktree lifecycle
 - generalized plugin hosting beyond MCP/custom tools
 - self-improvement against the active worktree
 - pretending ChatGPT/Codex subscription auth is the same as OpenAI API access
 - Frolllo-specific integration behavior inside Belltower crates
 
-Notably, "subagent execution is not required yet" does not mean "session lineage and cross-session inspection can be ignored."
-Those observability requirements are part of the stable architectural bar.
+Notably, bounded child-session execution does not make Belltower a general
+multi-agent framework. Session lineage, durable mailbox state, and
+cross-session inspection remain part of the stable architectural bar; broader
+workflow policy remains experimental.
 
 ## 8. Definition Of Done
 

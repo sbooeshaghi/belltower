@@ -53,6 +53,8 @@ During coherence passes, treat these as the primary comparison surfaces:
   transitions
 - exact request-sequence claims for approval/input resume and atomic
   parent/child session-spawn lineage
+- atomic paired related-session messages, FIFO wake claims, mixed-model child
+  settings, and model-facing subagent tool adapters
 - telemetry and export behavior
 
 ## Expected Outcomes

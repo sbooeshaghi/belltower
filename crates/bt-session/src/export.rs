@@ -1930,6 +1930,8 @@ fn portable_event_kind(value: &Value) -> Result<&'static str> {
         "SessionHandoffRecorded" => "session.handoff.recorded",
         "SessionResultImported" => "session.result.imported",
         "SessionResultRejected" => "session.result.rejected",
+        "RelatedSessionMessageRecorded" => "session.related_message.recorded",
+        "RelatedSessionMessageResolved" => "session.related_message.resolved",
         "SessionSettingsUpdated" => "session.settings.updated",
         "SessionEnded" => "session.ended",
         "BranchCreated" => "branch.created",

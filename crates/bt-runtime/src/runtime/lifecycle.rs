@@ -88,6 +88,73 @@ impl BelltowerRuntime {
             )?;
         }
 
+        self.repair_interrupted_related_session_notifications()?;
+
+        Ok(())
+    }
+
+    fn repair_interrupted_related_session_notifications(&self) -> Result<()> {
+        let sessions = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?
+            .list_sessions()?;
+        for session in sessions
+            .into_iter()
+            .filter(|session| session.parent_session_id.is_some())
+        {
+            let messages = self.related_session_messages(session.session_id)?;
+            let events = self
+                .store
+                .lock()
+                .map_err(|_| {
+                    bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned())
+                })?
+                .load_all_events(session.session_id)?;
+            for record in messages.iter().filter(|record| {
+                record.direction == RelatedSessionMessageDirection::Received
+                    && record.status == RelatedSessionMessageStatus::Claimed
+                    && record.resulting_turn_id.is_some()
+            }) {
+                let turn_id = record.resulting_turn_id.expect("filtered above");
+                let interrupted = events.iter().any(|event| {
+                    matches!(
+                        &event.payload,
+                        EventPayload::TurnFinished {
+                            turn_id: event_turn_id,
+                            status,
+                            finish_reason: Some(finish_reason),
+                            ..
+                        } if *event_turn_id == turn_id
+                            && status == "failed"
+                            && matches!(
+                                finish_reason.as_str(),
+                                "interrupted_after_restart" | "interrupted_after_resume"
+                            )
+                    )
+                });
+                let already_notified = messages.iter().any(|candidate| {
+                    candidate.direction == RelatedSessionMessageDirection::Sent
+                        && candidate.message.kind == RelatedSessionMessageKind::Error
+                        && candidate.message.in_reply_to == Some(record.message.message_id)
+                });
+                if interrupted && !already_notified {
+                    self.send_related_session_message(
+                        session.session_id,
+                        record.message.destination_branch_id,
+                        None,
+                        record.message.source_session_id,
+                        record.message.source_branch_id,
+                        RelatedSessionMessageKind::Error,
+                        RelatedSessionDeliveryMode::Notify,
+                        Some(record.message.message_id),
+                        "Subagent turn was interrupted by runtime restart. Its outcome is unknown and it was not retried automatically because side effects may have occurred."
+                            .to_owned(),
+                        Vec::new(),
+                    )?;
+                }
+            }
+        }
         Ok(())
     }
 

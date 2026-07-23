@@ -916,6 +916,15 @@ impl BelltowerRuntime {
         if let Some(dispatch) = self.apply_pending_steers(session, branch)? {
             return Ok(PostTurnControlAction::ContinueCurrentBranch(dispatch));
         }
+        if let Some(dispatch) = self.claim_next_related_session_message(session.session_id)? {
+            return Ok(PostTurnControlAction::ContinueRelatedSessionBranch(
+                QueuedDispatch {
+                    branch_id: dispatch.branch_id,
+                    turn_id: dispatch.turn_id(),
+                    settings_revision_id: dispatch.settings_revision_id(),
+                },
+            ));
+        }
         if let Some(dispatch) = self.dispatch_next_queued_message(session)? {
             return Ok(PostTurnControlAction::ContinueQueuedBranch(dispatch));
         }

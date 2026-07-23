@@ -39,6 +39,7 @@ use time::OffsetDateTime;
 
 use crate::bottom_pane::BottomSurfaceKind;
 use crate::command_actions::parse_spawn_command_args;
+use crate::command_render::render_turn_start_source;
 use crate::inline_terminal::render_input_text;
 
 fn test_client() -> BelltowerClient {
@@ -3330,6 +3331,10 @@ fn execution_output_renders_canonical_turn_provenance() {
     assert!(output.contains("context_boundary=2"));
     assert!(output.contains("context_messages=1"));
     assert!(output.contains("context_tools=1"));
+    assert_eq!(
+        render_turn_start_source(&TurnStartSource::RelatedSessionMessage),
+        "related_session_message"
+    );
 }
 
 #[test]

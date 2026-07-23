@@ -248,6 +248,21 @@ The control-plane rule is now explicit:
   child start/handoff, and parent spawn completion commit as one store
   transition. A historical parent turn is causal lineage, not permission to
   append new live events to that already-finished turn
+- related-session communication uses `session.related_message.recorded` and
+  `session.related_message.resolved`, not transcript text or a process-local
+  mailbox. One logical message commits matching `Sent` and `Received` copies to
+  the source and destination sessions atomically. Message ids are idempotency
+  identities: an exact retry returns the existing receipt, while conflicting
+  content under the same id fails
+- `wake` messages remain pending while the destination is busy. An idle claim
+  consumes the oldest pending message and atomically appends its `Claimed`
+  resolution plus `turn.started { source: related_session_message }` using the
+  destination's current settings revision. `notify` messages are durable
+  context but do not start work
+- a claimed cross-session turn is not retried automatically after restart,
+  because tools may already have produced side effects. Recovery terminalizes
+  the interrupted turn and sends one typed durable error to the originating
+  session instead
 - `context.compacted` records a stable `compaction_id`, trigger, phase, status,
   provider/model, context boundary, summary message reference, first-kept
   message/source reference when available, latency, and before/after accounting.

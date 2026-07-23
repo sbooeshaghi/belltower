@@ -1075,13 +1075,14 @@ fn render_context_manifest_summary(turn: &TraceTurnInspection) -> String {
     )
 }
 
-fn render_turn_start_source(source: &bt_core::TurnStartSource) -> &'static str {
+pub(crate) fn render_turn_start_source(source: &bt_core::TurnStartSource) -> &'static str {
     match source {
         bt_core::TurnStartSource::UserMessage => "user_message",
         bt_core::TurnStartSource::ApprovalResume => "approval_resume",
         bt_core::TurnStartSource::InputResume => "input_resume",
         bt_core::TurnStartSource::SteerFollowUp => "steer_follow_up",
         bt_core::TurnStartSource::QueuedFollowUp => "queued_follow_up",
+        bt_core::TurnStartSource::RelatedSessionMessage => "related_session_message",
     }
 }
 

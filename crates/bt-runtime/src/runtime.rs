@@ -7,27 +7,30 @@ use bt_core::{
     ApprovalDecision, ApprovalEvaluator, ApprovalRequest, BelltowerConfig, BranchId,
     BranchInspection, BranchRecord, BudgetConfig, CompletionDelta, CompletionSummary,
     ConnectionDescriptor, ConnectionId, CostBreakdown, EventEnvelope, EventPayload,
-    McpServerDescriptor, McpToolDescriptor, Message, MessagePart, ModelBackendDescriptor,
-    ModelRecommendationsReport, PendingApprovalInspection, PendingInputInspection, PlanInspection,
-    PlanItem, PricingEntry, QueuedMessageInspection, QueuedMessageResolutionOutcome,
-    RelatedSessionSummary, Result, Role, SessionBudgetInspection, SessionCostSummary,
-    SessionErrorInspection, SessionExecutionInspection, SessionId, SessionInspection,
-    SessionLineageInspection, SessionLineageNode, SessionQueueInspection, SessionRecord,
-    SessionRelationKind, SessionRuntimeState, SessionSettingsSnapshot, SessionStatus,
-    SessionToolCallInspection, SessionToolMode, SessionTreeInspection, SessionWorkflowInspection,
-    SpanKind, StartupTrace, SteerResolutionOutcome, ThinkingConfig, TokenUsage, ToolCall,
-    ToolCallId, ToolResultEnvelope, ToolSpec, TraceEventCounts, TraceTurnInspection, TurnId,
-    TurnInspection, TurnStartSource, TurnToolCallSummary, WorkflowRuntimeCounts,
-    WorkflowSessionNode, WorkflowStatusCounts, default_settings_revision_id,
+    MAX_RELATED_SESSION_DEPTH, MAX_RELATED_SESSION_DESCENDANTS, McpServerDescriptor,
+    McpToolDescriptor, Message, MessagePart, ModelBackendDescriptor, ModelRecommendationsReport,
+    PendingApprovalInspection, PendingInputInspection, PlanInspection, PlanItem, PricingEntry,
+    QueuedMessageInspection, QueuedMessageResolutionOutcome, RelatedSessionDeliveryMode,
+    RelatedSessionMessage, RelatedSessionMessageDirection, RelatedSessionMessageId,
+    RelatedSessionMessageKind, RelatedSessionMessageReceipt, RelatedSessionMessageRecord,
+    RelatedSessionMessageStatus, RelatedSessionSummary, Result, Role, SessionBudgetInspection,
+    SessionCostSummary, SessionErrorInspection, SessionExecutionInspection, SessionId,
+    SessionInspection, SessionLineageInspection, SessionLineageNode, SessionQueueInspection,
+    SessionRecord, SessionRelationKind, SessionRuntimeState, SessionSettingsSnapshot,
+    SessionStatus, SessionToolCallInspection, SessionToolMode, SessionTreeInspection,
+    SessionWorkflowInspection, SpanKind, StartupTrace, SteerResolutionOutcome, ThinkingConfig,
+    TokenUsage, ToolCall, ToolCallId, ToolResultEnvelope, ToolSpec, TraceEventCounts,
+    TraceTurnInspection, TurnId, TurnInspection, TurnStartSource, TurnToolCallSummary,
+    WorkflowRuntimeCounts, WorkflowSessionNode, WorkflowStatusCounts, default_settings_revision_id,
     render_queue_message_input,
 };
 use bt_mcp::{McpRegisteredTool, McpRegistry};
 use bt_models::LocalModelManager;
 use bt_session::{
-    ChunkPage, ContinuationClaim, LegacySessionExportBundle, LegacySessionExporter,
-    QueuedMessageProjection, RawChunkRecord, RecordedOperatorCommandRecord, SequencedMessageRecord,
-    SessionBudgetProjection, SessionControlProjection, SessionTurnAdmission, SqliteSessionStore,
-    SteerProjection, TranscriptPage,
+    ChunkPage, ContextMessageRecord, ContinuationClaim, LegacySessionExportBundle,
+    LegacySessionExporter, QueuedMessageProjection, RawChunkRecord, RecordedOperatorCommandRecord,
+    SequencedMessageRecord, SessionBudgetProjection, SessionControlProjection,
+    SessionTurnAdmission, SqliteSessionStore, SteerProjection, TranscriptPage,
 };
 use camino::Utf8PathBuf;
 use std::sync::{Arc, Mutex};
@@ -41,6 +44,7 @@ mod lifecycle;
 mod lineage;
 mod queries;
 mod records;
+mod related_sessions;
 mod services;
 mod sessions;
 mod support;
