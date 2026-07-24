@@ -265,6 +265,15 @@ with optional artifact references and reply correlation. A richer return
 artifact should remain structured rather than becoming an untyped transcript
 convention.
 
+Messaging topology is tree-scoped, not edge-scoped: any two sessions sharing
+a lineage root may exchange typed messages (parent-child, siblings, cousins),
+and nothing crosses trees. Peer traffic is deliberately NOT copied to the
+parent — a coordinator receives outcomes through reply settlement, while
+peer-to-peer chatter stays out of its context budget. Every message is
+durable in both participants' logs, and any session in the tree can inspect
+another's mailbox on demand through `list_agents { target_session_id }`
+(pull, not push).
+
 Reply settlement is a turn-run invariant, not a dispatch-path courtesy: at the
 end of every turn run on a child session, each claimed `instruction`/`question`
 message without a terminal reply receives one derived from the outcome. A

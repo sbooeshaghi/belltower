@@ -4031,6 +4031,77 @@ async fn workflow_route_reports_parent_child_runtime_state() {
 }
 
 #[tokio::test]
+async fn agent_messaging_is_scoped_to_one_lineage_tree() {
+    let server = spawn_server(BelltowerConfig::from_embedded().expect("config")).await;
+    let runtime = &server.runtime;
+
+    let (root, root_branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("local"),
+            None,
+            bt_core::SessionToolMode::Extended,
+            Some("lineage-root".to_owned()),
+            None,
+        )
+        .expect("root session");
+    let (sibling_a, _) = runtime
+        .spawn_child_session(
+            root.session_id,
+            root_branch.branch_id,
+            None,
+            "sibling a".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("sibling a");
+    let (sibling_b, sibling_b_branch) = runtime
+        .spawn_child_session(
+            root.session_id,
+            root_branch.branch_id,
+            None,
+            "sibling b".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("sibling b");
+    let (grandchild, _) = runtime
+        .spawn_child_session(
+            sibling_b.session_id,
+            sibling_b_branch.branch_id,
+            None,
+            "grandchild".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("grandchild");
+    let (stranger, _) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("local"),
+            None,
+            bt_core::SessionToolMode::Extended,
+            Some("other-tree".to_owned()),
+            None,
+        )
+        .expect("stranger session");
+
+    let same_lineage = crate::agent_tools::ensure_same_lineage;
+    // Siblings, parent-child, and cousin edges within one tree are allowed.
+    same_lineage(runtime, sibling_a.session_id, sibling_b.session_id).expect("siblings");
+    same_lineage(runtime, root.session_id, grandchild.session_id).expect("grandchild");
+    same_lineage(runtime, grandchild.session_id, sibling_a.session_id).expect("cousin edge");
+    // Self-messaging and cross-tree messaging are rejected.
+    same_lineage(runtime, sibling_a.session_id, sibling_a.session_id)
+        .expect_err("self-messaging must be rejected");
+    same_lineage(runtime, sibling_a.session_id, stranger.session_id)
+        .expect_err("cross-tree messaging must be rejected");
+}
+
+#[tokio::test]
 async fn operator_spawn_dispatches_child_objective_and_wakes_parent() {
     let mock_provider = spawn_mock_provider().await;
     let server = spawn_server(config_for_mock_provider(&mock_provider.base_url)).await;

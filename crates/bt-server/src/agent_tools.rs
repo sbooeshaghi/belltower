@@ -218,7 +218,7 @@ impl ToolExecutor for SendAgentMessageTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "send_agent_message".to_owned(),
-            description: "Send a durable typed message to a direct parent or child agent. notify records context for a future turn; wake also requests an idle destination turn without interrupting active work.".to_owned(),
+            description: "Send a durable typed message to any agent in this session tree (parent, child, or sibling). notify records context for a future turn; wake also requests an idle destination turn without interrupting active work. Parents are not copied on peer messages; use list_agents to inspect a related session's mailbox.".to_owned(),
             parameters_schema: json!({
                 "type": "object",
                 "required": ["target_session_id", "text", "call_id"],
@@ -264,7 +264,7 @@ impl ToolExecutor for SendAgentMessageTool {
         Box::pin(async move {
             let call_id = ToolCallId::new(required_string(&arguments, "call_id")?);
             let target_session_id = parse_session_id(&arguments, "target_session_id")?;
-            ensure_direct_relation(&self.state.runtime, self.session_id, target_session_id)?;
+            ensure_same_lineage(&self.state.runtime, self.session_id, target_session_id)?;
             let target_branch = self
                 .state
                 .runtime
@@ -329,11 +329,17 @@ impl ToolExecutor for ListAgentsTool {
     fn spec(&self) -> ToolSpec {
         read_tool_spec(
             "list_agents",
-            "Inspect the canonical session lineage, runtime states, and durable messages visible from the current agent.",
+            "Inspect the canonical session lineage, runtime states, and durable messages visible from the current agent. Pass target_session_id to read the mailbox of another session in this tree instead of your own — peer traffic is never pushed to you, but any of it can be inspected here on demand.",
             json!({
                 "type": "object",
                 "required": ["call_id"],
-                "properties": {"call_id": {"type": "string"}},
+                "properties": {
+                    "call_id": {"type": "string"},
+                    "target_session_id": {
+                        "type": "string",
+                        "description": "Optional session in this lineage tree whose mailbox to return instead of the caller's."
+                    }
+                },
                 "additionalProperties": false
             }),
         )
@@ -346,19 +352,31 @@ impl ToolExecutor for ListAgentsTool {
     fn execute(&self, arguments: Value, _context: ToolContext) -> ToolFuture<'_> {
         Box::pin(async move {
             let call_id = ToolCallId::new(required_string(&arguments, "call_id")?);
+            let mailbox_session_id = match optional_string(&arguments, "target_session_id") {
+                Some(value) => {
+                    let target = parse_session_id_value(&value)?;
+                    ensure_same_lineage(&self.runtime, self.session_id, target)?;
+                    target
+                }
+                None => self.session_id,
+            };
             let workflow = self
                 .runtime
                 .session_workflow(self.session_id)?
                 .ok_or_else(|| BelltowerError::NotFound("session workflow".to_owned()))?;
             let messages = latest_messages(
-                self.runtime.related_session_messages(self.session_id)?,
+                self.runtime.related_session_messages(mailbox_session_id)?,
                 MAX_RETURNED_MESSAGES,
             );
             Ok(ToolResultEnvelope {
                 call_id,
                 tool_name: "list_agents".to_owned(),
                 is_error: false,
-                output: json!({"workflow": workflow, "messages": messages}),
+                output: json!({
+                    "workflow": workflow,
+                    "mailbox_session_id": mailbox_session_id,
+                    "messages": messages
+                }),
                 duration_ms: None,
             })
         })
@@ -374,7 +392,7 @@ impl ToolExecutor for WaitAgentTool {
     fn spec(&self) -> ToolSpec {
         read_tool_spec(
             "wait_agent",
-            "Wait for a bounded interval for a direct parent or child to send a durable message. This observes activity; it does not join or cancel the other agent.",
+            "Wait for a bounded interval for a related session in this tree to send a durable message. This observes activity; it does not join or cancel the other agent.",
             json!({
                 "type": "object",
                 "required": ["call_id"],
@@ -400,7 +418,7 @@ impl ToolExecutor for WaitAgentTool {
                 .map(|value| parse_session_id_value(&value))
                 .transpose()?;
             if let Some(target_session_id) = target_session_id {
-                ensure_direct_relation(&self.runtime, self.session_id, target_session_id)?;
+                ensure_same_lineage(&self.runtime, self.session_id, target_session_id)?;
             }
             let after_seq_id = arguments
                 .get("after_seq_id")
@@ -685,26 +703,51 @@ fn latest_messages(
     messages
 }
 
-fn ensure_direct_relation(
+/// Agent messaging and mailbox inspection are scoped to one session tree:
+/// any two sessions sharing a lineage root may interact (parent-child,
+/// siblings, cousins), and nothing crosses trees. Parents are deliberately
+/// NOT copied on peer traffic — every message is already durable in the
+/// event log, and a coordinator inspects on demand via `list_agents`.
+pub(super) fn ensure_same_lineage(
     runtime: &BelltowerRuntime,
     source_session_id: SessionId,
     target_session_id: SessionId,
 ) -> Result<()> {
-    let source = runtime
-        .load_session(source_session_id)?
-        .ok_or_else(|| BelltowerError::NotFound(format!("session `{source_session_id}`")))?;
-    let target = runtime
-        .load_session(target_session_id)?
-        .ok_or_else(|| BelltowerError::NotFound(format!("session `{target_session_id}`")))?;
-    if source.parent_session_id == Some(target_session_id)
-        || target.parent_session_id == Some(source_session_id)
-    {
+    if source_session_id == target_session_id {
+        return Err(BelltowerError::Protocol(
+            "agent messaging requires a related session other than the caller".to_owned(),
+        ));
+    }
+    let source_root = lineage_root(runtime, source_session_id)?;
+    let target_root = lineage_root(runtime, target_session_id)?;
+    if source_root == target_root {
         Ok(())
     } else {
         Err(BelltowerError::Protocol(
-            "agent messaging is limited to direct parent-child sessions".to_owned(),
+            "agent messaging is limited to sessions in the same lineage tree".to_owned(),
         ))
     }
+}
+
+fn lineage_root(runtime: &BelltowerRuntime, session_id: SessionId) -> Result<SessionId> {
+    let mut visited = HashSet::new();
+    let mut cursor = runtime
+        .load_session(session_id)?
+        .ok_or_else(|| BelltowerError::NotFound(format!("session `{session_id}`")))?;
+    visited.insert(cursor.session_id);
+    while let Some(parent_id) = cursor.parent_session_id {
+        if !visited.insert(parent_id) {
+            return Err(BelltowerError::InvalidState(
+                "session lineage contains a cycle".to_owned(),
+            ));
+        }
+        cursor = runtime.load_session(parent_id)?.ok_or_else(|| {
+            BelltowerError::InvalidState(format!(
+                "session lineage references missing parent `{parent_id}`"
+            ))
+        })?;
+    }
+    Ok(cursor.session_id)
 }
 
 fn read_tool_spec(name: &str, description: &str, parameters_schema: Value) -> ToolSpec {
@@ -1208,6 +1251,6 @@ mod tests {
             )
             .await
             .expect_err("unrelated session must be rejected");
-        assert!(error.to_string().contains("direct parent-child"));
+        assert!(error.to_string().contains("same lineage tree"));
     }
 }

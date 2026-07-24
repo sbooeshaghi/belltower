@@ -192,9 +192,11 @@ same runtime/store boundary:
 - the operator route `POST /sessions/{id}/spawn` has the same dispatch
   contract: the objective is delivered as a wake instruction and the child
   starts immediately; `dispatch: false` opts into a prepared-but-idle child
-- `send_agent_message` records a typed direct parent-child message and may wake
-  an idle destination
-- `list_agents` returns canonical workflow lineage plus recent mailbox records
+- `send_agent_message` records a typed message to any session in the same
+  lineage tree (parent, child, or sibling) and may wake an idle destination;
+  parents are not copied on peer traffic
+- `list_agents` returns canonical workflow lineage plus recent mailbox
+  records, optionally for another same-tree session via `target_session_id`
 - `wait_agent` performs a bounded mailbox wait without joining or cancelling
   another session
 
