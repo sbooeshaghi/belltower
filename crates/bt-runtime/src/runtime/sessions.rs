@@ -358,15 +358,18 @@ impl BelltowerRuntime {
             .load_branch(parent_session_id, parent_branch_id)?
             .ok_or_else(|| bt_core::BelltowerError::InvalidState("branch not found".to_owned()))?;
 
-        let branch_turns = self
-            .turn_history(parent_session_id)?
+        let branch_turn_ids = self
+            .events_of_kind(parent_session_id, "turn.started", Some(parent_branch_id))?
             .into_iter()
-            .filter(|turn| turn.branch_id == parent_branch_id)
+            .filter_map(|event| match event.payload {
+                EventPayload::TurnStarted { turn_id, .. } => Some(turn_id),
+                _ => None,
+            })
             .collect::<Vec<_>>();
-        let latest_branch_turn_id = branch_turns.last().map(|turn| turn.turn_id);
+        let latest_branch_turn_id = branch_turn_ids.last().copied();
         let origin_turn_id = match parent_turn_id {
             Some(turn_id) => {
-                if branch_turns.iter().any(|turn| turn.turn_id == turn_id) {
+                if branch_turn_ids.contains(&turn_id) {
                     Some(turn_id)
                 } else {
                     return Err(bt_core::BelltowerError::InvalidState(

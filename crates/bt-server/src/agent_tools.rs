@@ -3,7 +3,7 @@
 //! These executors adapt the canonical runtime/session graph to the agent tool
 //! loop. They do not own lineage, mailbox, admission, or turn semantics.
 
-use crate::{AppState, run_session_turn};
+use crate::{AppState, detach_turn_work, run_session_turn};
 use bt_core::{
     ApprovalRequirement, BelltowerError, BranchId, ConnectionId, RelatedSessionDeliveryMode,
     RelatedSessionMessageDirection, RelatedSessionMessageId, RelatedSessionMessageKind, Result,
@@ -437,24 +437,32 @@ fn dispatch_agent_turn(
         .runtime
         .load_branch(admitted.session_id(), admitted.branch_id())?
         .ok_or_else(|| BelltowerError::NotFound("agent branch".to_owned()))?;
-    tokio::spawn(async move {
-        let outcome = run_session_turn(&state, &session, &branch, admitted).await;
-        if let Err(error) = record_agent_outcome(
-            &state,
-            &session,
-            &branch,
-            reply_destination_session_id,
-            reply_destination_branch_id,
-            in_reply_to,
-            outcome,
-        ) {
-            tracing::warn!(
-                session_id = %session.session_id,
-                error = %error,
-                "failed to record subagent outcome"
-            );
-        }
-    });
+    let work_state = state.clone();
+    detach_turn_work(
+        &state,
+        session.session_id,
+        branch.branch_id,
+        admitted.turn_id(),
+        async move {
+            let outcome = run_session_turn(&work_state, &session, &branch, admitted).await;
+            if let Err(error) = record_agent_outcome(
+                &work_state,
+                &session,
+                &branch,
+                reply_destination_session_id,
+                reply_destination_branch_id,
+                in_reply_to,
+                outcome,
+            ) {
+                tracing::warn!(
+                    session_id = %session.session_id,
+                    error = %error,
+                    "failed to record subagent outcome"
+                );
+            }
+            Ok(())
+        },
+    );
     Ok(())
 }
 
@@ -682,11 +690,9 @@ fn active_turn_id(
     branch_id: BranchId,
 ) -> Result<bt_core::TurnId> {
     runtime
-        .turn_history(session_id)?
-        .into_iter()
-        .rev()
-        .find(|turn| turn.branch_id == branch_id && turn.finished_at.is_none())
-        .map(|turn| turn.turn_id)
+        .active_turn_claim(session_id)?
+        .filter(|(claim_branch_id, _)| *claim_branch_id == branch_id)
+        .map(|(_, turn_id)| turn_id)
         .ok_or_else(|| {
             BelltowerError::InvalidState(
                 "model-facing agent tools require an active caller turn".to_owned(),

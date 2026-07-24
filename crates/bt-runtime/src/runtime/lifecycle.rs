@@ -104,18 +104,21 @@ impl BelltowerRuntime {
             .filter(|session| session.parent_session_id.is_some())
         {
             let messages = self.related_session_messages(session.session_id)?;
-            let events = self
-                .store
-                .lock()
-                .map_err(|_| {
-                    bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned())
-                })?
-                .load_all_events(session.session_id)?;
-            for record in messages.iter().filter(|record| {
-                record.direction == RelatedSessionMessageDirection::Received
-                    && record.status == RelatedSessionMessageStatus::Claimed
-                    && record.resulting_turn_id.is_some()
-            }) {
+            let claimed_records = messages
+                .iter()
+                .filter(|record| {
+                    record.direction == RelatedSessionMessageDirection::Received
+                        && record.status == RelatedSessionMessageStatus::Claimed
+                        && record.resulting_turn_id.is_some()
+                })
+                .collect::<Vec<_>>();
+            if claimed_records.is_empty() {
+                continue;
+            }
+            // Only turn boundaries matter here; replaying whole child logs at
+            // every startup made launch time scale with total history.
+            let events = self.events_of_kind(session.session_id, "turn.finished", None)?;
+            for record in claimed_records {
                 let turn_id = record.resulting_turn_id.expect("filtered above");
                 let interrupted = events.iter().any(|event| {
                     matches!(

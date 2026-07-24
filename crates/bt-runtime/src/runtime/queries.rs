@@ -22,6 +22,30 @@ impl BelltowerRuntime {
             .load_all_events(session_id)
     }
 
+    pub fn events_of_kind(
+        &self,
+        session_id: SessionId,
+        event_kind: &str,
+        branch_id: Option<bt_core::BranchId>,
+    ) -> Result<Vec<EventEnvelope>> {
+        self.store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?
+            .load_events_of_kind(session_id, event_kind, branch_id)
+    }
+
+    /// The session's current active-turn claim (branch, turn), if a turn owns
+    /// the session right now. Indexed projection lookup — never a log replay.
+    pub fn active_turn_claim(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<(bt_core::BranchId, TurnId)>> {
+        self.store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?
+            .active_turn_claim(session_id)
+    }
+
     pub fn operator_command_events(
         &self,
         session_id: SessionId,

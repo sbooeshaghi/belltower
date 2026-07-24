@@ -2017,6 +2017,69 @@ impl SqliteSessionStore {
         load_session_event_log_from_connection(&self.connection, session_id)
     }
 
+    /// Loads only events of one kind (optionally branch-scoped) through the
+    /// `events(session_id, event_kind, seq_id)` index, so control-flow
+    /// lookups (latest turn boundary, finished-turn checks) stop replaying
+    /// whole session logs.
+    pub fn load_events_of_kind(
+        &self,
+        session_id: SessionId,
+        event_kind: &str,
+        branch_id: Option<BranchId>,
+    ) -> Result<Vec<EventEnvelope>> {
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT event_json, seq_id
+                 FROM events
+                 WHERE session_id = ?1 AND event_kind = ?2
+                   AND (?3 IS NULL OR branch_id = ?3)
+                 ORDER BY seq_id ASC",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    session_id.to_string(),
+                    event_kind,
+                    branch_id.map(|id| id.to_string())
+                ],
+                |row| {
+                    let raw: String = row.get(0)?;
+                    let seq_id: i64 = row.get(1)?;
+                    let mut event: EventEnvelope =
+                        serde_json::from_str(&raw).map_err(to_sql_conversion)?;
+                    event.seq_id = Some(seq_id);
+                    Ok(event)
+                },
+            )
+            .map_err(storage_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_error)
+    }
+
+    /// The session's current active-turn claim, straight from the
+    /// coordination projection.
+    pub fn active_turn_claim(&self, session_id: SessionId) -> Result<Option<(BranchId, TurnId)>> {
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT branch_id, turn_id FROM active_turn_projection WHERE session_id = ?1",
+            )
+            .map_err(storage_error)?;
+        let mut rows = statement
+            .query_map(params![session_id.to_string()], |row| {
+                let branch_id: String = row.get(0)?;
+                let turn_id: String = row.get(1)?;
+                Ok((
+                    branch_id.parse().map_err(to_sql_conversion)?,
+                    turn_id.parse().map_err(to_sql_conversion)?,
+                ))
+            })
+            .map_err(storage_error)?;
+        rows.next().transpose().map_err(storage_error)
+    }
+
     pub fn load_unfinished_resumed_turns(&self) -> Result<Vec<ResumedTurnRecoveryRecord>> {
         let mut records = self
             .load_unfinished_turns()?
