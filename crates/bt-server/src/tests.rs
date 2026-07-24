@@ -82,6 +82,16 @@ fn api_client(server: &TestServer) -> BelltowerClient {
     .expect("api client")
 }
 
+/// Message dispatch is asynchronous: send/approve/answer return 202 once the
+/// turn is durably admitted, before the turn runs. Tests call this after any
+/// dispatching POST to wait until the runtime settles (no running turn, no
+/// queued messages) before observing messages/events/turns/exports.
+async fn settle(api: &BelltowerClient, session_id: SessionId) -> SessionRuntimeState {
+    api.wait_for_session_settle(session_id, std::time::Duration::from_secs(15))
+        .await
+        .expect("session settles")
+}
+
 impl Drop for TestServer {
     fn drop(&mut self) {
         self.handle.abort();
@@ -449,6 +459,8 @@ async fn api_errors_include_protocol_header_and_typed_envelope() {
 // 5.4 scenario -> ErrorClass mapping:
 // bad auth -> Auth; missing session -> NotFound; malformed request -> Protocol;
 // protocol-version mismatch -> Protocol; storage-unavailable simulation -> Storage.
+// Storage failures during a dispatched turn are observed durably (session.error
+// event + failed turn) rather than as an HTTP status on the send POST.
 #[tokio::test]
 async fn error_envelope_matrix_pins_client_visible_error_classes() {
     let server = spawn_server(BelltowerConfig::from_embedded().expect("config")).await;
@@ -510,6 +522,7 @@ async fn error_envelope_matrix_pins_client_visible_error_classes() {
     let storage_api = api_client(&storage_server);
     let created = storage_api
         .create_session(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -521,18 +534,17 @@ async fn error_envelope_matrix_pins_client_visible_error_classes() {
         .await
         .expect("create storage session");
 
-    let send_api = storage_api.clone();
-    let send_task = tokio::spawn(async move {
-        send_api
-            .send_message(
-                created.session.session_id,
-                &SendMessageRequest {
-                    branch_id: created.branch.branch_id,
-                    message: Message::text(Role::User, "hello"),
-                },
-            )
-            .await
-    });
+    let sent = storage_api
+        .send_message(
+            created.session.session_id,
+            &SendMessageRequest {
+                branch_id: created.branch.branch_id,
+                message: Message::text(Role::User, "hello"),
+            },
+        )
+        .await
+        .expect("send message");
+    assert_eq!(sent.outcome, SendMessageOutcome::Dispatched);
 
     let mut request_seen = mock_provider.request_seen.clone();
     while !*request_seen.borrow_and_update() {
@@ -550,16 +562,24 @@ async fn error_envelope_matrix_pins_client_visible_error_classes() {
         .send(true)
         .expect("release provider stream");
 
-    let storage_error = tokio::time::timeout(std::time::Duration::from_secs(10), send_task)
+    settle(&storage_api, created.session.session_id).await;
+    let turns = storage_api
+        .session_turns(created.session.session_id)
         .await
-        .expect("send timeout")
-        .expect("send task")
-        .expect_err("storage failure should surface as API error");
-    assert_client_api_error(
-        storage_error,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        ErrorClass::Storage,
+        .expect("session turns");
+    assert_eq!(
+        turns.turns.last().and_then(|turn| turn.status.as_deref()),
+        Some("failed")
     );
+    let events = storage_api
+        .session_events(created.session.session_id, None)
+        .await
+        .expect("session events");
+    assert!(events.events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::SessionError { class, code, .. }
+            if *class == ErrorClass::Storage && code == "storage_error"
+    )));
 }
 
 #[tokio::test]
@@ -597,6 +617,7 @@ async fn approve_missing_tool_call_returns_not_found() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("openai"),
             model_id: None,
@@ -647,6 +668,7 @@ async fn approve_with_wrong_tool_name_returns_not_found_and_keeps_pending_approv
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -676,6 +698,10 @@ async fn approve_with_wrong_tool_name_returns_not_found_and_keeps_pending_approv
         .await
         .expect("send message");
     assert_eq!(send.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        settle(&api_client(&server), created.session.session_id).await,
+        SessionRuntimeState::WaitingOnApproval
+    );
 
     let response = server
         .request(
@@ -722,6 +748,7 @@ async fn route_inventory_sanity_covers_current_release_candidate_surface() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("openai"),
             model_id: None,
@@ -1088,6 +1115,7 @@ async fn session_round_trip_persists_messages_events_and_raw_chunks() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: project_root.path().display().to_string(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -1121,6 +1149,7 @@ async fn session_round_trip_persists_messages_events_and_raw_chunks() {
     assert_eq!(send.session_id, created.session.session_id);
     assert_eq!(send.branch_id, created.branch.branch_id);
     assert_eq!(send.outcome, SendMessageOutcome::Dispatched);
+    settle(&api_client(&server), created.session.session_id).await;
 
     let messages: SessionMessagesResponse = server
         .request(
@@ -1530,6 +1559,7 @@ async fn failed_streaming_turn_records_session_error_and_failed_turn_finish() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -1558,11 +1588,20 @@ async fn failed_streaming_turn_records_session_error_and_failed_turn_finish() {
         .send()
         .await
         .expect("send message");
-    assert_eq!(send.status(), StatusCode::BAD_GATEWAY);
-    let error: ErrorEnvelope = send.json().await.expect("error body");
-    assert_eq!(error.class, ErrorClass::Provider);
-    assert_eq!(error.code, "provider_error");
-    assert!(error.retryable);
+    assert_eq!(send.status(), StatusCode::ACCEPTED);
+    let send: SendMessageResponse = send.json().await.expect("send message body");
+    assert_eq!(send.outcome, SendMessageOutcome::Dispatched);
+
+    let api = api_client(&server);
+    settle(&api, created.session.session_id).await;
+    let turns = api
+        .session_turns(created.session.session_id)
+        .await
+        .expect("session turns");
+    assert_eq!(
+        turns.turns.last().and_then(|turn| turn.status.as_deref()),
+        Some("failed")
+    );
 
     let events: SessionEventsResponse = server
         .request(
@@ -1640,6 +1679,7 @@ async fn pre_turn_failure_closes_prestarted_turn() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("preflight-auth"),
             model_id: Some("gpt-5.4-mini".to_owned()),
@@ -1668,8 +1708,20 @@ async fn pre_turn_failure_closes_prestarted_turn() {
         .send()
         .await
         .expect("send message");
-    let error = assert_error_response(send, StatusCode::UNAUTHORIZED, ErrorClass::Auth).await;
-    assert_eq!(error.code, "auth_error");
+    assert_eq!(send.status(), StatusCode::ACCEPTED);
+    let send: SendMessageResponse = send.json().await.expect("send message body");
+    assert_eq!(send.outcome, SendMessageOutcome::Dispatched);
+
+    let api = api_client(&server);
+    settle(&api, created.session.session_id).await;
+    let turns = api
+        .session_turns(created.session.session_id)
+        .await
+        .expect("session turns");
+    assert_eq!(
+        turns.turns.last().and_then(|turn| turn.status.as_deref()),
+        Some("failed")
+    );
 
     let events: SessionEventsResponse = server
         .request(
@@ -1745,6 +1797,7 @@ async fn storage_failure_during_turn_records_error_and_halts() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -1760,23 +1813,22 @@ async fn storage_failure_during_turn_records_error_and_halts() {
         .await
         .expect("create session body");
 
-    let send_client = client.clone();
-    let send_url = server.url(&format!("sessions/{}/message", created.session.session_id));
-    let token = server.token.clone();
-    let branch_id = created.branch.branch_id;
-    let send_task = tokio::spawn(async move {
-        send_client
-            .post(send_url)
-            .bearer_auth(token)
-            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
-            .json(&SendMessageRequest {
-                branch_id,
-                message: Message::text(Role::User, "hello"),
-            })
-            .send()
-            .await
-            .expect("send message")
-    });
+    let send = server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/message", created.session.session_id),
+        )
+        .json(&SendMessageRequest {
+            branch_id: created.branch.branch_id,
+            message: Message::text(Role::User, "hello"),
+        })
+        .send()
+        .await
+        .expect("send message");
+    assert_eq!(send.status(), StatusCode::ACCEPTED);
+    let send: SendMessageResponse = send.json().await.expect("send message body");
+    assert_eq!(send.outcome, SendMessageOutcome::Dispatched);
 
     let mut request_seen = mock_provider.request_seen.clone();
     while !*request_seen.borrow_and_update() {
@@ -1794,15 +1846,16 @@ async fn storage_failure_during_turn_records_error_and_halts() {
         .send(true)
         .expect("release provider stream");
 
-    let send = tokio::time::timeout(std::time::Duration::from_secs(10), send_task)
+    let api = api_client(&server);
+    settle(&api, created.session.session_id).await;
+    let turns = api
+        .session_turns(created.session.session_id)
         .await
-        .expect("send task timeout")
-        .expect("send task join");
-    assert_eq!(send.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let error: ErrorEnvelope = send.json().await.expect("error body");
-    assert_eq!(error.class, ErrorClass::Storage);
-    assert_eq!(error.code, "storage_error");
-    assert!(error.retryable);
+        .expect("session turns");
+    assert_eq!(
+        turns.turns.last().and_then(|turn| turn.status.as_deref()),
+        Some("failed")
+    );
 
     let events: SessionEventsResponse = server
         .request(
@@ -1878,6 +1931,7 @@ async fn wall_clock_budget_exhaustion_records_checkpoint_and_persists_cancel_sta
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -1912,6 +1966,7 @@ async fn wall_clock_budget_exhaustion_records_checkpoint_and_persists_cancel_sta
         .await
         .expect("send message");
     assert_eq!(send.status(), StatusCode::ACCEPTED);
+    settle(&api_client(&server), created.session.session_id).await;
 
     let queue: SessionQueueResponse = server
         .request(
@@ -2028,6 +2083,7 @@ async fn wall_clock_budget_accounting_survives_server_restart() {
     let created: CreateSessionResponse = first_server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -2062,6 +2118,7 @@ async fn wall_clock_budget_accounting_survives_server_restart() {
         .await
         .expect("first send");
     assert_eq!(first_send.status(), StatusCode::ACCEPTED);
+    settle(&api_client(&first_server), created.session.session_id).await;
     let first_budget = first_server
         .runtime
         .session_budget(created.session.session_id)
@@ -2092,6 +2149,7 @@ async fn wall_clock_budget_accounting_survives_server_restart() {
         .await
         .expect("second send");
     assert_eq!(second_send.status(), StatusCode::ACCEPTED);
+    settle(&api_client(&second_server), created.session.session_id).await;
 
     let queue: SessionQueueResponse = second_server
         .request(
@@ -2149,6 +2207,7 @@ async fn session_settings_can_be_updated() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -2195,6 +2254,7 @@ async fn session_budget_route_configures_runtime_budget() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -2259,6 +2319,7 @@ async fn compact_route_runs_runtime_owned_compaction() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("openai"),
             model_id: Some("o4-mini".to_owned()),
@@ -2396,6 +2457,7 @@ async fn degraded_mcp_servers_do_not_break_turn_execution() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -2425,6 +2487,7 @@ async fn degraded_mcp_servers_do_not_break_turn_execution() {
         .await
         .expect("send message");
     assert_eq!(send.status(), StatusCode::ACCEPTED);
+    settle(&api_client(&server), created.session.session_id).await;
 
     let messages: SessionMessagesResponse = server
         .request(
@@ -2466,6 +2529,7 @@ async fn session_export_returns_legacy_bundle_jsonl_html_sharegpt_and_otlp() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -2494,6 +2558,7 @@ async fn session_export_returns_legacy_bundle_jsonl_html_sharegpt_and_otlp() {
         .send()
         .await
         .expect("send message");
+    settle(&api_client(&server), created.session.session_id).await;
 
     let source_events: SessionEventsResponse = server
         .request(
@@ -2714,6 +2779,7 @@ async fn otlp_push_uploads_real_protobuf_to_collector() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -2742,6 +2808,7 @@ async fn otlp_push_uploads_real_protobuf_to_collector() {
         .send()
         .await
         .expect("send message");
+    settle(&api_client(&server), created.session.session_id).await;
 
     let pushed: PushOtlpExportResponse = server
         .request(
@@ -2827,6 +2894,7 @@ async fn otlp_push_reports_protobuf_partial_success_details() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -2888,6 +2956,7 @@ async fn otlp_push_reports_json_warning_only_partial_success() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -2945,6 +3014,7 @@ async fn otlp_push_keeps_success_when_collector_returns_unreadable_success_body(
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -3007,6 +3077,7 @@ async fn live_otlp_push_to_arize_preserves_session_correlation_across_turn_trace
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: project_root.path().display().to_string(),
             connection_id: ConnectionId::new("openai"),
             model_id: Some("o4-mini".to_owned()),
@@ -3539,6 +3610,7 @@ async fn operator_commands_are_recorded_in_session_events() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -3606,6 +3678,7 @@ async fn clear_queue_route_drains_runtime_queue_and_records_drops() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -3716,6 +3789,7 @@ async fn spawn_route_creates_child_session_with_lineage_and_events() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("openai"),
             model_id: Some("o4-mini".to_owned()),
@@ -3863,6 +3937,7 @@ async fn workflow_route_reports_parent_child_runtime_state() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("openai"),
             model_id: Some("o4-mini".to_owned()),
@@ -4275,6 +4350,7 @@ async fn operator_shell_commands_record_tool_and_command_events() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: project_root.path().display().to_string(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -4394,6 +4470,7 @@ async fn operator_shell_request_admission_is_atomic_on_storage_failure() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: project_root.path().display().to_string(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -4451,6 +4528,7 @@ async fn operator_shell_route_recovers_terminal_batch_after_storage_failure() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: project_root.path().display().to_string(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -4575,6 +4653,7 @@ async fn branch_create_and_activate_preserve_handoff_context() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -4603,6 +4682,7 @@ async fn branch_create_and_activate_preserve_handoff_context() {
         .send()
         .await
         .expect("send message");
+    settle(&api_client(&server), created.session.session_id).await;
 
     let child: CreateBranchResponse = server
         .request(
@@ -4688,6 +4768,7 @@ async fn branch_create_can_fork_from_explicit_event_boundary() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -4789,6 +4870,7 @@ async fn event_stream_replays_from_last_event_id_and_delivers_live_updates() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -4919,6 +5001,7 @@ async fn event_stream_delivers_completion_chunks_before_turn_finishes() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -4946,28 +5029,24 @@ async fn event_stream_delivers_completion_chunks_before_turn_finishes() {
     assert_eq!(response.status(), StatusCode::OK);
     let mut reader = SseReader::new(response);
 
-    let send_client = client.clone();
-    let send_base = server.base_url.clone();
-    let send_token = server.token.to_string();
-    let session_id = created.session.session_id;
-    let branch_id = created.branch.branch_id;
-    let send_handle = tokio::spawn(async move {
-        send_client
-            .post(format!("{send_base}sessions/{session_id}/message"))
-            .bearer_auth(send_token)
-            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
-            .json(&SendMessageRequest {
-                branch_id,
-                message: Message::text(Role::User, "hello"),
-            })
-            .send()
-            .await
-            .expect("send message request")
-            .status()
-    });
+    let send = server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/message", created.session.session_id),
+        )
+        .json(&SendMessageRequest {
+            branch_id: created.branch.branch_id,
+            message: Message::text(Role::User, "hello"),
+        })
+        .send()
+        .await
+        .expect("send message request");
+    assert_eq!(send.status(), StatusCode::ACCEPTED);
 
     let mut saw_completion_requested = false;
     let mut saw_completion_chunk = false;
+    let mut saw_turn_finished_before_chunk = false;
     while !saw_completion_chunk {
         let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), reader.next())
             .await
@@ -4985,22 +5064,33 @@ async fn event_stream_delivers_completion_chunks_before_turn_finishes() {
                     saw_completion_chunk = true;
                 }
             }
+            EventPayload::TurnFinished { .. } => {
+                saw_turn_finished_before_chunk = true;
+            }
             _ => {}
         }
     }
 
     assert!(saw_completion_requested);
     assert!(
-        !send_handle.is_finished(),
-        "send request should still be in flight when the first chunk is streamed"
+        !saw_turn_finished_before_chunk,
+        "completion chunks should stream before the turn finishes"
+    );
+    // The dispatched turn must still be in flight when the first chunk is
+    // observed: chunks are delivered live, not replayed after completion.
+    let api = api_client(&server);
+    let mid_turn_queue = api
+        .session_queue(created.session.session_id)
+        .await
+        .expect("mid-turn queue inspection");
+    assert_eq!(
+        mid_turn_queue.inspection.runtime_state,
+        SessionRuntimeState::Working,
+        "turn should still be running when the first chunk is streamed"
     );
 
-    let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        send_handle.await.expect("send task")
-    })
-    .await
-    .expect("send request should eventually complete");
-    assert_eq!(status, StatusCode::ACCEPTED);
+    let settled = settle(&api, created.session.session_id).await;
+    assert_eq!(settled, SessionRuntimeState::Idle);
 }
 
 #[tokio::test]
@@ -5011,6 +5101,7 @@ async fn event_stream_recovers_from_broadcast_lag_by_replaying_store_events() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -5110,6 +5201,7 @@ async fn event_stream_replays_across_process_restart_without_duplicates() {
 
     let created = api
         .create_session(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -5304,6 +5396,7 @@ async fn same_turn_continuation_manifest_uses_committed_tool_messages() {
     std::fs::write(project_root.path().join("README.md"), "fixture").expect("fixture file");
     let created = client
         .create_session(&CreateSessionRequest {
+            approval_mode: None,
             project_root: project_root.path().display().to_string(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -5326,6 +5419,7 @@ async fn same_turn_continuation_manifest_uses_committed_tool_messages() {
         .await
         .expect("send message");
     assert!(matches!(dispatched.outcome, SendMessageOutcome::Dispatched));
+    settle(&client, created.session.session_id).await;
 
     let events = client
         .session_events(created.session.session_id, None)
@@ -5474,6 +5568,7 @@ async fn inspection_contract_min_reconstructs_canonical_session_truth() {
 
     let created = client
         .create_session(&CreateSessionRequest {
+            approval_mode: None,
             project_root: project_root.path().display().to_string(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -5510,6 +5605,7 @@ async fn inspection_contract_min_reconstructs_canonical_session_truth() {
         .await
         .expect("send message");
     assert!(matches!(dispatched.outcome, SendMessageOutcome::Dispatched));
+    settle(&client, created.session.session_id).await;
 
     let initial_queue = client
         .session_queue(created.session.session_id)
@@ -5543,6 +5639,7 @@ async fn inspection_contract_min_reconstructs_canonical_session_truth() {
         .await
         .expect("approve built-in tool");
     assert_eq!(built_in_approval.status(), StatusCode::ACCEPTED);
+    settle(&client, created.session.session_id).await;
 
     let mcp_queue = client
         .session_queue(created.session.session_id)
@@ -5576,6 +5673,7 @@ async fn inspection_contract_min_reconstructs_canonical_session_truth() {
         .await
         .expect("approve mcp tool");
     assert_eq!(mcp_approval.status(), StatusCode::ACCEPTED);
+    settle(&client, created.session.session_id).await;
 
     let inspection = client
         .inspect_session(created.session.session_id)
@@ -5902,6 +6000,7 @@ async fn control_persistence_survives_restart_via_protocol_path() {
 
     let created = client
         .create_session(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -6132,6 +6231,7 @@ async fn approval_round_trip_executes_tool_and_continues_turn() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: project_root.path().display().to_string(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -6161,6 +6261,11 @@ async fn approval_round_trip_executes_tool_and_continues_turn() {
         .await
         .expect("send message");
     assert_eq!(send.status(), StatusCode::ACCEPTED);
+    let api = api_client(&server);
+    assert_eq!(
+        settle(&api, created.session.session_id).await,
+        SessionRuntimeState::WaitingOnApproval
+    );
 
     let paused_messages: SessionMessagesResponse = server
         .request(
@@ -6206,6 +6311,7 @@ async fn approval_round_trip_executes_tool_and_continues_turn() {
         .await
         .expect("approve tool");
     assert_eq!(approval.status(), StatusCode::ACCEPTED);
+    settle(&api, created.session.session_id).await;
 
     let resumed_messages: SessionMessagesResponse = server
         .request(
@@ -6381,6 +6487,7 @@ async fn once_approval_does_not_authorize_repeated_identical_request() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: project_root.path().display().to_string(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -6410,6 +6517,11 @@ async fn once_approval_does_not_authorize_repeated_identical_request() {
         .await
         .expect("send message");
     assert_eq!(send.status(), StatusCode::ACCEPTED);
+    let api = api_client(&server);
+    assert_eq!(
+        settle(&api, created.session.session_id).await,
+        SessionRuntimeState::WaitingOnApproval
+    );
 
     let call_id = ToolCallId::new("call-approval-repeat");
     let approval = server
@@ -6433,6 +6545,10 @@ async fn once_approval_does_not_authorize_repeated_identical_request() {
         .await
         .expect("approve tool");
     assert_eq!(approval.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        settle(&api, created.session.session_id).await,
+        SessionRuntimeState::WaitingOnApproval
+    );
 
     let events = server
         .runtime
@@ -6500,6 +6616,7 @@ async fn approval_resume_suspends_sibling_tool_calls_from_same_response() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: project_root.path().display().to_string(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -6529,6 +6646,11 @@ async fn approval_resume_suspends_sibling_tool_calls_from_same_response() {
         .await
         .expect("send message");
     assert_eq!(send.status(), StatusCode::ACCEPTED);
+    let api = api_client(&server);
+    assert_eq!(
+        settle(&api, created.session.session_id).await,
+        SessionRuntimeState::WaitingOnApproval
+    );
 
     let initial_queue: SessionQueueResponse = server
         .request(
@@ -6569,6 +6691,7 @@ async fn approval_resume_suspends_sibling_tool_calls_from_same_response() {
         .await
         .expect("approve first tool");
     assert_eq!(first_approval.status(), StatusCode::ACCEPTED);
+    settle(&api, created.session.session_id).await;
 
     {
         let requests = mock_provider
@@ -6638,6 +6761,7 @@ async fn approval_round_trip_resumes_pending_call_on_original_branch() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: project_root.path().display().to_string(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -6686,6 +6810,11 @@ async fn approval_round_trip_resumes_pending_call_on_original_branch() {
         .await
         .expect("send message");
     assert_eq!(send.status(), StatusCode::ACCEPTED);
+    let api = api_client(&server);
+    assert_eq!(
+        settle(&api, created.session.session_id).await,
+        SessionRuntimeState::WaitingOnApproval
+    );
 
     let paused_messages: SessionMessagesResponse = server
         .request(
@@ -6734,6 +6863,7 @@ async fn approval_round_trip_resumes_pending_call_on_original_branch() {
         .await
         .expect("approve tool");
     assert_eq!(approval.status(), StatusCode::ACCEPTED);
+    settle(&api, created.session.session_id).await;
 
     let resumed_messages: SessionMessagesResponse = server
         .request(
@@ -6802,6 +6932,7 @@ async fn approval_resume_keeps_paused_settings_revision_after_session_model_chan
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: project_root.path().display().to_string(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -6833,6 +6964,11 @@ async fn approval_resume_keeps_paused_settings_revision_after_session_model_chan
         .await
         .expect("send message");
     assert_eq!(send.status(), StatusCode::ACCEPTED);
+    let api = api_client(&server);
+    assert_eq!(
+        settle(&api, created.session.session_id).await,
+        SessionRuntimeState::WaitingOnApproval
+    );
 
     let updated: CreateSessionResponse = server
         .request(
@@ -6878,6 +7014,7 @@ async fn approval_resume_keeps_paused_settings_revision_after_session_model_chan
         .await
         .expect("approve tool");
     assert_eq!(approval.status(), StatusCode::ACCEPTED);
+    settle(&api, created.session.session_id).await;
 
     let events: SessionEventsResponse = server
         .request(
@@ -7055,7 +7192,8 @@ async fn failed_approved_tool_resume_records_one_terminal_transition() {
         .send()
         .await
         .expect("approve tool");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    settle(&api_client(&server), session.session_id).await;
 
     let events = server
         .runtime
@@ -7282,30 +7420,27 @@ async fn approved_tool_resume_closes_turn_when_initial_terminal_append_fails() {
         )
         .expect("finish paused turn");
 
-    let approve_client = client.clone();
-    let approve_url = server.url(&format!("sessions/{}/approve", session.session_id));
-    let token = server.token.clone();
-    let approve_call_id = call_id.clone();
-    let approve_task = tokio::spawn(async move {
-        approve_client
-            .post(approve_url)
-            .bearer_auth(token)
-            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
-            .json(&ApproveToolRequest {
-                call_id: approve_call_id,
-                tool_name: "shell".to_owned(),
+    let response = server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/approve", session.session_id),
+        )
+        .json(&ApproveToolRequest {
+            call_id: call_id.clone(),
+            tool_name: "shell".to_owned(),
+            scope: ApprovalScope::Once,
+            decision: ApprovalDecision::Approved {
+                decided_at: time::OffsetDateTime::now_utc(),
+                decided_by: "test".to_owned(),
                 scope: ApprovalScope::Once,
-                decision: ApprovalDecision::Approved {
-                    decided_at: time::OffsetDateTime::now_utc(),
-                    decided_by: "test".to_owned(),
-                    scope: ApprovalScope::Once,
-                    source: ApprovalDecisionSource::Human,
-                },
-            })
-            .send()
-            .await
-            .expect("approve tool")
-    });
+                source: ApprovalDecisionSource::Human,
+            },
+        })
+        .send()
+        .await
+        .expect("approve tool");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
 
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         while !marker.exists() {
@@ -7318,8 +7453,7 @@ async fn approved_tool_resume_closes_turn_when_initial_terminal_append_fails() {
         .runtime
         .inject_next_store_append_error_for_test("terminal append failure");
 
-    let response = approve_task.await.expect("approve task");
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    settle(&api_client(&server), session.session_id).await;
     let events = server
         .runtime
         .all_events(session.session_id)
@@ -7377,6 +7511,7 @@ async fn answer_round_trip_starts_resumed_turn_before_result_events() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -7551,6 +7686,7 @@ async fn answer_round_trip_resumes_pending_call_on_original_branch() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -7721,6 +7857,7 @@ async fn answer_resume_keeps_paused_settings_revision_after_session_model_change
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -7880,6 +8017,7 @@ async fn busy_session_send_returns_queued_outcome() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -8001,6 +8139,7 @@ async fn idle_cancel_request_does_not_queue_next_direct_message() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -8072,6 +8211,7 @@ async fn steer_during_in_flight_turn_runs_a_follow_up_turn() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -8087,23 +8227,20 @@ async fn steer_during_in_flight_turn_runs_a_follow_up_turn() {
         .await
         .expect("create session body");
 
-    let send_url = server.url(&format!("sessions/{}/message", created.session.session_id));
-    let token = server.token.clone();
-    let send_request = SendMessageRequest {
-        branch_id: created.branch.branch_id,
-        message: Message::text(Role::User, "start working"),
-    };
-    let send_client = client.clone();
-    let send_handle = tokio::spawn(async move {
-        send_client
-            .post(send_url)
-            .bearer_auth(token)
-            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
-            .json(&send_request)
-            .send()
-            .await
-            .expect("send message request")
-    });
+    let send = server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/message", created.session.session_id),
+        )
+        .json(&SendMessageRequest {
+            branch_id: created.branch.branch_id,
+            message: Message::text(Role::User, "start working"),
+        })
+        .send()
+        .await
+        .expect("send message request");
+    assert_eq!(send.status(), StatusCode::ACCEPTED);
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -8121,8 +8258,7 @@ async fn steer_during_in_flight_turn_runs_a_follow_up_turn() {
         .expect("steer request");
     assert_eq!(steer.status(), StatusCode::ACCEPTED);
 
-    let send = send_handle.await.expect("send task join");
-    assert_eq!(send.status(), StatusCode::ACCEPTED);
+    settle(&api_client(&server), created.session.session_id).await;
 
     let messages: SessionMessagesResponse = server
         .request(
@@ -8185,6 +8321,7 @@ async fn cancel_during_in_flight_turn_drops_pending_steer_follow_up() {
     let created: CreateSessionResponse = server
         .request(&client, Method::POST, "sessions")
         .json(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("local"),
             model_id: None,
@@ -8200,23 +8337,20 @@ async fn cancel_during_in_flight_turn_drops_pending_steer_follow_up() {
         .await
         .expect("create session body");
 
-    let send_url = server.url(&format!("sessions/{}/message", created.session.session_id));
-    let token = server.token.clone();
-    let send_request = SendMessageRequest {
-        branch_id: created.branch.branch_id,
-        message: Message::text(Role::User, "start working"),
-    };
-    let send_client = client.clone();
-    let send_handle = tokio::spawn(async move {
-        send_client
-            .post(send_url)
-            .bearer_auth(token)
-            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
-            .json(&send_request)
-            .send()
-            .await
-            .expect("send message request")
-    });
+    let send = server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/message", created.session.session_id),
+        )
+        .json(&SendMessageRequest {
+            branch_id: created.branch.branch_id,
+            message: Message::text(Role::User, "start working"),
+        })
+        .send()
+        .await
+        .expect("send message request");
+    assert_eq!(send.status(), StatusCode::ACCEPTED);
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -8248,8 +8382,8 @@ async fn cancel_during_in_flight_turn_drops_pending_steer_follow_up() {
         .expect("cancel request");
     assert_eq!(cancel.status(), StatusCode::ACCEPTED);
 
-    let send = send_handle.await.expect("send task join");
-    assert_eq!(send.status(), StatusCode::ACCEPTED);
+    let api = api_client(&server);
+    settle(&api, created.session.session_id).await;
 
     {
         let requests = mock_provider
@@ -8295,6 +8429,7 @@ async fn cancel_during_in_flight_turn_drops_pending_steer_follow_up() {
         .await
         .expect("follow-up send");
     assert_eq!(follow_up.status(), StatusCode::ACCEPTED);
+    settle(&api, created.session.session_id).await;
 
     let requests = mock_provider
         .requests

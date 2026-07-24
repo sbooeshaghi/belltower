@@ -460,6 +460,40 @@ impl BelltowerClient {
     }
 
     /// # Remote client-safe
+    /// Waits until the session settles: no running turn, no queued messages,
+    /// and either idle or waiting on an operator (approval/input). Message
+    /// dispatch is asynchronous — `send_message` acknowledges admission, not
+    /// completion — so headless clients and tests use this to observe the
+    /// turn outcome. Returns the runtime state observed at settle time.
+    pub async fn wait_for_session_settle(
+        &self,
+        session_id: SessionId,
+        timeout: std::time::Duration,
+    ) -> Result<bt_core::SessionRuntimeState> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let queue = self.session_queue(session_id).await?;
+            let inspection = queue.inspection;
+            let settled = !matches!(
+                inspection.runtime_state,
+                bt_core::SessionRuntimeState::Working
+                    | bt_core::SessionRuntimeState::CancelRequested
+            ) && inspection.queued_messages.is_empty();
+            if settled {
+                return Ok(inspection.runtime_state);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ClientError::Core(BelltowerError::InvalidState(format!(
+                    "session {session_id} did not settle within {timeout:?} (state: {:?}, {} queued)",
+                    inspection.runtime_state,
+                    inspection.queued_messages.len()
+                ))));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+    }
+
+    /// # Remote client-safe
     pub async fn session_execution(
         &self,
         session_id: SessionId,

@@ -175,6 +175,15 @@ This removes the main `401 Unauthorized` failure mode that came from rotating on
 4. receive ordered events with monotonic IDs
 5. reconnect using `Last-Event-ID` if interrupted
 
+Dispatch is asynchronous: send/approve/answer acknowledge durable admission
+(202) and the turn runs on a detached server task, so a client disconnect can
+never abort an admitted turn. Turn outcomes are observed through the event
+stream or the turns/queue inspection routes, not the dispatching POST's
+status; a watchdog force-fails a turn whose task panics, and startup recovery
+terminalizes turns interrupted by a crash. Clients that need the outcome
+synchronously (headless runs, tests) use
+`BelltowerClient::wait_for_session_settle`.
+
 Extended-tool sessions also register four server-hosted model tools over the
 same runtime/store boundary:
 
