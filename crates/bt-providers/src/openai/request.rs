@@ -70,15 +70,7 @@ pub(super) fn build_chat_request(
 }
 
 fn uses_openai_reasoning_token_budget(provider_id: &str, model: &str) -> bool {
-    if provider_id != "openai" {
-        return false;
-    }
-
-    let model = model.to_ascii_lowercase();
-    model.starts_with("o1")
-        || model.starts_with("o3")
-        || model.starts_with("o4")
-        || model.starts_with("gpt-5")
+    provider_id == "openai" && bt_core::model_capability::openai_reasoning_family(model)
 }
 
 fn uses_openai_stream_usage(provider_id: &str) -> bool {
@@ -97,7 +89,8 @@ fn openai_reasoning_effort(
     if !thinking.enabled {
         return None;
     }
-    Some(thinking.effort.unwrap_or(ThinkingEffort::High))
+    let effort = thinking.effort.unwrap_or(ThinkingEffort::High);
+    Some(bt_core::model_capability::clamp_openai_chat_reasoning_effort(effort))
 }
 
 fn preferred_tool_choice(_provider_id: &str, request: &CompletionRequest) -> Option<String> {

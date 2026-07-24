@@ -251,30 +251,11 @@ fn effective_thinking_config(
 }
 
 fn openai_reasoning_effort(model: &str) -> Option<ThinkingEffort> {
-    let model = model.to_ascii_lowercase();
-    if model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
-        return Some(ThinkingEffort::High);
-    }
-    if !model.starts_with("gpt-5") {
-        return None;
-    }
-    if model.contains("-pro") {
-        return Some(ThinkingEffort::High);
-    }
-    if model.starts_with("gpt-5.1-codex-max") {
-        return Some(ThinkingEffort::XHigh);
-    }
-    if model.starts_with("gpt-5.1") {
-        return Some(ThinkingEffort::High);
-    }
-    Some(ThinkingEffort::XHigh)
+    bt_core::model_capability::openai_default_reasoning_effort(model)
 }
 
 fn supports_anthropic_thinking(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    model.starts_with("claude-opus-4")
-        || model.starts_with("claude-sonnet-4")
-        || model.starts_with("claude-haiku-4")
+    bt_core::model_capability::anthropic_supports_thinking(model)
 }
 
 fn default_anthropic_thinking_budget(reserve_tokens: u64) -> u64 {
@@ -999,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn assembler_defaults_chatgpt_reasoning_models_to_highest_effort() {
+    fn assembler_defaults_chatgpt_reasoning_models_to_high_effort() {
         let config = bt_core::BelltowerConfig::from_embedded().expect("config");
         let assembler = ContextAssembler::new(config).expect("assembler");
 
@@ -1017,10 +998,31 @@ mod tests {
             output.request.thinking,
             Some(ThinkingConfig {
                 enabled: true,
-                effort: Some(ThinkingEffort::XHigh),
+                effort: Some(ThinkingEffort::High),
                 budget_tokens: None,
                 include_summaries: true,
             })
+        );
+    }
+
+    #[test]
+    fn assembler_defaults_codex_max_to_xhigh_effort() {
+        let config = bt_core::BelltowerConfig::from_embedded().expect("config");
+        let assembler = ContextAssembler::new(config).expect("assembler");
+
+        let output = assembler.build_request_with_metadata(
+            ConnectionId::new("chatgpt"),
+            "openai-chatgpt",
+            "gpt-5.1-codex-max",
+            None,
+            vec![Message::text(Role::User, "hello")],
+            Vec::new(),
+            None,
+        );
+
+        assert_eq!(
+            output.request.thinking.and_then(|t| t.effort),
+            Some(ThinkingEffort::XHigh)
         );
     }
 

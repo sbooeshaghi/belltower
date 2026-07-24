@@ -633,7 +633,7 @@ mod tests {
             temperature: None,
             thinking: Some(ThinkingConfig {
                 enabled: true,
-                effort: Some(ThinkingEffort::XHigh),
+                effort: Some(ThinkingEffort::High),
                 budget_tokens: None,
                 include_summaries: true,
             }),
@@ -642,7 +642,37 @@ mod tests {
         let translated = provider.build_request(request);
         assert_eq!(translated.max_tokens, None);
         assert_eq!(translated.max_completion_tokens, Some(256));
-        assert_eq!(translated.reasoning_effort, Some(ThinkingEffort::XHigh));
+        assert_eq!(translated.reasoning_effort, Some(ThinkingEffort::High));
+    }
+
+    #[test]
+    fn request_translation_clamps_xhigh_to_high_on_chat_completions() {
+        let provider = OpenAiCompatibleProvider::new(
+            "openai",
+            Url::parse("https://api.openai.com/v1/").expect("url"),
+            Some("secret".to_owned()),
+        )
+        .expect("provider");
+
+        let request = CompletionRequest {
+            connection_id: ConnectionId::new("openai"),
+            model: "gpt-5.4-mini".to_owned(),
+            system_prompt: None,
+            messages: vec![Message::text(Role::User, "hello")],
+            tools: Vec::new(),
+            structured_output: None,
+            max_tokens: Some(256),
+            temperature: None,
+            thinking: Some(ThinkingConfig {
+                enabled: true,
+                effort: Some(ThinkingEffort::XHigh),
+                budget_tokens: None,
+                include_summaries: true,
+            }),
+        };
+
+        let translated = provider.build_request(request);
+        assert_eq!(translated.reasoning_effort, Some(ThinkingEffort::High));
     }
 
     #[test]

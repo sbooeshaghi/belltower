@@ -73,11 +73,16 @@ Current shape:
   preparation
 - provider-specific curation on top of raw remote model discovery so operator-facing inventories only surface the relevant supported families for that connection
 - discoverable-model inventories that do not silently inject the configured default back into the runtime list when the backend did not expose it
-- quiet highest-thinking defaults for models with known reasoning controls:
+- quiet high-thinking defaults for models with known reasoning controls:
   the context/request layer enables model-side reasoning effort for supported
   OpenAI, ChatGPT/Codex, and Anthropic models without adding a primary operator
   option; provider adapters translate that canonical request intent into each
-  backend's request shape
+  backend's request shape. Model capability predicates (reasoning family,
+  default/maximum effort, thinking support) are centralized in
+  `bt_core::model_capability` and must not fork per crate. Defaults stay
+  within what each endpoint accepts: `xhigh` only for codex-max variants,
+  and the OpenAI chat-completions adapter clamps `xhigh` to `high` because
+  that endpoint rejects it (observed 400 on gpt-5.4)
 - auth-method labels carried directly on readiness and model inspection surfaces so launcher, CLI, and TUI can render supported login paths from canonical state
 - guided connection-plus-model selection through `/use`
 
