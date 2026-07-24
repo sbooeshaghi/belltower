@@ -367,17 +367,37 @@ impl SqliteSessionStore {
         Ok(sent_message)
     }
 
+    /// Walks to the lineage root inside the delivery transaction so the
+    /// same-tree constraint is checked against committed parent links.
+    fn lineage_root_in_tx(tx: &Transaction<'_>, session_id: SessionId) -> Result<SessionId> {
+        let mut visited = std::collections::HashSet::new();
+        let mut cursor = session_id;
+        visited.insert(cursor);
+        while let Some(parent) = Self::parent_session_id_in_tx(tx, cursor)? {
+            if !visited.insert(parent) {
+                return Err(BelltowerError::InvalidState(
+                    "session lineage contains a cycle".to_owned(),
+                ));
+            }
+            cursor = parent;
+        }
+        Ok(cursor)
+    }
+
     fn ensure_related_session_message_constraints_in_tx(
         tx: &Transaction<'_>,
         message: &RelatedSessionMessage,
     ) -> Result<()> {
-        let source_parent = Self::parent_session_id_in_tx(tx, message.source_session_id)?;
-        let destination_parent = Self::parent_session_id_in_tx(tx, message.destination_session_id)?;
-        if source_parent != Some(message.destination_session_id)
-            && destination_parent != Some(message.source_session_id)
+        // Messaging is tree-scoped: any two distinct sessions sharing a
+        // lineage root may exchange messages (parent-child, siblings,
+        // cousins); nothing crosses trees and nothing messages itself.
+        if message.source_session_id == message.destination_session_id
+            || Self::lineage_root_in_tx(tx, message.source_session_id)?
+                != Self::lineage_root_in_tx(tx, message.destination_session_id)?
         {
             return Err(BelltowerError::Protocol(
-                "related-session messages are limited to direct parent-child sessions".to_owned(),
+                "related-session messages are limited to sessions in the same lineage tree"
+                    .to_owned(),
             ));
         }
         Self::ensure_branch_owner_in_tx(tx, message.source_session_id, message.source_branch_id)?;

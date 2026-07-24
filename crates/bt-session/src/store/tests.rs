@@ -469,6 +469,28 @@ fn related_session_delivery_is_atomic_idempotent_and_lineage_scoped() {
         store.commit_related_session_message(&unrelated_sent, &unrelated_received),
         Err(BelltowerError::Protocol(_))
     ));
+
+    // Siblings share a lineage root, so peer delivery commits.
+    let (sibling, sibling_branch) = child_session(&parent, &parent_branch);
+    store
+        .create_session(&sibling, &sibling_branch)
+        .expect("create sibling");
+    let (sibling_sent, sibling_received) = related_message_events(
+        &child,
+        &child_branch,
+        &sibling,
+        &sibling_branch,
+        RelatedSessionMessageId::new(),
+        "peer traffic stays inside the tree",
+        RelatedSessionDeliveryMode::Notify,
+    );
+    let sibling_receipt = store
+        .commit_related_session_message(&sibling_sent, &sibling_received)
+        .expect("sibling delivery commits");
+    assert_eq!(
+        sibling_receipt.status,
+        RelatedSessionMessageStatus::Delivered
+    );
 }
 
 #[test]
