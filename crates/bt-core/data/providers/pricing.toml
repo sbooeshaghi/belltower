@@ -214,3 +214,8 @@ reason = "subscription-backed ChatGPT connection has no public per-token billing
 provider = "openai-chatgpt"
 model_pattern = "gpt-5.1-codex-mini"
 reason = "subscription-backed ChatGPT connection has no public per-token billing surface"
+
+[[unpriced_models]]
+provider = "claude-cli"
+model_pattern = "claude-"
+reason = "subscription-backed Claude Code CLI connection has no public per-token billing surface"
