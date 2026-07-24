@@ -13,9 +13,9 @@ use bt_agent::{
 };
 use bt_context::{SystemPromptBuilder, SystemPromptInput};
 use bt_core::{
-    BelltowerError, BranchId, BranchRecord, CompletionChunk, ConnectionDescriptor,
-    InstructionDocument, PlanInspection, Result, SessionId, SessionRecord, ToolResultEnvelope,
-    ToolSpec, TurnId, TurnInstructionProvenance, traits::Provider,
+    BelltowerError, BranchId, BranchRecord, ConnectionDescriptor, InstructionDocument,
+    PlanInspection, Result, SessionId, SessionRecord, ToolResultEnvelope, ToolSpec, TurnId,
+    TurnInstructionProvenance, traits::Provider,
 };
 use bt_tools::BuiltInToolRegistry;
 use std::future::Future;
@@ -232,41 +232,6 @@ impl BelltowerRuntime {
             },
             finish_reason: finish_reason_label,
         })
-    }
-
-    pub fn record_live_completion_chunk(
-        &self,
-        session: &SessionRecord,
-        branch: &BranchRecord,
-        connection: &ConnectionDescriptor,
-        turn_id: TurnId,
-        chunk: &CompletionChunk,
-    ) -> Result<()> {
-        let raw_chunk_index = if let Some(raw) = &chunk.raw {
-            let content = serde_json::to_vec(raw)?;
-            Some(self.record_raw_chunk(
-                session.session_id,
-                branch.branch_id,
-                connection.provider.clone(),
-                "completion".to_owned(),
-                chunk.llm_call_ordinal,
-                &content,
-                Some(turn_id),
-            )?)
-        } else {
-            None
-        };
-
-        self.record_completion_chunk(
-            session.session_id,
-            branch.branch_id,
-            chunk.llm_call_ordinal,
-            chunk.deltas.clone(),
-            raw_chunk_index,
-            Some(turn_id),
-        )?;
-
-        Ok(())
     }
 }
 

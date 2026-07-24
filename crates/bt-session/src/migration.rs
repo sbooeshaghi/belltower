@@ -259,7 +259,15 @@ CREATE INDEX IF NOT EXISTS idx_session_settings_revision_projection_lookup
 "#];
 
 pub fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
-    connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    // WAL + synchronous=NORMAL: with WAL, NORMAL fsyncs at checkpoints
+    // instead of every commit while remaining crash-consistent (a power loss
+    // can lose the tail of the WAL but never corrupts the database). The
+    // event log stays canonical: events are broadcast only after commit.
+    // FULL was measured at ~1 fsync per streamed delta transaction, which
+    // serialized every session on the store mutex.
+    connection.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
+    )?;
     for migration in MIGRATIONS {
         connection.execute_batch(migration)?;
     }
@@ -315,7 +323,9 @@ pub fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     connection.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_raw_chunks_session ON raw_chunks(session_id, chunk_id);
+        "CREATE INDEX IF NOT EXISTS idx_message_projection_session_branch ON message_projection(session_id, branch_id);
+         CREATE INDEX IF NOT EXISTS idx_events_session_kind ON events(session_id, event_kind, seq_id);
+         CREATE INDEX IF NOT EXISTS idx_raw_chunks_session ON raw_chunks(session_id, chunk_id);
          CREATE INDEX IF NOT EXISTS idx_raw_chunks_session_branch_turn ON raw_chunks(session_id, branch_id, turn_id, chunk_id);
          CREATE INDEX IF NOT EXISTS idx_raw_chunks_session_branch_turn_call ON raw_chunks(session_id, branch_id, turn_id, llm_call_ordinal, chunk_id);
          CREATE INDEX IF NOT EXISTS idx_queued_message_projection_pending ON queued_message_projection(session_id, status, source_seq);

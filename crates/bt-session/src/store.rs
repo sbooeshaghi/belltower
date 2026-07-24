@@ -1259,6 +1259,69 @@ impl SqliteSessionStore {
         Ok((chunk_id, event, seq_id))
     }
 
+    /// Appends one live streamed completion delta atomically: the raw
+    /// provider chunk row (when present) with its `raw.chunk` event, plus the
+    /// `completion.chunk` event, in a single transaction. Live streaming
+    /// previously paid two lock/transaction/fsync cycles per delta.
+    /// Returned envelopes carry their assigned seq ids, in append order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_live_completion_chunk<R, C>(
+        &mut self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        turn_id: Option<TurnId>,
+        llm_call_ordinal: Option<u32>,
+        provider: &str,
+        stream_name: &str,
+        raw_content: Option<&[u8]>,
+        build_raw_event: R,
+        build_chunk_event: C,
+    ) -> Result<(Option<i64>, Vec<EventEnvelope>)>
+    where
+        R: FnOnce(i64) -> Result<EventEnvelope>,
+        C: FnOnce(Option<i64>) -> Result<EventEnvelope>,
+    {
+        let tx = self.connection.transaction().map_err(storage_error)?;
+        if let Some(turn_id) = turn_id {
+            Self::ensure_active_turn_owner_in_tx(&tx, session_id, branch_id, turn_id)?;
+        }
+        let mut events = Vec::with_capacity(2);
+        let raw_chunk_index = if let Some(content) = raw_content {
+            tx.execute(
+                "INSERT INTO raw_chunks (session_id, branch_id, turn_id, llm_call_ordinal, event_id, provider, stream_name, content, received_at)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8)",
+                params![
+                    session_id.to_string(),
+                    branch_id.to_string(),
+                    turn_id.map(|id| id.to_string()),
+                    llm_call_ordinal.map(i64::from),
+                    provider,
+                    stream_name,
+                    content,
+                    format_time(OffsetDateTime::now_utc())?
+                ],
+            )
+            .map_err(storage_error)?;
+            let chunk_id = tx.last_insert_rowid();
+            let mut raw_event = build_raw_event(chunk_id)?;
+            tx.execute(
+                "UPDATE raw_chunks SET event_id = ?1 WHERE chunk_id = ?2",
+                params![raw_event.event_id.to_string(), chunk_id],
+            )
+            .map_err(storage_error)?;
+            raw_event.seq_id = Some(Self::append_event_in_tx(&tx, &raw_event)?);
+            events.push(raw_event);
+            Some(chunk_id)
+        } else {
+            None
+        };
+        let mut chunk_event = build_chunk_event(raw_chunk_index)?;
+        chunk_event.seq_id = Some(Self::append_event_in_tx(&tx, &chunk_event)?);
+        events.push(chunk_event);
+        tx.commit().map_err(storage_error)?;
+        Ok((raw_chunk_index, events))
+    }
+
     pub fn append_raw_chunk(
         &mut self,
         session_id: SessionId,
@@ -1391,22 +1454,23 @@ impl SqliteSessionStore {
 
     fn append_event_in_tx(tx: &Transaction<'_>, event: &EventEnvelope) -> Result<i64> {
         let event_json = serde_json::to_string(event)?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO events (
                 event_id, session_id, branch_id, span_id, parent_span_id, span_kind, event_kind, event_json, occurred_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                event.event_id.to_string(),
-                event.session_id.to_string(),
-                event.branch_id.to_string(),
-                event.span_id.to_string(),
-                event.parent_span_id.map(|value| value.to_string()),
-                span_kind_to_str(&event.span_kind),
-                event.kind(),
-                event_json,
-                format_time(event.occurred_at)?,
-            ],
         )
+        .map_err(storage_error)?
+        .execute(params![
+            event.event_id.to_string(),
+            event.session_id.to_string(),
+            event.branch_id.to_string(),
+            event.span_id.to_string(),
+            event.parent_span_id.map(|value| value.to_string()),
+            span_kind_to_str(&event.span_kind),
+            event.kind(),
+            event_json,
+            format_time(event.occurred_at)?,
+        ])
         .map_err(storage_error)?;
         let seq_id = tx.last_insert_rowid();
         Self::refresh_projections(tx, event, seq_id)?;

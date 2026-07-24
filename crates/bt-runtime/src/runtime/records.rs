@@ -530,6 +530,88 @@ impl BelltowerRuntime {
         Ok(chunk_index)
     }
 
+    /// Records one live streamed completion delta: the raw provider chunk
+    /// (when present), its `raw.chunk` event, and the `completion.chunk`
+    /// event commit in a single store transaction, then broadcast in order.
+    /// Live streaming previously paid two lock/transaction cycles per delta.
+    pub fn record_live_completion_chunk(
+        &self,
+        session: &bt_core::SessionRecord,
+        branch: &bt_core::BranchRecord,
+        connection: &bt_core::ConnectionDescriptor,
+        turn_id: TurnId,
+        chunk: &bt_core::CompletionChunk,
+    ) -> Result<()> {
+        let session_id = session.session_id;
+        let branch_id = branch.branch_id;
+        let provider = connection.provider.clone();
+        let llm_call_ordinal = chunk.llm_call_ordinal;
+        let raw_content = chunk.raw.as_ref().map(serde_json::to_vec).transpose()?;
+        let probe_event = EventEnvelope::new(
+            session_id,
+            branch_id,
+            SpanKind::Llm,
+            EventPayload::CompletionChunk {
+                llm_call_ordinal,
+                deltas: Vec::new(),
+                raw_chunk_index: None,
+            },
+        );
+        self.ensure_session_started(&probe_event)?;
+        self.take_store_append_fault_for_test()?;
+
+        let (_, events) = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?
+            .append_live_completion_chunk(
+                session_id,
+                branch_id,
+                Some(turn_id),
+                llm_call_ordinal,
+                &provider,
+                "completion",
+                raw_content.as_deref(),
+                |chunk_index| {
+                    Ok(apply_turn_id(
+                        EventEnvelope::new(
+                            session_id,
+                            branch_id,
+                            SpanKind::Llm,
+                            EventPayload::RawChunkPersisted {
+                                provider: provider.clone(),
+                                chunk_index,
+                                stream: "completion".to_owned(),
+                                llm_call_ordinal,
+                            },
+                        ),
+                        Some(turn_id),
+                    ))
+                },
+                |raw_chunk_index| {
+                    Ok(apply_turn_id(
+                        EventEnvelope::new(
+                            session_id,
+                            branch_id,
+                            SpanKind::Llm,
+                            EventPayload::CompletionChunk {
+                                llm_call_ordinal,
+                                deltas: chunk.deltas.clone(),
+                                raw_chunk_index,
+                            },
+                        ),
+                        Some(turn_id),
+                    ))
+                },
+            )?;
+
+        for event in events {
+            bt_otel::mirror_event(&event);
+            let _ = self.event_bus.send(event);
+        }
+        Ok(())
+    }
+
     pub fn record_completion_chunk(
         &self,
         session_id: SessionId,

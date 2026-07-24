@@ -290,6 +290,107 @@ fn migrations_and_session_creation_work() {
 }
 
 #[test]
+fn live_completion_chunk_appends_raw_row_and_events_atomically() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    let turn_id = TurnId::new();
+    store
+        .append_events(&[turn_started_event(&session, &branch, turn_id)])
+        .expect("start turn");
+
+    let content = serde_json::to_vec(&serde_json::json!({"delta": "hi"})).expect("raw bytes");
+    let (raw_index, events) = store
+        .append_live_completion_chunk(
+            session.session_id,
+            branch.branch_id,
+            Some(turn_id),
+            Some(0),
+            "openai",
+            "completion",
+            Some(&content),
+            |chunk_index| {
+                Ok(EventEnvelope::new(
+                    session.session_id,
+                    branch.branch_id,
+                    SpanKind::Llm,
+                    EventPayload::RawChunkPersisted {
+                        provider: "openai".to_owned(),
+                        chunk_index,
+                        stream: "completion".to_owned(),
+                        llm_call_ordinal: Some(0),
+                    },
+                )
+                .with_turn_id(turn_id))
+            },
+            |raw_chunk_index| {
+                Ok(EventEnvelope::new(
+                    session.session_id,
+                    branch.branch_id,
+                    SpanKind::Llm,
+                    EventPayload::CompletionChunk {
+                        llm_call_ordinal: Some(0),
+                        deltas: Vec::new(),
+                        raw_chunk_index,
+                    },
+                )
+                .with_turn_id(turn_id))
+            },
+        )
+        .expect("append live chunk");
+
+    let raw_index = raw_index.expect("raw chunk row id");
+    assert_eq!(events.len(), 2, "raw + completion events in one append");
+    let seq_ids: Vec<i64> = events
+        .iter()
+        .map(|event| event.seq_id.expect("assigned seq"))
+        .collect();
+    assert!(
+        seq_ids[1] > seq_ids[0],
+        "events must be sequenced in append order"
+    );
+    match &events[1].payload {
+        EventPayload::CompletionChunk {
+            raw_chunk_index, ..
+        } => assert_eq!(*raw_chunk_index, Some(raw_index)),
+        other => panic!("expected completion chunk event, got {other:?}"),
+    }
+
+    let stray_turn = TurnId::new();
+    let error = store
+        .append_live_completion_chunk(
+            session.session_id,
+            branch.branch_id,
+            Some(stray_turn),
+            Some(0),
+            "openai",
+            "completion",
+            None,
+            |_| unreachable!("raw builder must not run without raw content"),
+            |raw_chunk_index| {
+                Ok(EventEnvelope::new(
+                    session.session_id,
+                    branch.branch_id,
+                    SpanKind::Llm,
+                    EventPayload::CompletionChunk {
+                        llm_call_ordinal: Some(0),
+                        deltas: Vec::new(),
+                        raw_chunk_index,
+                    },
+                )
+                .with_turn_id(stray_turn))
+            },
+        )
+        .expect_err("a turn that does not own the session must not stream chunks");
+    assert!(matches!(
+        error,
+        BelltowerError::InvalidState(_) | BelltowerError::Protocol(_)
+    ));
+}
+
+#[test]
 fn related_session_delivery_is_atomic_idempotent_and_lineage_scoped() {
     let mut store = SqliteSessionStore::open_in_memory().expect("store");
     let (parent, parent_branch) = sample_session();

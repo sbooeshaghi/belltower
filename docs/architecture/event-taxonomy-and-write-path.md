@@ -187,6 +187,13 @@ The control-plane rule is now explicit:
 - the active-turn projection is a rebuildable coordination read model over
   canonical turn boundaries; transports must not recreate a process-local
   busy/idle heuristic
+- live streaming appends are atomic per delta: the raw provider chunk row,
+  its `raw_chunk.persisted` event, and the `completion.chunk` event commit in
+  one transaction (`append_live_completion_chunk`) and broadcast after commit
+  in seq order. The store runs WAL with `synchronous=NORMAL`, so commits do
+  not fsync individually; durability checkpoints amortize while the log stays
+  crash-consistent. Broadcast-after-commit is the invariant that keeps the
+  event log canonical — no client may observe an event that is not in the log
 - queued follow-up input is canonical runtime state, not a server-local queue
 - cancellation is a durable request that stays pending until runtime clears it
 - steer messages are durable queued control inputs that runtime later applies or drops
