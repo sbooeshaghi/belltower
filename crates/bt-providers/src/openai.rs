@@ -567,7 +567,7 @@ fn token_usage_from_openai(usage: &OpenAiUsage) -> TokenUsage {
 
 #[cfg(test)]
 mod tests {
-    use super::request::{message_to_openai, requires_first_tool_pass, text_requires_tools};
+    use super::request::message_to_openai;
     use super::{
         OpenAiCompatibleProvider, OpenAiStreamChoice, OpenAiStreamDelta, OpenAiStreamResponse,
         OpenAiToolCallDelta, OpenAiToolCallFunctionDelta, StructuredOutputAccumulator,
@@ -838,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_compatible_requests_can_require_tools_for_local_state_queries() {
+    fn declared_tools_request_auto_tool_choice() {
         let provider = OpenAiCompatibleProvider::new(
             "openai-compatible",
             Url::parse("http://127.0.0.1:11434/v1/").expect("url"),
@@ -873,104 +873,8 @@ mod tests {
         };
 
         let translated = provider.build_request(request);
-        assert_eq!(translated.tool_choice.as_deref(), Some("required"));
+        assert_eq!(translated.tool_choice.as_deref(), Some("auto"));
         assert_eq!(translated.tools.as_ref().map(Vec::len), Some(1));
-    }
-
-    #[test]
-    fn openai_hosted_requests_can_require_tools_for_local_state_queries() {
-        let provider = OpenAiCompatibleProvider::new(
-            "openai",
-            Url::parse("https://api.openai.com/v1/").expect("url"),
-            Some("test-key".to_owned()),
-        )
-        .expect("provider");
-
-        let request = CompletionRequest {
-            connection_id: ConnectionId::new("openai"),
-            model: "o4-mini".to_owned(),
-            system_prompt: None,
-            messages: vec![Message::text(
-                Role::User,
-                "how many folders are in this directory?",
-            )],
-            tools: vec![ToolSpec {
-                name: "list".to_owned(),
-                description: "List files and directories under the project root.".to_owned(),
-                parameters_schema: json!({"type":"object"}),
-                metadata: ToolMetadata {
-                    risk_class: ToolRiskClass::Safe,
-                    is_read_only: true,
-                    is_concurrency_safe: true,
-                    interrupt_behavior: ToolInterruptBehavior::Immediate,
-                    execution_mode: bt_core::ToolExecutionMode::Immediate,
-                    should_defer: false,
-                    catalogue_tags: vec!["files".to_owned()],
-                    display_group: ToolDisplayGroup::Codebase,
-                },
-            }],
-            structured_output: None,
-            max_tokens: Some(256),
-            temperature: None,
-            thinking: None,
-        };
-
-        let translated = provider.build_request(request);
-        assert_eq!(translated.tool_choice.as_deref(), Some("required"));
-    }
-
-    #[test]
-    fn tool_requirement_heuristic_targets_local_state_questions() {
-        assert!(requires_first_tool_pass(&[Message::text(
-            Role::User,
-            "show me how many folders are in this directory",
-        )]));
-        assert!(text_requires_tools(
-            "show me how many folders are in this directory"
-        ));
-        assert!(requires_first_tool_pass(&[Message::text(
-            Role::User,
-            "summarize this project",
-        )]));
-        assert!(text_requires_tools("summarize this project"));
-        assert!(!requires_first_tool_pass(&[Message::text(
-            Role::User,
-            "say hello",
-        )]));
-        assert!(!text_requires_tools("say hello"));
-    }
-
-    #[test]
-    fn follow_up_after_tool_result_does_not_force_another_tool_call() {
-        assert!(!requires_first_tool_pass(&[
-            Message::text(Role::User, "how many folders are in this directory?"),
-            Message {
-                message_id: bt_core::MessageId::new(),
-                role: Role::Assistant,
-                parts: vec![MessagePart::ToolCall {
-                    call: bt_core::ToolCall {
-                        tool_name: "shell".to_owned(),
-                        call_id: "call-1".to_owned(),
-                        arguments: json!({"command":"ls -l | grep '^d' | wc -l"}),
-                    },
-                }],
-                created_at: time::OffsetDateTime::now_utc(),
-            },
-            Message {
-                message_id: bt_core::MessageId::new(),
-                role: Role::Tool,
-                parts: vec![MessagePart::ToolResult {
-                    result: bt_core::ToolResultEnvelope {
-                        call_id: bt_core::ToolCallId::new("call-1"),
-                        tool_name: "shell".to_owned(),
-                        is_error: false,
-                        output: json!({"stdout":"4\n","status":0}),
-                        duration_ms: Some(3),
-                    },
-                }],
-                created_at: time::OffsetDateTime::now_utc(),
-            },
-        ]));
     }
 
     #[test]
