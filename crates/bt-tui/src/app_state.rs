@@ -68,6 +68,9 @@ impl ChatApp {
             pending_send: None,
             pending_send_started_at: None,
             pending_message_submissions: VecDeque::new(),
+            pending_commands: VecDeque::new(),
+            command_chain_tail: None,
+            command_task_detail: None,
             pending_session_load: None,
             pending_resume_command_raw_input: None,
             pending_history_backfill: None,
@@ -93,8 +96,6 @@ impl ChatApp {
             last_refresh: Instant::now(),
             last_metadata_refresh: Instant::now() - Duration::from_secs(10),
             last_queue_refresh: Instant::now() - QUEUE_REFRESH_INTERVAL,
-            last_readiness_refresh: Instant::now() - READINESS_REFRESH_INTERVAL,
-            last_mcp_refresh: Instant::now() - MCP_REFRESH_INTERVAL,
         }
     }
 

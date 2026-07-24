@@ -163,16 +163,8 @@ async fn dispatch_chat_action(app: &mut ChatApp, action: ChatAction) {
                 app.show_error(format!("send failed: {error}"));
             }
         }
-        ChatAction::Refresh => {
-            if let Err(error) = app.refresh().await {
-                app.show_error(format!("refresh failed: {error}"));
-            }
-        }
-        ChatAction::Cancel => {
-            if let Err(error) = app.cancel_active_turn(None).await {
-                app.show_error(format!("cancel failed: {error}"));
-            }
-        }
+        ChatAction::Refresh => app.request_transcript_refresh(None),
+        ChatAction::Cancel => app.cancel_active_turn(None),
         ChatAction::ApproveLastPendingOnce => {
             if let Err(error) = app
                 .start_resolve_last_pending(true, ApprovalScope::Once, None)
@@ -205,36 +197,12 @@ async fn dispatch_chat_action(app: &mut ChatApp, action: ChatAction) {
                 app.show_error(format!("denial failed: {error}"));
             }
         }
-        ChatAction::PreviousBranch => {
-            if let Err(error) = app.cycle_branch(-1).await {
-                app.show_error(format!("branch switch failed: {error}"));
-            }
-        }
-        ChatAction::NextBranch => {
-            if let Err(error) = app.cycle_branch(1).await {
-                app.show_error(format!("branch switch failed: {error}"));
-            }
-        }
-        ChatAction::PreviousSession => {
-            if let Err(error) = app.cycle_session(-1).await {
-                app.show_error(format!("session switch failed: {error}"));
-            }
-        }
-        ChatAction::NextSession => {
-            if let Err(error) = app.cycle_session(1).await {
-                app.show_error(format!("session switch failed: {error}"));
-            }
-        }
-        ChatAction::NewSession => {
-            if let Err(error) = app.create_session(None).await {
-                app.show_error(format!("session creation failed: {error}"));
-            }
-        }
-        ChatAction::CreateBranch => {
-            if let Err(error) = app.create_branch(None).await {
-                app.show_error(format!("branch creation failed: {error}"));
-            }
-        }
+        ChatAction::PreviousBranch => app.cycle_branch(-1),
+        ChatAction::NextBranch => app.cycle_branch(1),
+        ChatAction::PreviousSession => app.cycle_session(-1),
+        ChatAction::NextSession => app.cycle_session(1),
+        ChatAction::NewSession => app.create_session(None),
+        ChatAction::CreateBranch => app.create_branch(None),
     }
 }
 

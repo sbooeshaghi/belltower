@@ -194,6 +194,12 @@ This behavior should explicitly match Codex-style interaction.
   cache that re-rendered the whole transcript per event and was never read
   was deleted; do not reintroduce whole-transcript rendering on the stream
   path.)
+- Slash commands and keybinding actions that do network I/O never block the
+  event loop: they enqueue onto a serial pending-command queue (submission
+  order preserved, completions applied front-first, "Running /cmd …" status
+  while pending, failures land in visible history with the command label).
+  Session switches abort queued commands rather than letting them apply to
+  the wrong session. Operator-command recording is preserved on every path.
 - `/inspect tool <call-id>` drills into a specific tool call in detail without rerendering prior transcript output.
 - Humans and agents should share the same inspection concept and data model.
 

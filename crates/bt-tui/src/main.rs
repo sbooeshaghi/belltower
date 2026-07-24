@@ -51,6 +51,9 @@ use bt_protocol::{
     SteerSessionRequest, UpdateSessionRequest,
 };
 use clap::{Args, Parser, Subcommand};
+use command_actions::pending::{
+    CommandOutcome, PendingCommand, command_label, record_slash_command,
+};
 use command_render::{
     correlate_raw_diff_events, render_branches_output, render_compaction_output,
     render_defaults_output, render_doctor_output, render_execution_output, render_export_output,
@@ -119,7 +122,7 @@ pub(crate) use text_utils::{
     take_prefix_by_display_width, truncate_detail, truncate_path, wrap_composer_input,
     wrap_composer_input_with_end_indices, wrap_plain_text, wrapped_composer_cursor_position,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 pub(crate) use transcript_helpers::{
     errors_look_equivalent, merge_messages, merge_operator_commands, message_has_text,
@@ -132,8 +135,6 @@ pub(crate) use user_surface::{composer_text_area_rect, composer_wrap_width, user
 
 const COMMAND_NOTICE_TTL: Duration = Duration::from_secs(5);
 const METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-const READINESS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-const MCP_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const QUEUE_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const EVENT_STREAM_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
@@ -601,6 +602,17 @@ struct ChatApp {
     pending_send: Option<JoinHandle<std::result::Result<PendingSendCompletion, String>>>,
     pending_send_started_at: Option<Instant>,
     pending_message_submissions: VecDeque<PendingMessageSubmission>,
+    /// Slash commands running off the event loop. Commands fired while
+    /// another is pending queue up here: the VecDeque preserves submission
+    /// order, tasks are chained so they execute serially against the server,
+    /// and completions are applied front-first (see `command_actions::pending`).
+    pending_commands: VecDeque<PendingCommand>,
+    /// Completion signal of the most recently queued command task; the next
+    /// queued task waits on it so commands never race each other.
+    command_chain_tail: Option<oneshot::Receiver<()>>,
+    /// The "Running <label> …" detail currently shown for the queue front,
+    /// so completion only clears a status this queue actually set.
+    command_task_detail: Option<String>,
     pending_session_load: Option<JoinHandle<std::result::Result<LoadedSessionState, String>>>,
     pending_resume_command_raw_input: Option<String>,
     pending_history_backfill: Option<JoinHandle<std::result::Result<LoadedTranscriptPage, String>>>,
@@ -626,8 +638,6 @@ struct ChatApp {
     last_refresh: Instant,
     last_metadata_refresh: Instant,
     last_queue_refresh: Instant,
-    last_readiness_refresh: Instant,
-    last_mcp_refresh: Instant,
 }
 
 enum ChatStreamUpdate {

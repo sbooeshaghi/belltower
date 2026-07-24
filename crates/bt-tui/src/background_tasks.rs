@@ -11,6 +11,7 @@ impl ChatApp {
         self.poll_history_backfill_completion().await?;
         self.poll_send_completion().await?;
         self.poll_message_submission_completion().await?;
+        self.poll_command_completion().await?;
         self.poll_approval_completion().await?;
         Ok(())
     }

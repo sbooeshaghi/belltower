@@ -113,39 +113,6 @@ impl ChatApp {
         self.clamp_question_choice_selection();
     }
 
-    pub(super) async fn refresh_readiness_cache(
-        &mut self,
-        force: bool,
-    ) -> Result<(), Box<dyn Error>> {
-        if !force && self.last_readiness_refresh.elapsed() < READINESS_REFRESH_INTERVAL {
-            return Ok(());
-        }
-
-        let (status, backends, models) = tokio::try_join!(
-            self.client.status_inspection(),
-            self.client.model_backends(),
-            self.client.connection_models()
-        )?;
-        self.connection_status = Some(status.inspection);
-        self.model_backends = backends.backends;
-        self.connection_models = models.connections;
-        self.last_readiness_refresh = Instant::now();
-        Ok(())
-    }
-
-    pub(super) async fn refresh_connection_model_inventory(
-        &mut self,
-        connection_id: &ConnectionId,
-    ) -> Result<(), Box<dyn Error>> {
-        let models = self
-            .client
-            .connection_model_inventory(connection_id)
-            .await?;
-        self.merge_connection_model_inventories(models.connections);
-        self.last_readiness_refresh = Instant::now();
-        Ok(())
-    }
-
     pub(super) fn merge_connection_model_inventories(
         &mut self,
         inventories: Vec<ConnectionModelInventory>,
@@ -161,18 +128,6 @@ impl ChatApp {
                 self.connection_models.push(inventory);
             }
         }
-    }
-
-    pub(super) async fn refresh_mcp_cache(&mut self, force: bool) -> Result<(), Box<dyn Error>> {
-        if !force && self.last_mcp_refresh.elapsed() < MCP_REFRESH_INTERVAL {
-            return Ok(());
-        }
-
-        let inventory = self.client.mcp_inventory().await?;
-        self.mcp_servers = inventory.servers;
-        self.mcp_tools = inventory.tools;
-        self.last_mcp_refresh = Instant::now();
-        Ok(())
     }
 
     pub(super) fn refresh_tool_views(&mut self) {

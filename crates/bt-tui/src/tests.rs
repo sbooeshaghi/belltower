@@ -1,9 +1,9 @@
 use super::{
-    COMPOSER_BACKGROUND, ChatAction, ChatApp, ConnectionId, ESCAPE_PREFIX_TIMEOUT, EventEnvelope,
-    EventPayload, LoadedTranscriptPage, Message, MessagePart, PendingSendCompletion, Role,
-    ScrollbackSeparator, SessionId, SessionToolMode, ToolCallId, ToolResultEnvelope,
-    TranscriptDensity, TranscriptEntryKind, command_help_output, completion_for_input,
-    composer_body_height, composer_text_area_rect, composer_wrap_width,
+    COMPOSER_BACKGROUND, ChatAction, ChatApp, CommandOutcome, ConnectionId, ESCAPE_PREFIX_TIMEOUT,
+    EventEnvelope, EventPayload, LoadedTranscriptPage, Message, MessagePart, PendingCommand,
+    PendingSendCompletion, Role, ScrollbackSeparator, SessionId, SessionToolMode, ToolCallId,
+    ToolResultEnvelope, TranscriptDensity, TranscriptEntryKind, command_help_output,
+    completion_for_input, composer_body_height, composer_text_area_rect, composer_wrap_width,
     desired_inline_viewport_height, render_bottom_panel, render_doctor_output,
     render_execution_output, render_footer_lines, render_message_with_options,
     render_models_output, render_raw_diff_output, render_session_output, render_status_output,
@@ -3730,4 +3730,193 @@ fn operator_surface_error_projection_matches_fixture() {
 
     let actual = render_raw_diff_output(&turn, &[], None, false, &events);
     assert_operator_fixture("error-render.txt", &actual);
+}
+
+fn queued_command(
+    label: &str,
+    raw_input: Option<&str>,
+    handle: tokio::task::JoinHandle<std::result::Result<CommandOutcome, String>>,
+) -> PendingCommand {
+    PendingCommand {
+        label: label.to_owned(),
+        raw_input: raw_input.map(str::to_owned),
+        handle,
+    }
+}
+
+async fn wait_for_front_command(app: &ChatApp) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if app
+                .pending_commands
+                .front()
+                .is_some_and(|pending| pending.handle.is_finished())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("queued command should finish");
+}
+
+#[tokio::test]
+async fn queued_command_completion_applies_result() {
+    let mut app = test_app();
+    app.pending_commands.push_back(queued_command(
+        "/mcp",
+        Some("/mcp"),
+        tokio::spawn(async {
+            Ok(CommandOutcome::McpInventory {
+                servers: vec![McpServerDescriptor {
+                    name: "docs".to_owned(),
+                    transport: bt_core::McpTransportKind::StreamableHttp,
+                    enabled: true,
+                    status: McpServerStatus::Ready,
+                }],
+                tools: Vec::new(),
+            })
+        }),
+    ));
+
+    wait_for_front_command(&app).await;
+    app.poll_command_completion()
+        .await
+        .expect("completion poll");
+
+    assert!(app.pending_commands.is_empty());
+    assert_eq!(app.mcp_servers.len(), 1);
+    assert_eq!(app.mcp_servers[0].name, "docs");
+    assert!(app.operator_commands.is_empty(), "no local error expected");
+}
+
+#[tokio::test]
+async fn failed_queued_command_lands_in_show_error() {
+    let mut app = test_app();
+    app.pending_commands.push_back(queued_command(
+        "/status",
+        Some("/status"),
+        tokio::spawn(async { Err("connection refused".to_owned()) }),
+    ));
+
+    wait_for_front_command(&app).await;
+    app.poll_command_completion()
+        .await
+        .expect("completion poll");
+
+    assert!(app.pending_commands.is_empty());
+    let error = app.operator_commands.last().expect("local error recorded");
+    assert_eq!(error.command_type, "local_error");
+    assert!(!error.success);
+    assert!(
+        error.output.contains("/status failed: connection refused"),
+        "unexpected error output: {}",
+        error.output
+    );
+}
+
+#[tokio::test]
+async fn queued_command_completions_apply_in_submission_order() {
+    let mut app = test_app();
+    app.pending_commands.push_back(queued_command(
+        "/models",
+        Some("/models"),
+        tokio::spawn(std::future::pending::<
+            std::result::Result<CommandOutcome, String>,
+        >()),
+    ));
+    app.pending_commands.push_back(queued_command(
+        "/status",
+        Some("/status"),
+        tokio::spawn(async { Ok(CommandOutcome::Notice("second finished".to_owned())) }),
+    ));
+
+    // Give the second task time to finish; the first never will.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    app.poll_command_completion()
+        .await
+        .expect("completion poll");
+
+    // The unfinished front command blocks the later completion so results
+    // are always applied in submission order.
+    assert_eq!(app.pending_commands.len(), 2);
+    assert!(app.active_notice().is_none());
+
+    app.pending_commands
+        .front()
+        .expect("front command")
+        .handle
+        .abort();
+    wait_for_front_command(&app).await;
+    app.poll_command_completion()
+        .await
+        .expect("completion poll");
+
+    assert!(app.pending_commands.is_empty());
+    assert_eq!(app.active_notice(), Some("second finished"));
+    assert!(
+        app.operator_commands
+            .last()
+            .is_some_and(|command| command.output.contains("/models task failed")),
+        "aborted front command should surface through show_error"
+    );
+}
+
+#[tokio::test]
+async fn enqueued_commands_execute_serially_and_show_running_status() {
+    let mut app = test_app();
+    app.enqueue_pending_command(
+        "/model",
+        Some("/model gpt".to_owned()),
+        std::future::pending::<std::result::Result<CommandOutcome, String>>(),
+    );
+    app.enqueue_pending_command("/status", Some("/status".to_owned()), async {
+        Ok(CommandOutcome::Notice("status done".to_owned()))
+    });
+
+    let status = app.task_status.as_ref().expect("running status");
+    assert_eq!(status.header, "Running");
+    assert_eq!(status.detail.as_deref(), Some("/model …"));
+    assert!(!status.show_interrupt_hint);
+
+    // The second command is chained behind the first and must not start
+    // (let alone finish) while the first is still running.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!app.pending_commands[1].handle.is_finished());
+
+    app.pending_commands[0].handle.abort();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !app.pending_commands.is_empty() {
+            app.poll_command_completion()
+                .await
+                .expect("completion poll");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("queue should drain after the front command resolves");
+
+    assert_eq!(app.active_notice(), Some("status done"));
+    assert!(
+        app.task_status.is_none(),
+        "running status should clear when the queue empties"
+    );
+}
+
+#[tokio::test]
+async fn network_slash_command_enqueues_instead_of_blocking_dispatch() {
+    let mut app = test_app();
+
+    app.handle_command("/status").await.expect("dispatch");
+
+    assert_eq!(app.pending_commands.len(), 1);
+    assert_eq!(app.pending_commands[0].label, "/status");
+    assert_eq!(
+        app.pending_commands[0].raw_input.as_deref(),
+        Some("/status")
+    );
+    while let Some(pending) = app.pending_commands.pop_front() {
+        pending.handle.abort();
+    }
 }
