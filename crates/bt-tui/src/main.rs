@@ -358,6 +358,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         display_name,
                         objective,
                         budget: None,
+                        approval_mode: None,
                     })
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&response)?);

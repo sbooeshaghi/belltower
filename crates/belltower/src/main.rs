@@ -859,6 +859,8 @@ async fn run_headless(args: RunArgs) -> Result<()> {
     result
 }
 
+const HEADLESS_TURN_TIMEOUT_SECONDS: u64 = 600;
+
 async fn run_headless_turn(args: &RunArgs, prompt: &str, launch: &PreparedLaunch) -> Result<()> {
     let client = BelltowerClient::new_discovering_auth(Url::parse(&launch.server_url)?)
         .map_err(client_error)?;
@@ -871,6 +873,7 @@ async fn run_headless_turn(args: &RunArgs, prompt: &str, launch: &PreparedLaunch
             display_name: Some(headless_display_name(prompt)),
             objective: Some(prompt.to_owned()),
             budget: None,
+            approval_mode: None,
         })
         .await
         .map_err(client_error)?;
@@ -881,6 +884,15 @@ async fn run_headless_turn(args: &RunArgs, prompt: &str, launch: &PreparedLaunch
                 branch_id: create_response.branch.branch_id,
                 message: Message::text(Role::User, prompt),
             },
+        )
+        .await
+        .map_err(client_error)?;
+    // Turns run detached from the send POST; wait for the session to settle
+    // before reading the outcome.
+    client
+        .wait_for_session_settle(
+            create_response.session.session_id,
+            std::time::Duration::from_secs(HEADLESS_TURN_TIMEOUT_SECONDS),
         )
         .await
         .map_err(client_error)?;

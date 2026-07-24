@@ -265,6 +265,17 @@ with optional artifact references and reply correlation. A richer return
 artifact should remain structured rather than becoming an untyped transcript
 convention.
 
+Reply settlement is a turn-run invariant, not a dispatch-path courtesy: at the
+end of every turn run on a child session, each claimed `instruction`/`question`
+message without a terminal reply receives one derived from the outcome. A
+child that pauses for approval and is resumed by the operator therefore still
+reports its eventual result. Terminal replies (`result`/`error`) are sent with
+`wake` delivery so an idle parent runs a turn to consume them; waking cannot
+ping-pong because a woken turn claims a `result`/`error` message, which never
+creates a reply obligation. A server-side wake pump subscribed to the event
+bus dispatches any `wake` message whose destination was idle when it arrived;
+claims are atomic, so racing dispatchers resolve to one turn.
+
 At minimum it should support:
 
 - summary
@@ -284,6 +295,16 @@ Rules:
 - the parent may inspect them
 - parent-level approval inheritance must be explicit and policy-based
 - broad approvals should not automatically leak into delegated sessions by default
+
+Auto-approval is the explicit policy form of inheritance: a session may run in
+auto-approval mode (`approval_mode: "auto"` at create time, or per spawn with
+`inherit`/`auto`/`prompt`, where `inherit` copies the parent's mode). In auto
+mode every approval resolves as a durable `Policy { rule:
+"session_auto_approve" }` decision — recorded, session-scoped, and auditable.
+The mode flag itself is process-local and fail-safe: a restart falls back to
+prompting. Spawn approval is how the operator consents to a child's mode: the
+`approval_mode` argument is visible in the spawn arguments they approve, and a
+parent already in auto mode delegates within the depth and descendant caps.
 
 This matters because autonomous work should remain auditable.
 If a child session used a dangerous tool, the operator must be able to answer which session approved it, under what scope, and why.

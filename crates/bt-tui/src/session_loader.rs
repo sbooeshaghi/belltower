@@ -62,6 +62,7 @@ pub(super) async fn open_chat_session(
             display_name: args.display_name.clone(),
             objective: args.objective.clone(),
             budget: None,
+            approval_mode: None,
         })
         .await?;
     Ok(ChatSessionSelection {

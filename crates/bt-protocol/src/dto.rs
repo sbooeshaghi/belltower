@@ -98,6 +98,12 @@ pub struct CreateSessionRequest {
     pub objective: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<BudgetConfig>,
+    /// "auto" puts the session into auto-approval mode: every tool approval
+    /// resolves as a recorded policy decision instead of prompting. Omit (or
+    /// "prompt") for the default human-in-the-loop behavior. Process-local
+    /// and fail-safe: a server restart falls back to prompting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

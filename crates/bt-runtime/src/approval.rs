@@ -165,6 +165,11 @@ impl ApprovalEvaluator for ApprovalState {
 pub struct PolicyApprovalEvaluator {
     state: Arc<ApprovalState>,
     auto_approve_patterns: Vec<String>,
+    /// Sessions running in auto-approval mode: every approval request
+    /// resolves as a recorded policy decision instead of waiting on a human.
+    /// Process-local by design (fail-safe: a restart drops back to asking);
+    /// each resolved decision is still durably recorded in the event log.
+    auto_approve_sessions: std::sync::RwLock<std::collections::HashSet<bt_core::SessionId>>,
 }
 
 impl PolicyApprovalEvaluator {
@@ -173,10 +178,41 @@ impl PolicyApprovalEvaluator {
         Self {
             state,
             auto_approve_patterns,
+            auto_approve_sessions: std::sync::RwLock::new(std::collections::HashSet::new()),
         }
     }
 
+    pub fn set_session_auto_approval(&self, session_id: bt_core::SessionId, enabled: bool) {
+        let mut sessions = self
+            .auto_approve_sessions
+            .write()
+            .expect("auto-approval registry poisoned");
+        if enabled {
+            sessions.insert(session_id);
+        } else {
+            sessions.remove(&session_id);
+        }
+    }
+
+    #[must_use]
+    pub fn session_auto_approval(&self, session_id: bt_core::SessionId) -> bool {
+        self.auto_approve_sessions
+            .read()
+            .expect("auto-approval registry poisoned")
+            .contains(&session_id)
+    }
+
     fn auto_approve(&self, request: &ApprovalRequest) -> Option<ApprovalDecision> {
+        if self.session_auto_approval(request.session_id) {
+            return Some(ApprovalDecision::Approved {
+                decided_at: time::OffsetDateTime::now_utc(),
+                decided_by: "policy:session-auto-approve".to_owned(),
+                scope: ApprovalScope::Session,
+                source: ApprovalDecisionSource::Policy {
+                    rule: "session_auto_approve".to_owned(),
+                },
+            });
+        }
         if matches!(request.requirement, ApprovalRequirement::FirstUsePerSession)
             && matches!(
                 request.tool_metadata.risk_class,
@@ -383,6 +419,46 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn session_auto_approval_resolves_always_requirements_as_policy() {
+        let evaluator =
+            PolicyApprovalEvaluator::new(Arc::new(ApprovalState::default()), Vec::new());
+        let auto_session = SessionId::new();
+        let other_session = SessionId::new();
+
+        let blocked = evaluator
+            .evaluate(&request(other_session, "shell", json!({"command": "rm x"})))
+            .expect("evaluation should succeed");
+        assert!(blocked.is_none(), "non-auto session must still prompt");
+
+        evaluator.set_session_auto_approval(auto_session, true);
+        let decision = evaluator
+            .evaluate(&request(auto_session, "shell", json!({"command": "rm x"})))
+            .expect("evaluation should succeed");
+        assert!(matches!(
+            decision,
+            Some(ApprovalDecision::Approved {
+                source: ApprovalDecisionSource::Policy { ref rule },
+                scope: ApprovalScope::Session,
+                ..
+            }) if rule == "session_auto_approve"
+        ));
+
+        let still_blocked = evaluator
+            .evaluate(&request(other_session, "shell", json!({"command": "rm x"})))
+            .expect("evaluation should succeed");
+        assert!(
+            still_blocked.is_none(),
+            "auto mode must stay scoped to its session"
+        );
+
+        evaluator.set_session_auto_approval(auto_session, false);
+        let disabled = evaluator
+            .evaluate(&request(auto_session, "shell", json!({"command": "ls"})))
+            .expect("evaluation should succeed");
+        assert!(disabled.is_none(), "disabling auto mode must re-gate");
     }
 
     #[test]

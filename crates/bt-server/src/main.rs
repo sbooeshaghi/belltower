@@ -169,6 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "resumed durable related-session wake messages"
         );
     }
+    agent_tools::spawn_wake_pump(state.clone());
     trace.mark("server.ready");
     axum::serve(listener, build_app(state)).await?;
     Ok(())
@@ -335,6 +336,7 @@ async fn create_session(
     ApiJson(request): ApiJson<CreateSessionRequest>,
 ) -> Result<Json<CreateSessionResponse>, ApiError> {
     let budget = request.budget.clone();
+    let approval_mode = parse_approval_mode(request.approval_mode.as_deref())?;
     let (session, branch) = state.runtime.create_session(
         request.project_root.into(),
         request.connection_id,
@@ -348,7 +350,48 @@ async fn create_session(
             .runtime
             .configure_session_budget(session.session_id, branch.branch_id, budget)?;
     }
+    if approval_mode == ApprovalMode::Auto {
+        apply_auto_approval_mode(&state, &session, branch.branch_id)?;
+    }
     Ok(Json(CreateSessionResponse { session, branch }))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApprovalMode {
+    Prompt,
+    Auto,
+}
+
+pub(crate) fn parse_approval_mode(raw: Option<&str>) -> Result<ApprovalMode, ApiError> {
+    match raw.unwrap_or("prompt") {
+        "prompt" => Ok(ApprovalMode::Prompt),
+        "auto" => Ok(ApprovalMode::Auto),
+        value => Err(ApiError(bt_core::BelltowerError::Protocol(format!(
+            "unsupported approval_mode `{value}`; expected `prompt` or `auto`"
+        )))),
+    }
+}
+
+/// Enables auto-approval for a session and records the policy change as a
+/// durable operator command so the event log explains every policy-approved
+/// tool call that follows.
+pub(crate) fn apply_auto_approval_mode(
+    state: &AppState,
+    session: &SessionRecord,
+    branch_id: bt_core::BranchId,
+) -> Result<(), ApiError> {
+    state
+        .runtime
+        .set_session_approval_auto(session.session_id, true);
+    state.runtime.record_operator_command(
+        session.session_id,
+        branch_id,
+        "approval_mode".to_owned(),
+        "approval_mode auto".to_owned(),
+        "Session approvals now resolve automatically as recorded policy decisions.".to_owned(),
+        true,
+    )?;
+    Ok(())
 }
 
 async fn update_session(
@@ -449,7 +492,7 @@ async fn send_message(
         .admit_user_message(&session, &branch, request.message)?
     {
         UserMessageAdmission::Started(started) => {
-            run_session_turn(&state, &session, &branch, started).await?;
+            detach_session_turn(&state, session.clone(), branch.clone(), started);
             SendMessageOutcome::Dispatched
         }
         UserMessageAdmission::Queued { position } => SendMessageOutcome::Queued { position },
@@ -600,77 +643,90 @@ async fn approve_tool(
             .model_id
             .clone()
             .unwrap_or_else(|| connection.default_model.clone());
-        let started = Instant::now();
-        let tool_result = match resolve_tool_after_approval(
+        let resumed_turn_span = session_scope_span(&turn_session, branch.branch_id);
+        let work_state = state.clone();
+        detach_turn_work(
             &state,
-            &turn_session,
-            branch.branch_id,
-            Some(resumed.turn_id()),
-            &resumable.tool_call,
-            decision,
-        )
-        .await
-        {
-            Ok(tool_result) => tool_result,
-            Err(error) => {
-                let latency_ms = started.elapsed().as_millis() as u64;
-                state.runtime.record_resumed_tool_failure(
-                    &turn_session,
-                    &branch,
-                    &connection,
-                    &model_id,
-                    resumed.turn_id(),
-                    &resumable.tool_call,
-                    &error.0,
-                    latency_ms,
-                )?;
-                return Err(error);
-            }
-        };
-        let tool_result_message = bt_core::Message::from_part(
-            bt_core::Role::Tool,
-            bt_core::MessagePart::ToolResult {
-                result: tool_result.clone(),
-            },
-        );
-        if let Err(persistence_error) = state.runtime.record_tool_terminal_transition(
             turn_session.session_id,
             branch.branch_id,
             resumed.turn_id(),
-            tool_result.clone(),
-            tool_result_message,
-        ) {
-            let latency_ms = started.elapsed().as_millis() as u64;
-            state.runtime.record_turn_failure_transition(
-                turn_session.session_id,
-                branch.branch_id,
-                &connection.provider,
-                &model_id,
-                resumed.turn_id(),
-                vec![tool_result],
-                &persistence_error,
-                latency_ms,
-            )?;
-            return Err(ApiError(persistence_error));
-        }
-        if state
-            .runtime
-            .has_pending_approvals_on_branch(turn_session.session_id, branch.branch_id)?
-        {
-            let latency_ms = started.elapsed().as_millis() as u64;
-            state.runtime.record_active_turn_finished(
-                turn_session.session_id,
-                branch.branch_id,
-                resumed.turn_id(),
-                connection.provider.clone(),
-                model_id.clone(),
-                "awaiting_approval".to_owned(),
-                Some("tool_calls".to_owned()),
-                latency_ms,
-            )?;
-            return Ok(StatusCode::ACCEPTED);
-        }
-        run_session_turn(&state, &turn_session, &branch, resumed).await?;
+            async move {
+                let state = work_state;
+                let started = Instant::now();
+                let tool_result = match resolve_tool_after_approval(
+                    &state,
+                    &turn_session,
+                    branch.branch_id,
+                    Some(resumed.turn_id()),
+                    &resumable.tool_call,
+                    decision,
+                )
+                .await
+                {
+                    Ok(tool_result) => tool_result,
+                    Err(error) => {
+                        let latency_ms = started.elapsed().as_millis() as u64;
+                        state.runtime.record_resumed_tool_failure(
+                            &turn_session,
+                            &branch,
+                            &connection,
+                            &model_id,
+                            resumed.turn_id(),
+                            &resumable.tool_call,
+                            &error.0,
+                            latency_ms,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                let tool_result_message = bt_core::Message::from_part(
+                    bt_core::Role::Tool,
+                    bt_core::MessagePart::ToolResult {
+                        result: tool_result.clone(),
+                    },
+                );
+                if let Err(persistence_error) = state.runtime.record_tool_terminal_transition(
+                    turn_session.session_id,
+                    branch.branch_id,
+                    resumed.turn_id(),
+                    tool_result.clone(),
+                    tool_result_message,
+                ) {
+                    let latency_ms = started.elapsed().as_millis() as u64;
+                    state.runtime.record_turn_failure_transition(
+                        turn_session.session_id,
+                        branch.branch_id,
+                        &connection.provider,
+                        &model_id,
+                        resumed.turn_id(),
+                        vec![tool_result],
+                        &persistence_error,
+                        latency_ms,
+                    )?;
+                    return Err(ApiError(persistence_error));
+                }
+                if state
+                    .runtime
+                    .has_pending_approvals_on_branch(turn_session.session_id, branch.branch_id)?
+                {
+                    let latency_ms = started.elapsed().as_millis() as u64;
+                    state.runtime.record_active_turn_finished(
+                        turn_session.session_id,
+                        branch.branch_id,
+                        resumed.turn_id(),
+                        connection.provider.clone(),
+                        model_id.clone(),
+                        "awaiting_approval".to_owned(),
+                        Some("tool_calls".to_owned()),
+                        latency_ms,
+                    )?;
+                    return Ok(());
+                }
+                run_session_turn(&state, &turn_session, &branch, resumed).await?;
+                Ok(())
+            }
+            .instrument(resumed_turn_span),
+        );
 
         Ok(StatusCode::ACCEPTED)
     }
@@ -696,7 +752,7 @@ async fn answer_tool(
         let resumed = state
             .runtime
             .bootstrap_resumed_input_turn(&resumable, tool_result)?;
-        run_session_turn(&state, &session, &branch, resumed).await?;
+        detach_session_turn(&state, session.clone(), branch.clone(), resumed);
         Ok(StatusCode::ACCEPTED)
     }
     .instrument(session_span)
@@ -1461,8 +1517,107 @@ pub(crate) async fn run_session_turn(
             &adapters,
             TurnRunRequest::new(session.clone(), branch.clone(), admitted_turn)?,
         )
-        .await?;
-    Ok(outcome)
+        .await
+        .map_err(ApiError::from);
+    // Every turn-run path (dispatch, send, approval/input resume) settles the
+    // session's reply obligations to related sessions here, so a child that
+    // pauses for approval still reports its eventual outcome to the parent.
+    if session.parent_session_id.is_some()
+        && let Err(error) =
+            crate::agent_tools::settle_child_reply_obligations(state, session, branch, &outcome)
+    {
+        tracing::warn!(
+            session_id = %session.session_id,
+            error = %error,
+            "failed to settle child reply obligations"
+        );
+    }
+    outcome
+}
+
+/// Runs admitted-turn work on a detached task so a client disconnect can
+/// never abort a turn mid-flight. The watchdog guarantees the task cannot
+/// leave the session claimed: on panic/abort (and as a backstop on error
+/// paths the orchestrator already records) it force-transitions the turn to
+/// failed; a transition rejected because the turn is already terminal is
+/// expected and logged at debug.
+pub(crate) fn detach_turn_work<F>(
+    state: &AppState,
+    session_id: SessionId,
+    branch_id: bt_core::BranchId,
+    turn_id: bt_core::TurnId,
+    work: F,
+) where
+    F: std::future::Future<Output = Result<(), ApiError>> + Send + 'static,
+{
+    let worker = tokio::spawn(work);
+    let watchdog_state = state.clone();
+    tokio::spawn(async move {
+        let failure_reason = match worker.await {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => {
+                tracing::error!(
+                    %session_id,
+                    %turn_id,
+                    error = %error.0,
+                    "detached turn task ended with failure"
+                );
+                "turn task ended with unrecorded failure".to_owned()
+            }
+            Err(join_error) => {
+                let reason = if join_error.is_panic() {
+                    "panicked"
+                } else {
+                    "was aborted"
+                };
+                tracing::error!(%session_id, %turn_id, "detached turn task {reason}");
+                format!("turn task {reason}")
+            }
+        };
+        let error = bt_core::BelltowerError::Runtime(failure_reason);
+        if let Err(record_error) = watchdog_state.runtime.record_turn_failure_transition(
+            session_id,
+            branch_id,
+            "unknown",
+            "unknown",
+            turn_id,
+            Vec::new(),
+            &error,
+            0,
+        ) {
+            tracing::debug!(
+                %session_id,
+                %turn_id,
+                "turn failure already recorded or turn no longer active: {record_error}"
+            );
+        }
+    });
+}
+
+/// Detaches a full session-turn run (admission already recorded).
+pub(crate) fn detach_session_turn(
+    state: &AppState,
+    session: SessionRecord,
+    branch: BranchRecord,
+    admitted_turn: bt_runtime::AdmittedTurn,
+) {
+    let session_id = session.session_id;
+    let branch_id = branch.branch_id;
+    let turn_id = admitted_turn.turn_id();
+    let session_span = session_scope_span(&session, branch_id);
+    let work_state = state.clone();
+    detach_turn_work(
+        state,
+        session_id,
+        branch_id,
+        turn_id,
+        async move {
+            run_session_turn(&work_state, &session, &branch, admitted_turn)
+                .await
+                .map(|_| ())
+        }
+        .instrument(session_span),
+    );
 }
 
 #[cfg(test)]

@@ -42,6 +42,19 @@ impl BelltowerRuntime {
         self.approval_evaluator.clone()
     }
 
+    /// Puts a session into (or out of) auto-approval mode: every approval
+    /// request resolves as a recorded policy decision. Process-local and
+    /// fail-safe — restarts fall back to prompting.
+    pub fn set_session_approval_auto(&self, session_id: SessionId, enabled: bool) {
+        self.approval_evaluator
+            .set_session_auto_approval(session_id, enabled);
+    }
+
+    #[must_use]
+    pub fn session_approval_is_auto(&self, session_id: SessionId) -> bool {
+        self.approval_evaluator.session_auto_approval(session_id)
+    }
+
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
         self.event_bus.subscribe()

@@ -3,12 +3,13 @@
 //! These executors adapt the canonical runtime/session graph to the agent tool
 //! loop. They do not own lineage, mailbox, admission, or turn semantics.
 
-use crate::{AppState, detach_turn_work, run_session_turn};
+use crate::AppState;
 use bt_core::{
-    ApprovalRequirement, BelltowerError, BranchId, ConnectionId, RelatedSessionDeliveryMode,
-    RelatedSessionMessageDirection, RelatedSessionMessageId, RelatedSessionMessageKind, Result,
-    Role, SessionId, ToolCallId, ToolContext, ToolDisplayGroup, ToolExecutionMode, ToolExecutor,
-    ToolInterruptBehavior, ToolMetadata, ToolResultEnvelope, ToolRiskClass, ToolSpec,
+    ApprovalRequirement, BelltowerError, BranchId, ConnectionId, EventPayload,
+    RelatedSessionDeliveryMode, RelatedSessionMessageDirection, RelatedSessionMessageId,
+    RelatedSessionMessageKind, RelatedSessionMessageStatus, Result, Role, SessionId, ToolCallId,
+    ToolContext, ToolDisplayGroup, ToolExecutionMode, ToolExecutor, ToolInterruptBehavior,
+    ToolMetadata, ToolResultEnvelope, ToolRiskClass, ToolSpec,
 };
 use bt_runtime::{AdmittedTurn, BelltowerRuntime, TurnRunOutcome, TurnRunStopReason};
 use bt_tools::BuiltInToolRegistry;
@@ -84,6 +85,11 @@ impl ToolExecutor for SpawnAgentTool {
                     "allow_shared_workspace": {
                         "type": "boolean",
                         "description": "Must be true to acknowledge that parent and child currently share one project root."
+                    },
+                    "approval_mode": {
+                        "type": "string",
+                        "enum": ["inherit", "auto", "prompt"],
+                        "description": "Child tool-approval policy. inherit (default) copies the parent session's mode; auto resolves every child approval as a recorded policy decision; prompt requires human approval."
                     }
                 },
                 "additionalProperties": false
@@ -132,6 +138,19 @@ impl ToolExecutor for SpawnAgentTool {
                 self.session_id,
                 self.branch_id,
             )?);
+            let child_auto_approval = match optional_string(&arguments, "approval_mode")
+                .as_deref()
+                .unwrap_or("inherit")
+            {
+                "inherit" => self.state.runtime.session_approval_is_auto(self.session_id),
+                "auto" => true,
+                "prompt" => false,
+                value => {
+                    return Err(BelltowerError::Tool(format!(
+                        "unsupported approval_mode `{value}`; expected inherit, auto, or prompt"
+                    )));
+                }
+            };
             let (child, child_branch, receipt) = self
                 .state
                 .runtime
@@ -144,6 +163,20 @@ impl ToolExecutor for SpawnAgentTool {
                     connection_id,
                     model_id,
                 )?;
+            if child_auto_approval {
+                self.state
+                    .runtime
+                    .set_session_approval_auto(child.session_id, true);
+                self.state.runtime.record_operator_command(
+                    child.session_id,
+                    child_branch.branch_id,
+                    "approval_mode".to_owned(),
+                    "approval_mode auto (from spawn)".to_owned(),
+                    "Child session approvals resolve automatically as recorded policy decisions."
+                        .to_owned(),
+                    true,
+                )?;
+            }
             let admitted = self
                 .state
                 .runtime
@@ -153,13 +186,7 @@ impl ToolExecutor for SpawnAgentTool {
                         "new child session could not claim its initial objective".to_owned(),
                     )
                 })?;
-            dispatch_agent_turn(
-                self.state.clone(),
-                admitted,
-                self.session_id,
-                self.branch_id,
-                receipt.message_id,
-            )?;
+            dispatch_agent_turn(self.state.clone(), admitted)?;
 
             Ok(ToolResultEnvelope {
                 call_id,
@@ -273,13 +300,7 @@ impl ToolExecutor for SendAgentMessageTool {
                     .runtime
                     .claim_next_related_session_message(target_session_id)?
             {
-                dispatch_agent_turn(
-                    self.state.clone(),
-                    admitted,
-                    self.session_id,
-                    self.branch_id,
-                    receipt.message_id,
-                )?;
+                dispatch_agent_turn(self.state.clone(), admitted)?;
                 dispatched = true;
             }
             Ok(ToolResultEnvelope {
@@ -422,13 +443,7 @@ impl ToolExecutor for WaitAgentTool {
     }
 }
 
-fn dispatch_agent_turn(
-    state: AppState,
-    admitted: AdmittedTurn,
-    reply_destination_session_id: SessionId,
-    reply_destination_branch_id: BranchId,
-    in_reply_to: RelatedSessionMessageId,
-) -> Result<()> {
+fn dispatch_agent_turn(state: AppState, admitted: AdmittedTurn) -> Result<()> {
     let session = state
         .runtime
         .load_session(admitted.session_id())?
@@ -437,33 +452,70 @@ fn dispatch_agent_turn(
         .runtime
         .load_branch(admitted.session_id(), admitted.branch_id())?
         .ok_or_else(|| BelltowerError::NotFound("agent branch".to_owned()))?;
-    let work_state = state.clone();
-    detach_turn_work(
-        &state,
-        session.session_id,
-        branch.branch_id,
-        admitted.turn_id(),
-        async move {
-            let outcome = run_session_turn(&work_state, &session, &branch, admitted).await;
-            if let Err(error) = record_agent_outcome(
-                &work_state,
-                &session,
-                &branch,
-                reply_destination_session_id,
-                reply_destination_branch_id,
-                in_reply_to,
-                outcome,
-            ) {
+    crate::detach_session_turn(&state, session, branch, admitted);
+    Ok(())
+}
+
+/// Background pump that dispatches Wake-mode related-session messages to
+/// idle destinations. Tools claim eagerly at the send site; this pump is the
+/// single mechanism that catches everything else (settled child results,
+/// wakes raced against a busy destination whose turn ended before post-turn
+/// controls saw the message, recovery gaps). Claiming is atomic, so a
+/// duplicate trigger resolves to `None` instead of a double dispatch.
+pub(super) fn spawn_wake_pump(state: AppState) {
+    let mut events = state.runtime.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    let EventPayload::RelatedSessionMessageRecorded {
+                        direction, message, ..
+                    } = &event.payload
+                    else {
+                        continue;
+                    };
+                    if *direction != RelatedSessionMessageDirection::Received
+                        || message.delivery_mode != RelatedSessionDeliveryMode::Wake
+                    {
+                        continue;
+                    }
+                    dispatch_pending_wakes(&state, event.session_id);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "wake pump lagged; sweeping pending agent turns");
+                    if let Err(error) = recover_pending_agent_turns(state.clone()) {
+                        tracing::warn!(error = %error, "wake pump sweep failed");
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+fn dispatch_pending_wakes(state: &AppState, destination_session_id: SessionId) {
+    match state
+        .runtime
+        .claim_next_related_session_message(destination_session_id)
+    {
+        Ok(Some(admitted)) => {
+            if let Err(error) = dispatch_agent_turn(state.clone(), admitted) {
                 tracing::warn!(
-                    session_id = %session.session_id,
+                    session_id = %destination_session_id,
                     error = %error,
-                    "failed to record subagent outcome"
+                    "failed to dispatch woken agent turn"
                 );
             }
-            Ok(())
-        },
-    );
-    Ok(())
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                session_id = %destination_session_id,
+                error = %error,
+                "failed to claim wake message"
+            );
+        }
+    }
 }
 
 pub(super) fn recover_pending_agent_turns(state: AppState) -> Result<usize> {
@@ -481,85 +533,110 @@ pub(super) fn recover_pending_agent_turns(state: AppState) -> Result<usize> {
         else {
             continue;
         };
-        dispatch_agent_turn(
-            state.clone(),
-            admitted,
-            record.message.source_session_id,
-            record.message.source_branch_id,
-            record.message.message_id,
-        )?;
+        dispatch_agent_turn(state.clone(), admitted)?;
         dispatched = dispatched.saturating_add(1);
     }
     Ok(dispatched)
 }
 
-fn record_agent_outcome(
+/// Settles this child session's reply obligations after a turn run: every
+/// claimed Instruction/Question from a related session that has not yet
+/// received a terminal reply gets one derived from the outcome. Runs at the
+/// `run_session_turn` choke point, so approval- and input-resumed child turns
+/// report back exactly like dispatch-path turns. Terminal replies are sent
+/// with Wake delivery: an idle parent runs a turn to consume the result
+/// instead of holding it forever. Waking cannot ping-pong — a woken turn
+/// claims a Result/Error message, which never creates a reply obligation.
+pub(super) fn settle_child_reply_obligations(
     state: &AppState,
     session: &bt_core::SessionRecord,
     branch: &bt_core::BranchRecord,
-    destination_session_id: SessionId,
-    destination_branch_id: BranchId,
-    in_reply_to: RelatedSessionMessageId,
-    outcome: std::result::Result<TurnRunOutcome, crate::ApiError>,
+    outcome: &std::result::Result<TurnRunOutcome, crate::ApiError>,
 ) -> Result<()> {
+    if session.parent_session_id.is_none() {
+        return Ok(());
+    }
+    let records = state.runtime.related_session_messages(session.session_id)?;
     let (kind, text) = match outcome {
-        Ok(outcome) => {
-            let explicit_terminal = state
-                .runtime
-                .related_session_messages(session.session_id)?
-                .into_iter()
-                .any(|record| {
-                    record.direction == RelatedSessionMessageDirection::Sent
-                        && record.message.in_reply_to == Some(in_reply_to)
-                        && matches!(
-                            record.message.kind,
-                            RelatedSessionMessageKind::Result | RelatedSessionMessageKind::Error
-                        )
-                });
-            if explicit_terminal {
-                return Ok(());
-            }
-            match outcome.stop_reason {
-                TurnRunStopReason::Complete => (
-                    RelatedSessionMessageKind::Result,
-                    latest_assistant_text(&state.runtime, session.session_id, branch.branch_id)?
-                        .unwrap_or_else(|| "Subagent turn completed.".to_owned()),
-                ),
-                TurnRunStopReason::AwaitingApproval => (
-                    RelatedSessionMessageKind::Progress,
-                    "Subagent is waiting for tool approval.".to_owned(),
-                ),
-                TurnRunStopReason::AwaitingInput => (
-                    RelatedSessionMessageKind::Progress,
-                    "Subagent is waiting for operator input.".to_owned(),
-                ),
-                TurnRunStopReason::BudgetExhausted => (
-                    RelatedSessionMessageKind::Error,
-                    "Subagent stopped because its budget was exhausted.".to_owned(),
-                ),
-                TurnRunStopReason::Cancelled => (
-                    RelatedSessionMessageKind::Error,
-                    "Subagent turn was cancelled.".to_owned(),
-                ),
-            }
-        }
+        Ok(outcome) => match outcome.stop_reason {
+            TurnRunStopReason::Complete => (
+                RelatedSessionMessageKind::Result,
+                latest_assistant_text(&state.runtime, session.session_id, branch.branch_id)?
+                    .unwrap_or_else(|| "Subagent turn completed.".to_owned()),
+            ),
+            TurnRunStopReason::AwaitingApproval => (
+                RelatedSessionMessageKind::Progress,
+                "Subagent is waiting for tool approval.".to_owned(),
+            ),
+            TurnRunStopReason::AwaitingInput => (
+                RelatedSessionMessageKind::Progress,
+                "Subagent is waiting for operator input.".to_owned(),
+            ),
+            TurnRunStopReason::BudgetExhausted => (
+                RelatedSessionMessageKind::Error,
+                "Subagent stopped because its budget was exhausted.".to_owned(),
+            ),
+            TurnRunStopReason::Cancelled => (
+                RelatedSessionMessageKind::Error,
+                "Subagent turn was cancelled.".to_owned(),
+            ),
+        },
         Err(error) => (
             RelatedSessionMessageKind::Error,
             format!("Subagent turn failed: {}", error.0),
         ),
     };
-    state.runtime.send_related_session_message(
-        session.session_id,
-        branch.branch_id,
-        None,
-        destination_session_id,
-        destination_branch_id,
+    let terminal = matches!(
         kind,
-        RelatedSessionDeliveryMode::Notify,
-        Some(in_reply_to),
-        text,
-        Vec::new(),
-    )?;
+        RelatedSessionMessageKind::Result | RelatedSessionMessageKind::Error
+    );
+
+    for record in records.iter().filter(|record| {
+        record.direction == RelatedSessionMessageDirection::Received
+            && record.status == RelatedSessionMessageStatus::Claimed
+            && matches!(
+                record.message.kind,
+                RelatedSessionMessageKind::Instruction | RelatedSessionMessageKind::Question
+            )
+    }) {
+        let message_id = record.message.message_id;
+        let already_terminally_replied = records.iter().any(|candidate| {
+            candidate.direction == RelatedSessionMessageDirection::Sent
+                && candidate.message.in_reply_to == Some(message_id)
+                && matches!(
+                    candidate.message.kind,
+                    RelatedSessionMessageKind::Result | RelatedSessionMessageKind::Error
+                )
+        });
+        if already_terminally_replied {
+            continue;
+        }
+        let duplicate_progress = !terminal
+            && records.iter().any(|candidate| {
+                candidate.direction == RelatedSessionMessageDirection::Sent
+                    && candidate.message.in_reply_to == Some(message_id)
+                    && candidate.message.text == text
+            });
+        if duplicate_progress {
+            continue;
+        }
+        state.runtime.send_related_session_message(
+            session.session_id,
+            branch.branch_id,
+            None,
+            record.message.source_session_id,
+            record.message.source_branch_id,
+            kind,
+            if terminal {
+                RelatedSessionDeliveryMode::Wake
+            } else {
+                RelatedSessionDeliveryMode::Notify
+            },
+            Some(message_id),
+            text.clone(),
+            Vec::new(),
+        )?;
+    }
     Ok(())
 }
 

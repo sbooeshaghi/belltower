@@ -521,6 +521,7 @@ impl ChatApp {
                 display_name: None,
                 objective: None,
                 budget: None,
+                approval_mode: None,
             })
             .await?;
         self.prepare_for_session_switch();
