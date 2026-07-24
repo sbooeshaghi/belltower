@@ -447,120 +447,15 @@ impl BelltowerRuntime {
             .collect()
     }
 
+    /// Turn history is an indexed read of the `turn_projection` read model,
+    /// maintained per appended event by the session store. Inspection
+    /// surfaces must not replay the session event log; the only replay is
+    /// the marker-gated rebuild during store migration.
     pub fn turn_history(&self, session_id: SessionId) -> Result<Vec<TurnInspection>> {
-        let events = self.all_events(session_id)?;
-        let mut turns: Vec<TurnInspection> = Vec::new();
-
-        for event in &events {
-            let Some(turn_id) = event.turn_id.or_else(|| payload_turn_id(&event.payload)) else {
-                continue;
-            };
-
-            let turn = ensure_turn_summary(&mut turns, event, turn_id);
-            turn.event_count += 1;
-            if turn.event_seq_start.is_none() {
-                turn.event_seq_start = event.seq_id;
-            }
-            turn.event_seq_end = event.seq_id.or(turn.event_seq_end);
-
-            match &event.payload {
-                EventPayload::TurnStarted {
-                    provider,
-                    model,
-                    message_count,
-                    settings_revision_id,
-                    ..
-                } => {
-                    turn.provider = provider.clone();
-                    turn.model = model.clone();
-                    turn.message_count = *message_count;
-                    turn.settings_revision_id = *settings_revision_id;
-                    turn.started_at = event.occurred_at;
-                    turn.event_seq_start = event.seq_id;
-                }
-                EventPayload::CompletionRequested {
-                    llm_call_ordinal: _,
-                    provider,
-                    model,
-                    message_count,
-                } => {
-                    if turn.provider.is_empty() {
-                        turn.provider = provider.clone();
-                    }
-                    if turn.model.is_empty() {
-                        turn.model = model.clone();
-                    }
-                    if turn.message_count == 0 {
-                        turn.message_count = *message_count;
-                    }
-                }
-                EventPayload::SessionError { code, .. } => {
-                    if turn.finish_reason.is_none() {
-                        turn.finish_reason = Some(code.clone());
-                    }
-                }
-                EventPayload::TurnFinished {
-                    provider,
-                    model,
-                    status,
-                    finish_reason,
-                    latency_ms,
-                    ..
-                } => {
-                    turn.provider = provider.clone();
-                    turn.model = model.clone();
-                    turn.status = Some(status.clone());
-                    turn.finish_reason = finish_reason.clone();
-                    turn.latency_ms = Some(*latency_ms);
-                    turn.finished_at = Some(event.occurred_at);
-                }
-                EventPayload::RawChunkPersisted { .. } => {
-                    turn.raw_chunk_count += 1;
-                }
-                EventPayload::ToolCallRequested {
-                    call_id, tool_name, ..
-                } => {
-                    reset_turn_tool_call(turn, call_id.clone(), tool_name.clone());
-                }
-                EventPayload::ToolApprovalRequested {
-                    call_id, tool_name, ..
-                } => {
-                    let tool = ensure_turn_tool_call(turn, call_id.clone(), tool_name.clone());
-                    tool.approval_status = Some("pending".to_owned());
-                    turn.pending_approval_count += 1;
-                }
-                EventPayload::ToolApprovalResolved {
-                    call_id,
-                    tool_name,
-                    decision,
-                    ..
-                } => {
-                    let tool = ensure_turn_tool_call(turn, call_id.clone(), tool_name.clone());
-                    tool.approval_status = Some(match decision {
-                        ApprovalDecision::Approved { .. } => "approved".to_owned(),
-                        ApprovalDecision::Denied { .. } => "denied".to_owned(),
-                    });
-                    if turn.pending_approval_count > 0 {
-                        turn.pending_approval_count -= 1;
-                    }
-                }
-                EventPayload::ToolExecutionFinished {
-                    call_id,
-                    tool_name,
-                    result,
-                } => {
-                    let tool = ensure_turn_tool_call(turn, call_id.clone(), tool_name.clone());
-                    tool.execution_status = Some(if result.is_error {
-                        "error".to_owned()
-                    } else {
-                        "completed".to_owned()
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        Ok(turns)
+        self.store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?
+            .load_turn_projections(session_id)
     }
 
     pub fn session_execution(

@@ -5,6 +5,7 @@ mod migration;
 mod reprojection;
 mod store;
 mod sync;
+mod turn_projection;
 
 pub use export::*;
 pub use migration::{MIGRATIONS, apply_migrations};

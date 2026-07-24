@@ -13,13 +13,13 @@ use crate::{
 use bt_core::{
     ApprovalDecision, ApprovalDecisionSource, ApprovalScope, BelltowerError, BranchRecord,
     BudgetConfig, CompletionRequest, ConnectionId, ContextManifest, ContextMessageSourceRef,
-    EventEnvelope, EventId, EventPayload, InstructionDocument, MAX_RELATED_SESSION_DESCENDANTS,
-    Message, PortableHash, RelatedSessionDeliveryMode, RelatedSessionMessage,
-    RelatedSessionMessageDirection, RelatedSessionMessageId, RelatedSessionMessageKind,
-    RelatedSessionMessageStatus, Role, SessionBundleArtifactMode, SessionBundleManifest,
-    SessionNodeRef, SessionRecord, SessionStatus, SessionToolMode, SpanKind, ToolCallId,
-    ToolOperationContext, ToolResultEnvelope, TurnId, TurnInstructionProvenance, TurnStartSource,
-    default_settings_revision_id,
+    ErrorClass, EventEnvelope, EventId, EventPayload, InstructionDocument,
+    MAX_RELATED_SESSION_DESCENDANTS, Message, PortableHash, RelatedSessionDeliveryMode,
+    RelatedSessionMessage, RelatedSessionMessageDirection, RelatedSessionMessageId,
+    RelatedSessionMessageKind, RelatedSessionMessageStatus, Role, SessionBundleArtifactMode,
+    SessionBundleManifest, SessionNodeRef, SessionRecord, SessionStatus, SessionToolMode, SpanKind,
+    TokenUsage, ToolCallId, ToolOperationContext, ToolResultEnvelope, TurnId, TurnInspection,
+    TurnInstructionProvenance, TurnStartSource, TurnToolCallSummary, default_settings_revision_id,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -5479,4 +5479,601 @@ fn session_history_search_can_scope_to_branch_lineage_or_all_branches() {
         .expect("all branch search");
     assert_eq!(all_branch_matches.len(), 1);
     assert_eq!(all_branch_matches[0].branch_id, child.branch_id);
+}
+
+struct TurnProjectionFixture {
+    events: Vec<EventEnvelope>,
+    first_turn: TurnId,
+    second_turn: TurnId,
+    unstarted_turn: TurnId,
+    shell_call: ToolCallId,
+    write_call: ToolCallId,
+}
+
+/// A realistic mixed sequence for the `turn_projection` read model: a failed
+/// first turn with raw chunks, tool calls, approvals, a call-id reuse, a
+/// session error, and a failed finish; a successful second turn whose
+/// provenance event resolves its turn only through the payload; a turn
+/// referenced only by envelope turn ids that never records boundary events;
+/// and one event with no resolvable turn id at all.
+fn turn_projection_fixture(
+    session: &SessionRecord,
+    branch: &BranchRecord,
+) -> TurnProjectionFixture {
+    let first_turn = TurnId::new();
+    let second_turn = TurnId::new();
+    let unstarted_turn = TurnId::new();
+    let shell_call = ToolCallId::new("turn-proj-shell");
+    let write_call = ToolCallId::new("turn-proj-write");
+
+    let envelope = |span_kind: SpanKind, payload: EventPayload| {
+        EventEnvelope::new(session.session_id, branch.branch_id, span_kind, payload)
+    };
+
+    let events = vec![
+        // First turn: admitted user message precedes turn.started, which must
+        // reset the projected event_seq_start.
+        envelope(
+            SpanKind::Agent,
+            EventPayload::MessageAppended {
+                message: Message::text(Role::User, "run the build"),
+            },
+        )
+        .with_turn_id(first_turn),
+        turn_started_event(session, branch, first_turn),
+        envelope(
+            SpanKind::Llm,
+            EventPayload::CompletionRequested {
+                llm_call_ordinal: 1,
+                provider: "openai-compatible".to_owned(),
+                model: "o4-mini".to_owned(),
+                message_count: 3,
+            },
+        )
+        .with_turn_id(first_turn),
+        envelope(
+            SpanKind::Llm,
+            EventPayload::CompletionChunk {
+                llm_call_ordinal: Some(1),
+                deltas: Vec::new(),
+                raw_chunk_index: Some(0),
+            },
+        )
+        .with_turn_id(first_turn),
+        envelope(
+            SpanKind::Llm,
+            EventPayload::RawChunkPersisted {
+                provider: "test".to_owned(),
+                chunk_index: 0,
+                stream: "response".to_owned(),
+                llm_call_ordinal: Some(1),
+            },
+        )
+        .with_turn_id(first_turn),
+        envelope(
+            SpanKind::Llm,
+            EventPayload::RawChunkPersisted {
+                provider: "test".to_owned(),
+                chunk_index: 1,
+                stream: "response".to_owned(),
+                llm_call_ordinal: Some(1),
+            },
+        )
+        .with_turn_id(first_turn),
+        envelope(
+            SpanKind::Tool,
+            EventPayload::ToolCallRequested {
+                call_id: shell_call.clone(),
+                tool_name: "shell".to_owned(),
+                arguments: serde_json::json!({"command": "pwd"}),
+            },
+        )
+        .with_turn_id(first_turn),
+        envelope(
+            SpanKind::Tool,
+            EventPayload::ToolApprovalRequested {
+                call_id: shell_call.clone(),
+                tool_name: "shell".to_owned(),
+                snapshot: None,
+            },
+        )
+        .with_turn_id(first_turn),
+        envelope(
+            SpanKind::Tool,
+            EventPayload::ToolApprovalResolved {
+                call_id: shell_call.clone(),
+                tool_name: "shell".to_owned(),
+                request_fingerprint: None,
+                resolution: None,
+                decision: ApprovalDecision::Approved {
+                    decided_at: OffsetDateTime::now_utc(),
+                    decided_by: "operator".to_owned(),
+                    scope: ApprovalScope::Once,
+                    source: ApprovalDecisionSource::Human,
+                },
+            },
+        )
+        .with_turn_id(first_turn),
+        envelope(
+            SpanKind::Tool,
+            EventPayload::ToolExecutionFinished {
+                call_id: shell_call.clone(),
+                tool_name: "shell".to_owned(),
+                result: ToolResultEnvelope {
+                    call_id: shell_call.clone(),
+                    tool_name: "shell".to_owned(),
+                    is_error: false,
+                    output: serde_json::json!({"stdout": "ok"}),
+                    duration_ms: Some(3),
+                },
+            },
+        )
+        .with_turn_id(first_turn),
+        // Provider reuses the call id for a new request: approval and
+        // execution state must reset.
+        envelope(
+            SpanKind::Tool,
+            EventPayload::ToolCallRequested {
+                call_id: shell_call.clone(),
+                tool_name: "read".to_owned(),
+                arguments: serde_json::json!({"path": "README.md"}),
+            },
+        )
+        .with_turn_id(first_turn),
+        // An approval that is never resolved keeps the turn's pending count.
+        envelope(
+            SpanKind::Tool,
+            EventPayload::ToolApprovalRequested {
+                call_id: write_call.clone(),
+                tool_name: "write".to_owned(),
+                snapshot: None,
+            },
+        )
+        .with_turn_id(first_turn),
+        envelope(
+            SpanKind::Agent,
+            EventPayload::SessionError {
+                class: ErrorClass::Provider,
+                code: "provider_unavailable".to_owned(),
+                message: "stream disconnected".to_owned(),
+                retryable: true,
+            },
+        )
+        .with_turn_id(first_turn),
+        // The failed finish carries no finish_reason and must overwrite the
+        // session.error code with None, mirroring the historical fold.
+        envelope(
+            SpanKind::Agent,
+            EventPayload::TurnFinished {
+                turn_id: first_turn,
+                provider: "test".to_owned(),
+                model: "test-model".to_owned(),
+                status: "failed".to_owned(),
+                finish_reason: None,
+                latency_ms: 1200,
+            },
+        )
+        .with_turn_id(first_turn),
+        // No resolvable turn id: must not touch the projection.
+        envelope(
+            SpanKind::Session,
+            EventPayload::MessageAppended {
+                message: Message::text(Role::User, "note outside any turn"),
+            },
+        ),
+        // Second, successful turn.
+        envelope(
+            SpanKind::Agent,
+            EventPayload::MessageAppended {
+                message: Message::text(Role::User, "try again"),
+            },
+        )
+        .with_turn_id(second_turn),
+        turn_started_event(session, branch, second_turn),
+        // Provenance resolves its turn through the payload, not the envelope.
+        envelope(
+            SpanKind::Agent,
+            EventPayload::TurnInstructionProvenanceRecorded {
+                provenance: TurnInstructionProvenance {
+                    turn_id: second_turn,
+                    provider: "test".to_owned(),
+                    model: "test-model".to_owned(),
+                    settings_revision_id: default_settings_revision_id(),
+                    core_prompt: InstructionDocument {
+                        source: "data/prompts/00-core.md".to_owned(),
+                        title: "00-core".to_owned(),
+                        body: "Core harness prompt.".to_owned(),
+                    },
+                    provider_overlay: None,
+                    instructions: Vec::new(),
+                    rendered_system_prompt: "Core harness prompt.".to_owned(),
+                },
+            },
+        ),
+        envelope(
+            SpanKind::Llm,
+            EventPayload::CompletionRequested {
+                llm_call_ordinal: 1,
+                provider: "test".to_owned(),
+                model: "test-model".to_owned(),
+                message_count: 2,
+            },
+        )
+        .with_turn_id(second_turn),
+        envelope(
+            SpanKind::Llm,
+            EventPayload::CompletionFinished {
+                llm_call_ordinal: 1,
+                provider: "test".to_owned(),
+                model: "test-model".to_owned(),
+                usage: TokenUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
+                cost: None,
+                finish_reason: "stop".to_owned(),
+                latency_ms: 40,
+            },
+        )
+        .with_turn_id(second_turn),
+        turn_finished_event(session, branch, second_turn),
+        // A turn that never records boundary events: created by envelope turn
+        // ids, provider/model filled by the completion.requested fallback,
+        // finish reason retained from session.error.
+        envelope(
+            SpanKind::Agent,
+            EventPayload::MessageAppended {
+                message: Message::text(Role::User, "one more"),
+            },
+        )
+        .with_turn_id(unstarted_turn),
+        envelope(
+            SpanKind::Llm,
+            EventPayload::CompletionRequested {
+                llm_call_ordinal: 1,
+                provider: "anthropic".to_owned(),
+                model: "claude-sonnet".to_owned(),
+                message_count: 2,
+            },
+        )
+        .with_turn_id(unstarted_turn),
+        envelope(
+            SpanKind::Llm,
+            EventPayload::SessionError {
+                class: ErrorClass::Provider,
+                code: "network_timeout".to_owned(),
+                message: "request timed out".to_owned(),
+                retryable: true,
+            },
+        )
+        .with_turn_id(unstarted_turn),
+    ];
+
+    TurnProjectionFixture {
+        events,
+        first_turn,
+        second_turn,
+        unstarted_turn,
+        shell_call,
+        write_call,
+    }
+}
+
+/// Reference implementation: a verbatim copy of the event-log fold that
+/// `BelltowerRuntime::turn_history` performed before `turn_projection`
+/// existed. The projection must reproduce this fold exactly.
+fn reference_turn_history_fold(events: &[EventEnvelope]) -> Vec<TurnInspection> {
+    fn payload_turn_id(payload: &EventPayload) -> Option<TurnId> {
+        match payload {
+            EventPayload::TurnStarted { turn_id, .. }
+            | EventPayload::TurnFinished { turn_id, .. } => Some(*turn_id),
+            EventPayload::TurnInstructionProvenanceRecorded { provenance } => {
+                Some(provenance.turn_id)
+            }
+            _ => None,
+        }
+    }
+
+    fn ensure_turn_summary<'a>(
+        turns: &'a mut Vec<TurnInspection>,
+        event: &EventEnvelope,
+        turn_id: TurnId,
+    ) -> &'a mut TurnInspection {
+        if let Some(index) = turns.iter().position(|turn| turn.turn_id == turn_id) {
+            return &mut turns[index];
+        }
+
+        turns.push(TurnInspection {
+            turn_id,
+            branch_id: event.branch_id,
+            provider: String::new(),
+            model: String::new(),
+            message_count: 0,
+            settings_revision_id: default_settings_revision_id(),
+            started_at: event.occurred_at,
+            finished_at: None,
+            status: None,
+            finish_reason: None,
+            latency_ms: None,
+            event_seq_start: event.seq_id,
+            event_seq_end: event.seq_id,
+            event_count: 0,
+            pending_approval_count: 0,
+            raw_chunk_count: 0,
+            tool_calls: Vec::new(),
+        });
+        turns
+            .last_mut()
+            .expect("turn summary exists immediately after push")
+    }
+
+    fn ensure_turn_tool_call(
+        turn: &mut TurnInspection,
+        call_id: ToolCallId,
+        tool_name: String,
+    ) -> &mut TurnToolCallSummary {
+        if let Some(index) = turn
+            .tool_calls
+            .iter()
+            .position(|tool| tool.call_id == call_id)
+        {
+            return &mut turn.tool_calls[index];
+        }
+
+        turn.tool_calls.push(TurnToolCallSummary {
+            call_id,
+            tool_name,
+            approval_status: None,
+            execution_status: None,
+        });
+        turn.tool_calls
+            .last_mut()
+            .expect("tool call exists immediately after push")
+    }
+
+    fn reset_turn_tool_call(turn: &mut TurnInspection, call_id: ToolCallId, tool_name: String) {
+        let tool = ensure_turn_tool_call(turn, call_id, tool_name.clone());
+        tool.tool_name = tool_name;
+        tool.approval_status = None;
+        tool.execution_status = None;
+    }
+
+    let mut turns: Vec<TurnInspection> = Vec::new();
+
+    for event in events {
+        let Some(turn_id) = event.turn_id.or_else(|| payload_turn_id(&event.payload)) else {
+            continue;
+        };
+
+        let turn = ensure_turn_summary(&mut turns, event, turn_id);
+        turn.event_count += 1;
+        if turn.event_seq_start.is_none() {
+            turn.event_seq_start = event.seq_id;
+        }
+        turn.event_seq_end = event.seq_id.or(turn.event_seq_end);
+
+        match &event.payload {
+            EventPayload::TurnStarted {
+                provider,
+                model,
+                message_count,
+                settings_revision_id,
+                ..
+            } => {
+                turn.provider = provider.clone();
+                turn.model = model.clone();
+                turn.message_count = *message_count;
+                turn.settings_revision_id = *settings_revision_id;
+                turn.started_at = event.occurred_at;
+                turn.event_seq_start = event.seq_id;
+            }
+            EventPayload::CompletionRequested {
+                llm_call_ordinal: _,
+                provider,
+                model,
+                message_count,
+            } => {
+                if turn.provider.is_empty() {
+                    turn.provider = provider.clone();
+                }
+                if turn.model.is_empty() {
+                    turn.model = model.clone();
+                }
+                if turn.message_count == 0 {
+                    turn.message_count = *message_count;
+                }
+            }
+            EventPayload::SessionError { code, .. } => {
+                if turn.finish_reason.is_none() {
+                    turn.finish_reason = Some(code.clone());
+                }
+            }
+            EventPayload::TurnFinished {
+                provider,
+                model,
+                status,
+                finish_reason,
+                latency_ms,
+                ..
+            } => {
+                turn.provider = provider.clone();
+                turn.model = model.clone();
+                turn.status = Some(status.clone());
+                turn.finish_reason = finish_reason.clone();
+                turn.latency_ms = Some(*latency_ms);
+                turn.finished_at = Some(event.occurred_at);
+            }
+            EventPayload::RawChunkPersisted { .. } => {
+                turn.raw_chunk_count += 1;
+            }
+            EventPayload::ToolCallRequested {
+                call_id, tool_name, ..
+            } => {
+                reset_turn_tool_call(turn, call_id.clone(), tool_name.clone());
+            }
+            EventPayload::ToolApprovalRequested {
+                call_id, tool_name, ..
+            } => {
+                let tool = ensure_turn_tool_call(turn, call_id.clone(), tool_name.clone());
+                tool.approval_status = Some("pending".to_owned());
+                turn.pending_approval_count += 1;
+            }
+            EventPayload::ToolApprovalResolved {
+                call_id,
+                tool_name,
+                decision,
+                ..
+            } => {
+                let tool = ensure_turn_tool_call(turn, call_id.clone(), tool_name.clone());
+                tool.approval_status = Some(match decision {
+                    ApprovalDecision::Approved { .. } => "approved".to_owned(),
+                    ApprovalDecision::Denied { .. } => "denied".to_owned(),
+                });
+                if turn.pending_approval_count > 0 {
+                    turn.pending_approval_count -= 1;
+                }
+            }
+            EventPayload::ToolExecutionFinished {
+                call_id,
+                tool_name,
+                result,
+            } => {
+                let tool = ensure_turn_tool_call(turn, call_id.clone(), tool_name.clone());
+                tool.execution_status = Some(if result.is_error {
+                    "error".to_owned()
+                } else {
+                    "completed".to_owned()
+                });
+            }
+            _ => {}
+        }
+    }
+
+    turns
+}
+
+#[test]
+fn turn_projection_matches_replay_fold_reference() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+
+    let fixture = turn_projection_fixture(&session, &branch);
+    store.append_events(&fixture.events).expect("append events");
+
+    let stored_events = store
+        .load_all_events(session.session_id)
+        .expect("load events");
+    let expected = reference_turn_history_fold(&stored_events);
+    let actual = store
+        .load_turn_projections(session.session_id)
+        .expect("load projections");
+    assert_eq!(actual, expected);
+
+    // Pin the key semantics independently of the reference copy.
+    assert_eq!(actual.len(), 3);
+
+    let failed = &actual[0];
+    assert_eq!(failed.turn_id, fixture.first_turn);
+    assert_eq!(failed.branch_id, branch.branch_id);
+    assert_eq!(failed.provider, "test");
+    assert_eq!(failed.model, "test-model");
+    assert_eq!(failed.message_count, 1);
+    assert_eq!(failed.status.as_deref(), Some("failed"));
+    assert_eq!(
+        failed.finish_reason, None,
+        "turn.finished must overwrite the session.error code, mirroring the replay fold"
+    );
+    assert_eq!(failed.latency_ms, Some(1200));
+    assert!(failed.finished_at.is_some());
+    assert_eq!(failed.raw_chunk_count, 2);
+    assert_eq!(failed.pending_approval_count, 1);
+    assert_eq!(failed.event_count, 14);
+    let turn_started_seq = stored_events
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.payload,
+                EventPayload::TurnStarted { turn_id, .. } if *turn_id == fixture.first_turn
+            )
+        })
+        .and_then(|event| event.seq_id);
+    assert!(turn_started_seq.is_some());
+    assert_eq!(
+        failed.event_seq_start, turn_started_seq,
+        "turn.started resets event_seq_start past the admitted user message"
+    );
+    assert_eq!(failed.tool_calls.len(), 2);
+    assert_eq!(failed.tool_calls[0].call_id, fixture.shell_call);
+    assert_eq!(failed.tool_calls[0].tool_name, "read");
+    assert_eq!(failed.tool_calls[0].approval_status, None);
+    assert_eq!(failed.tool_calls[0].execution_status, None);
+    assert_eq!(failed.tool_calls[1].call_id, fixture.write_call);
+    assert_eq!(
+        failed.tool_calls[1].approval_status.as_deref(),
+        Some("pending")
+    );
+    assert_eq!(failed.tool_calls[1].execution_status, None);
+
+    let completed = &actual[1];
+    assert_eq!(completed.turn_id, fixture.second_turn);
+    assert_eq!(completed.status.as_deref(), Some("completed"));
+    assert_eq!(completed.finish_reason.as_deref(), Some("stop"));
+    assert_eq!(completed.pending_approval_count, 0);
+    assert!(completed.tool_calls.is_empty());
+
+    let unstarted = &actual[2];
+    assert_eq!(unstarted.turn_id, fixture.unstarted_turn);
+    assert_eq!(unstarted.provider, "anthropic");
+    assert_eq!(unstarted.model, "claude-sonnet");
+    assert_eq!(unstarted.message_count, 2);
+    assert_eq!(unstarted.status, None);
+    assert_eq!(unstarted.finish_reason.as_deref(), Some("network_timeout"));
+    assert_eq!(unstarted.latency_ms, None);
+    assert!(unstarted.finished_at.is_none());
+}
+
+#[test]
+fn reopening_without_rebuild_marker_recovers_turn_projection() {
+    let file = NamedTempFile::new().expect("tempfile");
+    let (session, branch) = sample_session();
+    let fixture = turn_projection_fixture(&session, &branch);
+
+    let baseline = {
+        let mut store = SqliteSessionStore::open(file.path()).expect("store");
+        store
+            .create_session(&session, &branch)
+            .expect("create session");
+        store.append_events(&fixture.events).expect("append events");
+        let baseline = store
+            .load_turn_projections(session.session_id)
+            .expect("baseline projection");
+        assert_eq!(baseline.len(), 3);
+        baseline
+    };
+
+    {
+        let connection = rusqlite::Connection::open(file.path()).expect("raw connection");
+        connection
+            .execute("DELETE FROM turn_projection", [])
+            .expect("clear projection");
+        connection
+            .execute(
+                "DELETE FROM migration_metadata WHERE key = 'turn_projection_v1_rebuilt'",
+                [],
+            )
+            .expect("clear marker");
+    }
+
+    let store = SqliteSessionStore::open(file.path()).expect("reopen store");
+    let rebuilt = store
+        .load_turn_projections(session.session_id)
+        .expect("rebuilt projection");
+    assert_eq!(rebuilt, baseline);
 }

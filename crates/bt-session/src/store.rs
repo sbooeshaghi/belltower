@@ -5,7 +5,8 @@ use bt_core::{
     Message, RelatedSessionDeliveryMode, RelatedSessionMessage, RelatedSessionMessageDirection,
     RelatedSessionMessageId, RelatedSessionMessageReceipt, RelatedSessionMessageRecord,
     RelatedSessionMessageStatus, Result, Role, SessionId, SessionRecord, SessionSettingsSnapshot,
-    SessionToolMode, SpanKind, ToolCallId, ToolOperationContext, TurnId, TurnStartSource,
+    SessionToolMode, SpanKind, ToolCallId, ToolOperationContext, TurnId, TurnInspection,
+    TurnStartSource,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::HashMap;
@@ -2271,6 +2272,18 @@ impl SqliteSessionStore {
             .map_err(storage_error)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(storage_error)
+    }
+
+    /// Per-turn inspection summaries from the incrementally maintained
+    /// `turn_projection` read model, ordered by each turn's first event
+    /// sequence. This is the projection behind turn history; it never
+    /// replays the event log.
+    pub fn load_turn_projections(&self, session_id: SessionId) -> Result<Vec<TurnInspection>> {
+        crate::turn_projection::load_turn_projections_ordered(
+            &self.connection,
+            &session_id.to_string(),
+        )
+        .map_err(storage_error)
     }
 
     pub fn load_branch_messages_page(

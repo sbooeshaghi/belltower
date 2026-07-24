@@ -7,6 +7,10 @@ use super::{
     SqliteSessionStore, approval_status, format_time, queued_message_resolution_status,
     steer_resolution_status, storage_error,
 };
+use crate::turn_projection::{
+    apply_turn_projection_event, load_turn_projection, new_turn_projection, projected_turn_id,
+    upsert_turn_projection,
+};
 use bt_core::{
     BelltowerError, BudgetConfig, CostBreakdown, EventEnvelope, EventPayload,
     RelatedSessionDeliveryMode, RelatedSessionMessageDirection, RelatedSessionMessageStatus,
@@ -158,6 +162,28 @@ impl SqliteSessionStore {
         Ok(())
     }
 
+    /// Folds one appended event into its `turn_projection` row inside the
+    /// same write transaction. Read-modify-write through the shared fold in
+    /// `crate::turn_projection` keeps the incremental path byte-identical to
+    /// the migration-time rebuild. Events without a resolvable turn id leave
+    /// the projection untouched.
+    fn refresh_turn_projection(
+        tx: &Transaction<'_>,
+        event: &EventEnvelope,
+        seq_id: i64,
+    ) -> Result<()> {
+        let Some(turn_id) = projected_turn_id(event) else {
+            return Ok(());
+        };
+        let session_key = event.session_id.to_string();
+        let mut turn = load_turn_projection(tx, &session_key, &turn_id.to_string())
+            .map_err(storage_error)?
+            .unwrap_or_else(|| new_turn_projection(event, turn_id, seq_id));
+        apply_turn_projection_event(&mut turn, event, seq_id);
+        upsert_turn_projection(tx, &session_key, &turn).map_err(storage_error)?;
+        Ok(())
+    }
+
     pub(super) fn refresh_projections(
         tx: &Transaction<'_>,
         event: &EventEnvelope,
@@ -190,6 +216,8 @@ impl SqliteSessionStore {
             ],
         )
         .map_err(storage_error)?;
+
+        Self::refresh_turn_projection(tx, event, seq_id)?;
 
         match &event.payload {
             EventPayload::MessageAppended { message } => {

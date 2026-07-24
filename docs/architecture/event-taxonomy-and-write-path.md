@@ -329,6 +329,12 @@ The intended model is:
 - load transcript windows from projection-backed message views
 - use SSE with `Last-Event-ID` to catch up from the true session tail
 - use raw event replay for reconnect/catch-up and offline analysis, not as the primary UI bootstrap path
+- `turn_projection` is a rebuildable read model over turn boundaries: every
+  event that resolves to a turn (envelope turn id or turn-bearing payload)
+  folds into one durable per-turn summary row inside the append transaction,
+  with a marker-gated migration rebuild as the only full replay. Inspection
+  surfaces (turn history, lineage, workflow views) must read this projection
+  and must not replay session logs
 
 This distinction becomes mandatory for long sessions with thousands of messages, tool calls, and raw chunks.
 

@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 const ACTIVE_TURN_REBUILD_MARKER: &str = "active_turn_projection_v1_rebuilt";
+const TURN_PROJECTION_REBUILD_MARKER: &str = "turn_projection_v1_rebuilt";
 
 const TOOL_AND_APPROVAL_PROJECTION_TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS approval_projection (
@@ -183,6 +184,30 @@ CREATE TABLE IF NOT EXISTS active_turn_projection (
     started_seq_id  INTEGER NOT NULL,
     started_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS turn_projection (
+    session_id             TEXT NOT NULL,
+    branch_id              TEXT NOT NULL,
+    turn_id                TEXT NOT NULL,
+    provider               TEXT NOT NULL DEFAULT '',
+    model                  TEXT NOT NULL DEFAULT '',
+    message_count          INTEGER NOT NULL DEFAULT 0,
+    settings_revision_id   INTEGER NOT NULL DEFAULT 1,
+    started_at             TEXT NOT NULL,
+    finished_at            TEXT,
+    status                 TEXT,
+    finish_reason          TEXT,
+    latency_ms             INTEGER,
+    event_seq_start        INTEGER,
+    event_seq_end          INTEGER,
+    event_count            INTEGER NOT NULL DEFAULT 0,
+    pending_approval_count INTEGER NOT NULL DEFAULT 0,
+    raw_chunk_count        INTEGER NOT NULL DEFAULT 0,
+    tool_calls_json        TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (session_id, turn_id)
+);
+CREATE INDEX IF NOT EXISTS idx_turn_projection_session_seq_start
+    ON turn_projection(session_id, event_seq_start);
 
 CREATE TABLE IF NOT EXISTS migration_metadata (
     key        TEXT PRIMARY KEY,
@@ -434,6 +459,9 @@ pub fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
     if !migration_marker_exists(connection, ACTIVE_TURN_REBUILD_MARKER)? {
         rebuild_active_turn_projection(connection)?;
     }
+    if !migration_marker_exists(connection, TURN_PROJECTION_REBUILD_MARKER)? {
+        rebuild_turn_projection(connection)?;
+    }
     Ok(())
 }
 
@@ -510,6 +538,56 @@ fn rebuild_active_turn_projection(connection: &Connection) -> rusqlite::Result<(
         connection.execute(
             "INSERT OR REPLACE INTO migration_metadata (key, value) VALUES (?1, 'complete')",
             params![ACTIVE_TURN_REBUILD_MARKER],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => connection.execute_batch("COMMIT"),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+/// One-time backfill of `turn_projection` for databases created before the
+/// projection existed. Replays the full event log once with the same fold the
+/// incremental refresh uses (`crate::turn_projection`), then records the
+/// marker so later opens never replay again.
+fn rebuild_turn_projection(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        let events = {
+            let mut statement =
+                connection.prepare("SELECT seq_id, event_json FROM events ORDER BY seq_id ASC")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut turns: HashMap<(String, String), bt_core::TurnInspection> = HashMap::new();
+        for (seq_id, event_json) in events {
+            let event: EventEnvelope = serde_json::from_str(&event_json)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            let Some(turn_id) = crate::turn_projection::projected_turn_id(&event) else {
+                continue;
+            };
+            let turn = turns
+                .entry((event.session_id.to_string(), turn_id.to_string()))
+                .or_insert_with(|| {
+                    crate::turn_projection::new_turn_projection(&event, turn_id, seq_id)
+                });
+            crate::turn_projection::apply_turn_projection_event(turn, &event, seq_id);
+        }
+
+        connection.execute("DELETE FROM turn_projection", [])?;
+        for ((session_id, _), turn) in &turns {
+            crate::turn_projection::upsert_turn_projection(connection, session_id, turn)?;
+        }
+        connection.execute(
+            "INSERT OR REPLACE INTO migration_metadata (key, value) VALUES (?1, 'complete')",
+            params![TURN_PROJECTION_REBUILD_MARKER],
         )?;
         Ok(())
     })();
