@@ -103,10 +103,30 @@ Future shape:
 - an explicit compatibility matrix that blocks fake subscription/API-key equivalence
 - operator login/setup flows that choose an auth method honestly instead of assuming every remote connection is API-key based
 
+Subscription-backed Claude (`claude-code` connection, provider `claude-cli`):
+
+- runs completions by subprocessing the operator's locally installed and
+  logged-in Claude Code CLI (`claude -p --output-format stream-json`);
+  belltower never sees or stores credentials, and ambient
+  `ANTHROPIC_API_KEY`-style env vars are stripped from the child process so
+  usage always bills the subscription
+- the CLI's `stream_event` payloads are Anthropic Messages events, so
+  translation reuses the anthropic provider's stream state machine; every
+  NDJSON envelope is persisted as a raw chunk
+- v1 is completion-only: declared harness tool specs are not bridged into the
+  CLI (a warning is recorded and the model has no callable tools on this
+  connection), the CLI's own tools are disallowed and the loop is capped at
+  one turn, and structured output is unsupported — use the `anthropic` API
+  connection for tool-calling sessions until an MCP bridge lands
+- readiness reports Degraded when the `claude` binary (override:
+  `BELLTOWER_CLAUDE_BIN`) is missing or unresponsive; auth problems surface
+  on the first completion as a durable session error rather than a quota-
+  spending readiness probe
+
 Important rule:
 
 - incompatible tokens must not be presented as valid provider auth
-- a subscription-backed runtime path is only supportable through its own provider/runtime implementation
+- a subscription-backed runtime path is only supportable through its own provider/runtime implementation (the `claude-cli` provider is exactly this)
 - provider-specific capabilities like structured output must be surfaced truthfully and should not become first-class operator flows before the underlying auth/model/readiness UX is strong
 - request-side capability policy should remain centralized and quiet until the
   operator experience is proven. Thinking/reasoning defaults are a provider

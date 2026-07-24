@@ -2,6 +2,7 @@
 
 mod anthropic;
 mod chatgpt;
+mod claude_cli;
 mod openai;
 mod sse;
 
@@ -32,6 +33,7 @@ pub(crate) fn shared_http_client() -> reqwest::Client {
 
 pub use anthropic::AnthropicProvider;
 pub use chatgpt::{OpenAiChatGptProvider, chatgpt_account_id};
+pub use claude_cli::ClaudeCliProvider;
 pub use openai::OpenAiCompatibleProvider;
 pub use sse::{SseEvent, SseParser};
 
@@ -39,7 +41,7 @@ pub use sse::{SseEvent, SseParser};
 pub fn connection_supported(connection: &ConnectionDescriptor) -> bool {
     matches!(
         connection.provider.as_str(),
-        "openai-compatible" | "openai-chatgpt" | "anthropic"
+        "openai-compatible" | "openai-chatgpt" | "anthropic" | "claude-cli"
     )
 }
 
@@ -67,6 +69,9 @@ pub fn provider_for_connection(
             connection.base_url.clone(),
             anthropic_api_key(credential)?,
         )?)),
+        // Subscription-backed: auth lives entirely inside the Claude Code
+        // CLI's own login; any resolved credential is deliberately unused.
+        "claude-cli" => Ok(Arc::new(ClaudeCliProvider::new(connection.id.to_string()))),
         other => Err(BelltowerError::Unsupported(format!(
             "provider `{other}` is not implemented yet"
         ))),

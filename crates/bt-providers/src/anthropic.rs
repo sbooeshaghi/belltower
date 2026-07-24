@@ -394,7 +394,7 @@ struct AnthropicToolUseAccumulator {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-struct AnthropicStreamState {
+pub(crate) struct AnthropicStreamState {
     tool_uses: BTreeMap<usize, AnthropicToolUseAccumulator>,
     prompt_tokens: u64,
     completion_tokens: u64,
@@ -491,7 +491,7 @@ impl AnthropicStreamState {
         }
     }
 
-    fn usage_snapshot(&self) -> Option<TokenUsage> {
+    pub(crate) fn usage_snapshot(&self) -> Option<TokenUsage> {
         let total_tokens = self.prompt_tokens + self.completion_tokens;
         if total_tokens == 0
             && self.cache_read_tokens.is_none()
@@ -512,7 +512,7 @@ impl AnthropicStreamState {
     }
 }
 
-fn completion_chunks_from_sse_event(
+pub(crate) fn completion_chunks_from_sse_event(
     event: &SseEvent,
     state: &mut AnthropicStreamState,
 ) -> Result<Vec<CompletionChunk>> {

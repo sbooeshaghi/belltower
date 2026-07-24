@@ -47,6 +47,21 @@ source_hint = "env:ANTHROPIC_API_KEY"
 supports_refresh = false
 
 [[connections]]
+id = "claude-code"
+provider = "claude-cli"
+# The CLI owns endpoints and auth; base_url is structural only.
+base_url = "https://api.anthropic.com"
+default_model = "claude-haiku-4-5-20251001"
+auth_sources = []
+model_fallbacks = ["claude-sonnet-5", "claude-opus-4-8", "claude-fable-5"]
+[[connections.auth_methods]]
+id = "claude_code_cli_login"
+kind = "external_broker"
+label = "Claude Code CLI login (subscription)"
+source_hint = "claude login"
+supports_refresh = true
+
+[[connections]]
 id = "vertex"
 provider = "google-vertex"
 base_url = "https://aiplatform.googleapis.com"
