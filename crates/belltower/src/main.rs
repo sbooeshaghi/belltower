@@ -889,6 +889,17 @@ async fn run_headless_turn(args: &RunArgs, prompt: &str, launch: &PreparedLaunch
         .await
         .map_err(client_error)?;
     let assistant_text = render_headless_assistant_output(&messages.messages);
+    let turns = client
+        .session_turns(create_response.session.session_id)
+        .await
+        .map_err(client_error)?;
+    let last_turn_status = turns.turns.last().and_then(|turn| turn.status.clone());
+    let turn_failed = last_turn_status.as_deref() == Some("failed");
+    let session_errors = if turn_failed {
+        collect_session_error_lines(&client, create_response.session.session_id).await
+    } else {
+        Vec::new()
+    };
 
     if args.json {
         let payload = serde_json::json!({
@@ -898,6 +909,8 @@ async fn run_headless_turn(args: &RunArgs, prompt: &str, launch: &PreparedLaunch
             "model_id": create_response.session.model_id,
             "outcome": headless_outcome_label(&send_response.outcome),
             "queued_position": headless_queued_position(&send_response.outcome),
+            "turn_status": last_turn_status,
+            "errors": session_errors,
             "assistant_text": assistant_text,
             "message_count": messages.messages.len(),
         });
@@ -918,14 +931,65 @@ async fn run_headless_turn(args: &RunArgs, prompt: &str, launch: &PreparedLaunch
         if let SendMessageOutcome::Queued { position } = send_response.outcome {
             eprintln!("Queued at position {position}.");
         }
-        if assistant_text.trim().is_empty() {
-            eprintln!("No assistant text returned. Inspect the session for pending control state.");
-        } else {
-            println!("{}", assistant_text.trim_end());
+        match last_turn_status.as_deref() {
+            Some("awaiting_approval") => {
+                eprintln!(
+                    "Turn ended awaiting a tool approval. Approve it in the TUI or via POST /sessions/{{session_id}}/approve, or rerun with an auto-approving tool mode."
+                );
+            }
+            Some("awaiting_input") => {
+                eprintln!("Turn ended awaiting operator input (ask tool).");
+            }
+            _ => {}
+        }
+        if !turn_failed {
+            if assistant_text.trim().is_empty() {
+                eprintln!(
+                    "No assistant text returned. Inspect the session for pending control state."
+                );
+            } else {
+                println!("{}", assistant_text.trim_end());
+            }
         }
     }
 
+    if turn_failed {
+        for line in &session_errors {
+            eprintln!("session error: {line}");
+        }
+        return Err(BelltowerError::Provider(format!(
+            "turn failed with {} recorded session error(s); session {}",
+            session_errors.len(),
+            create_response.session.session_id
+        )));
+    }
+
     Ok(())
+}
+
+async fn collect_session_error_lines(
+    client: &BelltowerClient,
+    session_id: bt_core::SessionId,
+) -> Vec<String> {
+    let Ok(events) = client.session_events(session_id, None).await else {
+        return Vec::new();
+    };
+    events
+        .events
+        .iter()
+        .filter_map(|envelope| match &envelope.payload {
+            bt_core::EventPayload::SessionError {
+                class,
+                code,
+                message,
+                retryable,
+            } => Some(format!(
+                "[{class}/{code}{}] {message}",
+                if *retryable { ", retryable" } else { "" }
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 fn read_headless_prompt(args: &RunArgs) -> Result<String> {

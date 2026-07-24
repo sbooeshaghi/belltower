@@ -939,6 +939,8 @@ impl ChatApp {
                 let _ = self.emit_final_work_separator_if_needed();
                 self.clear_live_turn_boundary();
                 self.clear_live_turn_items();
+                self.clear_task_status();
+                self.request_queue_refresh();
                 self.rebuild_render_cache();
                 self.status = format!("Error: {code}");
                 self.show_error(format!("{class} error: {message}"));
@@ -949,6 +951,7 @@ impl ChatApp {
                 let _ = self.emit_final_work_separator_if_needed();
                 self.clear_live_turn_boundary();
                 self.clear_live_turn_items();
+                self.clear_task_status();
                 self.rebuild_render_cache();
                 if status == "failed" {
                     self.status = "Turn failed".to_owned();

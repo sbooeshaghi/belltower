@@ -428,6 +428,39 @@ fn sample_operator_surface_matrix() -> (
 }
 
 #[test]
+fn session_error_event_prints_into_history_and_clears_task_spinner() {
+    let mut app = test_app();
+    app.set_task_status("Working", None);
+    app.apply_stream_event(event(
+        1,
+        EventPayload::SessionError {
+            class: bt_core::ErrorClass::Provider,
+            code: "provider_error".to_owned(),
+            message: "HTTP 400: unsupported reasoning_effort".to_owned(),
+            retryable: false,
+        },
+    ));
+
+    assert!(
+        app.task_status.is_none(),
+        "task spinner must clear when the session errors"
+    );
+
+    let mut committed = String::new();
+    for _ in 0..4 {
+        app.run_stream_commit_tick();
+        if let Some(lines) = app.take_new_history_lines() {
+            committed.push_str(&lines_to_text(&lines));
+            committed.push('\n');
+        }
+    }
+    assert!(
+        committed.contains("unsupported reasoning_effort"),
+        "session error text must land in visible history, got: {committed:?}"
+    );
+}
+
+#[test]
 fn streamed_assistant_text_commits_completed_lines_and_keeps_partial_tail_live() {
     let mut app = test_app();
     app.apply_stream_event(event(

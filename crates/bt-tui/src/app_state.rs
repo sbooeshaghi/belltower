@@ -603,8 +603,29 @@ impl ChatApp {
     pub(super) fn show_error(&mut self, message: impl Into<String>) {
         let message = message.into();
         let seq_id = self.local_error_anchor_seq();
+        let commands_before = self.operator_commands.len();
         self.push_local_operator_command("local_error", "", message, false, seq_id);
+        // A local error is not a server-sequenced command, so the scrollback
+        // sync driven by loaded pages will never print it; queue it directly
+        // or the operator sees nothing at all.
+        if self.operator_commands.len() > commands_before
+            && let Some(command) = self.operator_commands.last().cloned()
+        {
+            self.queue_local_error_now(&command);
+        }
         self.show_notice("Error recorded in chat.");
+    }
+
+    fn queue_local_error_now(&mut self, command: &RecordedOperatorCommand) {
+        let key = operator_command_print_key(command);
+        if !self.printed_operator_command_keys.insert(key) {
+            return;
+        }
+        let _ = self.queue_plain_history_text(
+            render_operator_command(command, self.transcript_output_width.max(1)),
+            TranscriptEntryKind::LocalError,
+            None,
+        );
     }
 
     pub(super) fn has_pending_request(&self) -> bool {

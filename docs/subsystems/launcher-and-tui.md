@@ -59,6 +59,10 @@ The current operator contract is:
   surfaces instead of blocking first launch
 - if the implicit default remote connection is unavailable but `local` is ready, the launcher may fall back to `local`; explicit `--connection` selections still fail closed and report the structured readiness reason
 - `belltower run --prompt ...` is the canonical headless launcher path for scripts and benchmarks; it shares startup/readiness/server bootstrapping with `belltower chat`, then uses `bt-client` to create a normal session and send a normal user message
+- headless runs are honest about turn outcomes: a failed turn prints every
+  recorded `session.error` to stderr and exits nonzero; turns that end
+  `awaiting_approval`/`awaiting_input` say so instead of printing nothing.
+  `--json` output carries `turn_status` and `errors` fields for scripting
 
 ## TUI Expectations
 
@@ -182,6 +186,9 @@ This behavior should explicitly match Codex-style interaction.
 - Streamed tool activity should appear in the live turn region as soon as the model emits tool-call deltas, not only after the committed tool-call message lands.
 - Tool summaries include persistent `call_id` values for later drill-down.
 - Tool errors render clearly and durably in transcript order.
+- `session.error` events are loud: the error text is queued into the visible
+  transcript immediately (not only into the render cache) and the active task
+  spinner clears, so a failed turn can never present as a silent hang.
 - `/inspect tool <call-id>` drills into a specific tool call in detail without rerendering prior transcript output.
 - Humans and agents should share the same inspection concept and data model.
 
