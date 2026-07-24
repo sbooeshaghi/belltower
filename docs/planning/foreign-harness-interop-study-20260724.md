@@ -1,6 +1,7 @@
-# Foreign-Harness Session Interop Study (xtend / xtensions)
+# Foreign-Harness Session Interop Study (xtend / xtensions / trajectory)
 
-Date: 2026-07-24. Status: study only — no implementation. Sources: the
+Date: 2026-07-24 (trajectory addendum same day). Status: study only — no
+implementation. Sources: the
 `sbooeshaghi/xtend` and `sbooeshaghi/xtensions` repos (read at HEAD),
 Belltower's `session.bt` architecture
 ([session-bundles-and-trace-sync](../architecture/session-bundles-and-trace-sync.md))
@@ -234,3 +235,122 @@ parity with the mesh work:
 4. Tree bundles for session.bt (mesh-complete same-harness sharing).
 5. xtend upstream PR: `belltower` tool support, so `xtend extend <name>
    --tool belltower` resolves naturally.
+
+With the trajectory addendum below, two items join this list:
+
+0. **Formalize the Belltower schemas** (moves ahead of everything — it
+   unblocks external consumers, upstream adapters, and validator reuse; see
+   §8d).
+6. **Trajectory-v1 export projection** (+ optional upstream
+   `source: "belltower"` adapter PR; see §8b).
+
+## 8. Addendum: letta-ai/trajectory (released 2026-07-23)
+
+Reviewed at HEAD: the npm/PyPI `@letta-ai/trajectory` package, its two
+JSON Schemas, eight shipped harness adapters (claude-code, codex,
+letta-code, openclaw, openhands, pi, hermes, deepagents), the
+`CANONICAL.md` cloud-ingestion contract, and the `prompts/add-source.md`
+agent prompt for writing new adapters.
+
+### 8a. What it is — two layers, one lesson each
+
+**trajectory-v1** is a deliberately tiny, token-efficient record format for
+*agents reading past sessions*: five roles (`meta`, `user`, `reasoning`,
+`assistant`, `tool`), tool results linked by `tool_call_id`, long outputs
+optionally truncated, harness bookkeeping dropped. ~5x token reduction vs
+native transcripts. The schema is strict: `additionalProperties: false`
+everywhere, a conditional rule that `content` is null iff `tool_calls`
+present, `$id`-versioned. Explicitly positioned *against* full-fidelity
+formats (Harbor ATIF) — experience data for memory formation, not replay.
+
+**canonical-v1** is their cloud ingestion contract layered on top, and it
+convergently reinvents most of `session.bt`'s identity discipline: stable
+source-record ids that are never transport-order-derived, a
+`record_hash` (transport bytes) vs `content_hash` (semantic bytes,
+timestamps excluded) split, lexicographic order keys instead of positional
+identity, append-only source "generations" where truncation means a new
+generation, dual provenance stamps on every derived row
+(`normalizer_version` + `schema_version`), and **quarantine-over-fallback**
+failure modes (`source_group_conflict` fails the upload rather than
+minting bad identity). Belltower's bundle design made the same calls
+independently — good evidence both are right.
+
+Ecosystem signal: eight harnesses already covered (including hermes),
+adapters are written *by coding agents* from a maintained prompt, and
+letta-code's memory "dreaming" consumes them across harnesses. This format
+is becoming the lingua franca for agent experience data.
+
+### 8b. Relevance to Belltower — what to adopt
+
+1. **Emit trajectory-v1 as an export projection.** Canonical events →
+   trajectory records is a small deterministic fold (meta from the session
+   record; `message.appended`/completion evidence → user/assistant/
+   reasoning; tool lifecycle → assistant tool_calls + tool records keyed by
+   the existing call ids). It joins Belltower sessions to every trajectory
+   consumer — letta's dreaming, cross-harness indexing, memory agents —
+   at projection cost, like the ShareGPT/HTML exports. Related-session
+   trees flatten to one trajectory per session (the format has no tree
+   concept; the spawn tool calls and settlement results already appear as
+   ordinary records, which is honest).
+2. **Upstream `source: "belltower"` adapter, second.** Their normalizer
+   contract takes one transcript string with no filesystem/SQLite access,
+   so the upstream adapter needs a stable *file* to parse — either the
+   trajectory files Belltower emits (trivial adapter) or the
+   `events.jsonl` inside a `session.bt` bundle (full adapter, requires the
+   published event schema below). Their `add-source.md` prompt makes this
+   a one-session contribution.
+3. **The memory direction (later, but real).** The blog's `/init` pattern —
+   bootstrap an agent's memory from every harness's local sessions — is
+   directly relevant to Belltower-as-lab-notebook: a Belltower memory/
+   consolidation agent could read trajectory-normalized experience from
+   Claude Code, Codex, and Belltower itself. Nothing to build now; the
+   export projection (item 1) is the prerequisite.
+
+### 8c. What not to do
+
+- **Do not import trajectory files as resumable sessions.** They are too
+  lossy for §4a's coherence rules (no turn boundaries, truncated results,
+  dropped sidechains — their claude-code adapter *drops* subagent records
+  that our importer must map to related sessions). Import stays on native
+  transcripts; trajectory is an output/learning format.
+- **Do not let a trajectory-shaped record model leak into the canonical
+  taxonomy.** Five roles is the right size for experience data precisely
+  because it discards what Belltower's log exists to preserve (approvals,
+  policy decisions, mesh messaging, provenance).
+
+### 8d. Schema formalization (endorsed, with a concrete shape)
+
+The suspicion prompting this review is correct, and trajectory shows the
+payoff pattern. Belltower's canonical shapes exist only as Rust/serde
+definitions; nothing outside the workspace can validate a bundle or build
+an adapter without reading Rust. Proposal:
+
+- Publish versioned JSON Schemas as repo artifacts:
+  `schema/belltower-event-v1.schema.json` (the `EventEnvelope` and every
+  payload kind, strict per-kind: `additionalProperties: false`, required
+  fields, enum casing as serialized — note the lowercase snake_case enums
+  that already bit our own test scripts) and
+  `schema/belltower-bundle-manifest-v1.schema.json` (manifest, node refs,
+  content refs, event ranges, checksums).
+- **Generate from the Rust types** (schemars) so code remains the source of
+  truth, with a CI drift gate: regenerating must produce the committed
+  schema byte-for-byte. Hand-maintained schemas fork; generated ones
+  cannot.
+- Stamp derived outputs the canonical-v1 way: every projection/export
+  records the producing version and the schema version it targets
+  (bundle manifests already carry producer info; extend the discipline to
+  trajectory/ShareGPT/OTLP projections).
+- Adopt their semantic-vs-transport hash distinction explicitly in the
+  bundle docs: `event_hash` is already computed over canonical bytes that
+  exclude local fields; documenting which fields are *semantic* (survive
+  re-serialization) versus *transport* makes cross-implementation
+  validation tractable.
+- Version bump policy: schema version changes only on contract changes,
+  never on packaging — their `CANONICAL_SCHEMA_VERSION` vs
+  `NORMALIZER_VERSION` split, which maps cleanly onto
+  `SESSION_BT_SCHEMA_VERSION` vs crate versions.
+
+This is also the enabling move for §4/§7: xtend's `belltower` tool
+support, trajectory's `belltower` source, and any third-party xtension
+viewer all consume the published schemas instead of reverse-engineering
+the store.
