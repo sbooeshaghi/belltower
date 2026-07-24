@@ -28,11 +28,6 @@ impl ChatApp {
             messages: Vec::new(),
             message_seq_ids: Vec::new(),
             operator_commands: Vec::new(),
-            rendered_message_lines: vec![Line::from("No messages yet.")],
-            wrapped_message_lines: vec![Line::from("No messages yet.")],
-            visual_line_count_cache: 1,
-            max_line_width_cache: 1,
-            clear_separator_skip_line: None,
             sessions: Vec::new(),
             branches: Vec::new(),
             connections: Vec::new(),
@@ -396,7 +391,6 @@ impl ChatApp {
                 success,
             });
         }
-        self.rebuild_render_cache();
         if self.should_follow_messages() {
             self.scroll_to_bottom();
         }
@@ -654,7 +648,6 @@ impl ChatApp {
         while let Some(pending) = self.pending_message_submissions.pop_front() {
             pending.handle.abort();
         }
-        self.sync_transcript_view();
     }
 
     pub(super) fn runtime_busy_for_controls(&self) -> bool {
@@ -774,11 +767,9 @@ impl ChatApp {
             return;
         };
         self.clear_optimistic_user_state();
-        self.sync_transcript_view();
     }
 
     pub(super) fn on_messages_changed(&mut self) {
-        self.rebuild_render_cache();
         if self.should_follow_messages() {
             self.scroll_to_bottom();
         }
@@ -828,40 +819,11 @@ impl ChatApp {
         if self.message_view_width != next_width || self.message_view_height != next_height {
             self.message_view_width = next_width;
             self.message_view_height = next_height;
-            self.rebuild_render_cache();
         }
-    }
-
-    pub(super) fn base_rendered_lines(&self) -> Vec<Line<'static>> {
-        rendered_message_lines_with_options(
-            &self.messages,
-            &self.message_seq_ids,
-            &self.operator_commands,
-            self.clear_separator_skip_line,
-            self.show_reasoning,
-            self.transcript_density(),
-            self.message_view_width,
-        )
-    }
-
-    pub(super) fn sync_transcript_view(&mut self) {
-        self.rebuild_render_cache();
     }
 
     pub(super) fn should_follow_messages(&self) -> bool {
         self.resume_follow_lock || self.auto_follow_messages
-    }
-
-    pub(super) fn rebuild_render_cache(&mut self) {
-        self.rendered_message_lines = self.base_rendered_lines();
-        self.refresh_render_metrics();
-    }
-
-    pub(super) fn refresh_render_metrics(&mut self) {
-        self.wrapped_message_lines =
-            wrap_rendered_lines(&self.rendered_message_lines, self.message_view_width);
-        self.visual_line_count_cache = self.wrapped_message_lines.len().max(1);
-        self.max_line_width_cache = rendered_max_line_width(&self.rendered_message_lines);
     }
 
     pub(super) fn request_scrollback_reset(&mut self, hard_clear: bool) {

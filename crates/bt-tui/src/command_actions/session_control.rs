@@ -402,7 +402,6 @@ impl ChatApp {
                 approval_scope_label(scope)
             )
         };
-        self.rebuild_render_cache();
         self.maybe_record_command_feedback(raw_input, self.status.clone(), true)
             .await
     }
@@ -530,7 +529,6 @@ impl ChatApp {
         self.refresh_metadata().await?;
         self.refresh().await?;
         self.ensure_event_stream().await?;
-        self.sync_transcript_view();
         self.request_scrollback_reset(true);
         if let Some(raw_input) = raw_input {
             self.record_operator_command(
@@ -603,8 +601,6 @@ impl ChatApp {
         self.auto_follow_messages = true;
         self.pending_resume_command_raw_input = raw_input;
         self.status = format!("Loading {}", session_title(Some(&session)));
-        self.rendered_message_lines = vec![Line::from("Loading session...")];
-        self.refresh_render_metrics();
         self.scroll_to_bottom();
         let client = self.client.clone();
         self.pending_session_load = Some(tokio::spawn(async move {
@@ -664,7 +660,6 @@ impl ChatApp {
     }
 
     pub(crate) fn reset_transcript_view_state(&mut self) {
-        self.clear_separator_skip_line = None;
         self.auto_follow_messages = true;
         self.active_turn.live = false;
         self.clear_live_turn_boundary();
@@ -718,9 +713,6 @@ impl ChatApp {
         self.transient_status = None;
         self.transient_status_until = None;
         self.status = "Loading session...".to_owned();
-        self.rendered_message_lines = vec![Line::from("Loading session...")];
-        self.wrapped_message_lines = vec![Line::from("Loading session...")];
-        self.refresh_render_metrics();
         self.scroll_to_bottom();
     }
 }

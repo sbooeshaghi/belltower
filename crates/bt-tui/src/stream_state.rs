@@ -805,7 +805,6 @@ impl ChatApp {
                 self.active_turn.live = true;
                 self.start_stream_controller_if_needed();
                 self.set_task_status("Working", Some(format!("{provider} ({model})")));
-                self.rebuild_render_cache();
             }
             EventPayload::CompletionChunk { deltas, .. } => {
                 let mut live_output_changed = false;
@@ -907,7 +906,6 @@ impl ChatApp {
                 }
 
                 if live_output_changed {
-                    self.rebuild_render_cache();
                     if self.should_follow_messages() {
                         self.scroll_to_bottom();
                     }
@@ -920,7 +918,6 @@ impl ChatApp {
                 if self.active_turn.cells.is_empty() {
                     let _ = self.emit_final_work_separator_if_needed();
                 }
-                self.rebuild_render_cache();
                 self.status = format!(
                     "Ready. Completed {} ({}). {} messages loaded.",
                     provider,
@@ -941,7 +938,6 @@ impl ChatApp {
                 self.clear_live_turn_items();
                 self.clear_task_status();
                 self.request_queue_refresh();
-                self.rebuild_render_cache();
                 self.status = format!("Error: {code}");
                 self.show_error(format!("{class} error: {message}"));
             }
@@ -952,7 +948,6 @@ impl ChatApp {
                 self.clear_live_turn_boundary();
                 self.clear_live_turn_items();
                 self.clear_task_status();
-                self.rebuild_render_cache();
                 if status == "failed" {
                     self.status = "Turn failed".to_owned();
                 }
@@ -966,7 +961,6 @@ impl ChatApp {
                 self.active_turn.live = true;
                 if is_ask_tool(&tool_name) {
                     self.handle_ask_signal(&call_id, Some(&arguments));
-                    self.rebuild_render_cache();
                     return;
                 }
                 self.start_streaming_tool_preview(
@@ -979,7 +973,6 @@ impl ChatApp {
                     tool_name.clone(),
                     summarize_tool_detail(&tool_name, &arguments),
                 );
-                self.rebuild_render_cache();
             }
             EventPayload::ToolApprovalRequested {
                 tool_name, call_id, ..
@@ -1036,7 +1029,6 @@ impl ChatApp {
                     self.clear_pending_tool(&call_id);
                     self.clear_task_status();
                     self.show_notice("Input recorded.".to_owned());
-                    self.rebuild_render_cache();
                     return;
                 }
                 self.request_queue_refresh();
@@ -1079,7 +1071,6 @@ impl ChatApp {
                 if let Some(command) = self.operator_commands.last().cloned() {
                     self.queue_scrollback_operator_command(&command);
                 }
-                self.rebuild_render_cache();
                 if self.should_follow_messages() {
                     self.scroll_to_bottom();
                 }
@@ -1108,7 +1099,6 @@ impl ChatApp {
         }
         self.has_more_history_before |= page.has_more_before;
         self.last_event_id = self.last_event_id.max(page.last_event_id);
-        self.rebuild_render_cache();
         if let Some(previous_latest_seq) = previous_latest_seq {
             self.queue_unprinted_scrollback_entries(Some(previous_latest_seq));
         } else {
@@ -1130,7 +1120,6 @@ impl ChatApp {
         merge_operator_commands(&mut self.operator_commands, page.operator_commands);
         self.has_more_history_before = page.has_more_before;
         self.last_event_id = self.last_event_id.max(page.last_event_id);
-        self.rebuild_render_cache();
     }
 
     pub(super) fn clear_optimistic_user_state(&mut self) {

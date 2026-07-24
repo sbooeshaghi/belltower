@@ -127,7 +127,6 @@ pub(crate) use transcript_helpers::{
 };
 use transcript_view::{
     compare_transcript_seq_ids, merged_rendered_transcript_entries, render_operator_command,
-    rendered_max_line_width, rendered_message_lines_with_options, wrap_rendered_lines,
 };
 pub(crate) use user_surface::{composer_text_area_rect, composer_wrap_width, user_surface_style};
 
@@ -565,11 +564,6 @@ struct ChatApp {
     messages: Vec<Message>,
     message_seq_ids: Vec<Option<i64>>,
     operator_commands: Vec<RecordedOperatorCommand>,
-    rendered_message_lines: Vec<Line<'static>>,
-    wrapped_message_lines: Vec<Line<'static>>,
-    visual_line_count_cache: usize,
-    max_line_width_cache: usize,
-    clear_separator_skip_line: Option<usize>,
     sessions: Vec<SessionRecord>,
     branches: Vec<BranchRecord>,
     connections: Vec<ConnectionDescriptor>,

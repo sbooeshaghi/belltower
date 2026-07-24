@@ -10,21 +10,6 @@ fn ask_question_for_call_id(messages: &[Message], call_id: &str) -> Option<Strin
     })
 }
 
-fn append_transcript_entry(
-    lines: &mut Vec<Line<'static>>,
-    rendered: String,
-    separator: ScrollbackSeparator,
-    suppress_separator_at_line: Option<usize>,
-) {
-    if !lines.is_empty()
-        && matches!(separator, ScrollbackSeparator::Paragraph)
-        && suppress_separator_at_line != Some(lines.len())
-    {
-        lines.push(Line::from(""));
-    }
-    lines.extend(rendered.lines().map(|line| Line::from(line.to_owned())));
-}
-
 pub(super) fn compare_transcript_seq_ids(
     left: Option<i64>,
     right: Option<i64>,
@@ -35,31 +20,6 @@ pub(super) fn compare_transcript_seq_ids(
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => std::cmp::Ordering::Equal,
     }
-}
-
-pub(super) fn rendered_message_lines_with_options(
-    messages: &[Message],
-    message_seq_ids: &[Option<i64>],
-    operator_commands: &[RecordedOperatorCommand],
-    clear_separator_skip_line: Option<usize>,
-    show_reasoning: bool,
-    transcript_density: TranscriptDensity,
-    view_width: u16,
-) -> Vec<Line<'static>> {
-    let mut lines = rendered_transcript_lines(
-        messages,
-        message_seq_ids,
-        operator_commands,
-        clear_separator_skip_line,
-        show_reasoning,
-        transcript_density,
-        view_width,
-    );
-    if lines.is_empty() {
-        lines = vec![Line::from("No messages yet.")];
-    }
-
-    lines
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,39 +207,6 @@ fn rendered_scrollback_message(
     render_transcript_message_with_options(message, show_reasoning, transcript_density, view_width)
 }
 
-fn rendered_transcript_lines(
-    messages: &[Message],
-    message_seq_ids: &[Option<i64>],
-    operator_commands: &[RecordedOperatorCommand],
-    clear_separator_skip_line: Option<usize>,
-    show_reasoning: bool,
-    transcript_density: TranscriptDensity,
-    view_width: u16,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let entries = merged_rendered_transcript_entries(
-        messages,
-        message_seq_ids,
-        operator_commands,
-        show_reasoning,
-        transcript_density,
-        view_width,
-    );
-    let mut previous_kind = None;
-
-    for entry in entries {
-        append_transcript_entry(
-            &mut lines,
-            entry.rendered,
-            transcript_separator_between(previous_kind, entry.kind),
-            clear_separator_skip_line,
-        );
-        previous_kind = Some(entry.kind);
-    }
-
-    lines
-}
-
 fn sequenced_entry_before(
     message_seq_id: Option<i64>,
     command_seq_id: Option<i64>,
@@ -314,28 +241,4 @@ pub(crate) fn render_operator_command(
             )
         }
     }
-}
-
-pub(super) fn wrap_rendered_lines(lines: &[Line<'static>], view_width: u16) -> Vec<Line<'static>> {
-    let width = usize::from(view_width.max(1));
-    let mut wrapped = Vec::new();
-    for line in lines {
-        wrapped.extend(
-            wrap_plain_text(&line.to_string(), width)
-                .into_iter()
-                .map(Line::from),
-        );
-    }
-    if wrapped.is_empty() {
-        wrapped.push(Line::from("No messages yet."));
-    }
-    wrapped
-}
-
-pub(super) fn rendered_max_line_width(lines: &[Line<'static>]) -> usize {
-    lines
-        .iter()
-        .map(|line| display_width(&line.to_string()))
-        .max()
-        .unwrap_or(1)
 }

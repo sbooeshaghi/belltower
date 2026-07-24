@@ -187,8 +187,13 @@ This behavior should explicitly match Codex-style interaction.
 - Tool summaries include persistent `call_id` values for later drill-down.
 - Tool errors render clearly and durably in transcript order.
 - `session.error` events are loud: the error text is queued into the visible
-  transcript immediately (not only into the render cache) and the active task
-  spinner clears, so a failed turn can never present as a silent hang.
+  transcript immediately and the active task spinner clears, so a failed turn
+  can never present as a silent hang.
+- The transcript renders incrementally through queued history cells; there is
+  no full-transcript re-render on stream events. (A legacy parallel render
+  cache that re-rendered the whole transcript per event and was never read
+  was deleted; do not reintroduce whole-transcript rendering on the stream
+  path.)
 - `/inspect tool <call-id>` drills into a specific tool call in detail without rerendering prior transcript output.
 - Humans and agents should share the same inspection concept and data model.
 

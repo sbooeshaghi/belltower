@@ -80,14 +80,12 @@ impl ChatApp {
                 self.pending_resume_command_raw_input = None;
                 self.show_error(format!("session switch failed: {error}"));
                 self.status = format!("Ready. {} messages loaded.", self.messages.len());
-                self.sync_transcript_view();
                 self.ensure_event_stream().await?;
             }
             Err(error) => {
                 self.pending_resume_command_raw_input = None;
                 self.show_error(format!("session switch task failed: {error}"));
                 self.status = format!("Ready. {} messages loaded.", self.messages.len());
-                self.sync_transcript_view();
                 self.ensure_event_stream().await?;
             }
         }
@@ -170,7 +168,6 @@ impl ChatApp {
                 } else if !self.active_turn.live && !self.runtime_busy_for_controls() {
                     self.clear_task_status();
                 }
-                self.sync_transcript_view();
             }
             Ok(Ok(PendingSendCompletion::MessageSubmitted(response))) => {
                 self.apply_message_submission_outcome(response, None, true)
@@ -265,7 +262,6 @@ impl ChatApp {
             }
         }
 
-        self.sync_transcript_view();
         Ok(())
     }
 
@@ -291,7 +287,6 @@ impl ChatApp {
                 if self.last_metadata_refresh.elapsed() >= METADATA_REFRESH_INTERVAL {
                     self.refresh_metadata().await?;
                 }
-                self.sync_transcript_view();
             }
             Ok(Err(error)) => {
                 self.active_turn.live = false;
@@ -299,7 +294,6 @@ impl ChatApp {
                 self.restore_pending_tool_after_failed_approval(action.as_ref());
                 self.clear_task_status();
                 self.show_error(format!("approval failed: {error}"));
-                self.sync_transcript_view();
             }
             Err(error) => {
                 self.active_turn.live = false;
@@ -307,7 +301,6 @@ impl ChatApp {
                 self.restore_pending_tool_after_failed_approval(action.as_ref());
                 self.clear_task_status();
                 self.show_error(format!("approval task failed: {error}"));
-                self.sync_transcript_view();
             }
         }
 

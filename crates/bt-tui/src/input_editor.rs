@@ -1250,7 +1250,6 @@ impl ChatApp {
                 .map_err(|error| error.to_string())
         }));
         self.pending_send_started_at = Some(Instant::now());
-        self.sync_transcript_view();
     }
 
     pub(super) fn start_send_text(&mut self, text: String) {
@@ -1258,7 +1257,6 @@ impl ChatApp {
         self.mark_live_turn_start();
         self.active_turn.live = true;
         self.active_turn.optimistic_user_text = Some(text.clone());
-        self.sync_transcript_view();
         self.set_task_status(
             "Working",
             Some(format!(
@@ -1284,7 +1282,6 @@ impl ChatApp {
                 .map_err(|error| error.to_string())
         }));
         self.pending_send_started_at = Some(Instant::now());
-        self.sync_transcript_view();
     }
 
     pub(super) fn start_background_message_submission(&mut self, text: String) {
@@ -1332,7 +1329,6 @@ impl ChatApp {
                 .map_err(|error| error.to_string())
         }));
         self.pending_send_started_at = Some(Instant::now());
-        self.sync_transcript_view();
     }
 
     fn handle_key_without_escape_prefix(&mut self, key: KeyEvent) -> Option<ChatAction> {
