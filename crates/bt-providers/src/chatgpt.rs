@@ -40,7 +40,7 @@ impl OpenAiChatGptProvider {
             base_url,
             access_token: access_token.into(),
             account_id: account_id.into(),
-            http: Client::builder().build().map_err(reqwest_error)?,
+            http: crate::shared_http_client(),
         })
     }
 

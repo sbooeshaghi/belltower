@@ -217,28 +217,44 @@ impl CredentialResolver {
         };
 
         if chatgpt_refresh_needed(connection, &credential)? {
-            if let Err(error) = refresh_chatgpt_token_bundle(
-                ChatGptLoginOptions::for_provider(connection.id.to_string())
-                    .with_shared_store(self.store.clone()),
-            )
-            .await
-            {
-                if let Some(reloaded) = self.resolve_from_auth_store(connection)?
-                    && reloaded_chatgpt_credential_is_usable(connection, &credential, &reloaded)?
-                {
-                    return Ok(Some(reloaded));
-                }
-                return Err(error);
-            }
+            // ChatGPT rotates refresh tokens on use: two concurrent refreshes
+            // burn the stored refresh token permanently. Serialize per
+            // provider, then re-check — the winner of the race has usually
+            // already refreshed by the time a waiter acquires the lock.
+            let refresh_lock = oauth_refresh_lock(connection.id.0.as_str());
+            let _refresh_guard = refresh_lock.lock().await;
             credential = match self.resolve_from_auth_store(connection)? {
                 Some(credential) => credential,
-                None => {
-                    return Err(BelltowerError::Auth(format!(
-                        "refreshed ChatGPT credentials for `{}` but no credential was reloaded from the auth store",
-                        connection.id
-                    )));
-                }
+                None => return Ok(None),
             };
+            if chatgpt_refresh_needed(connection, &credential)? {
+                if let Err(error) = refresh_chatgpt_token_bundle(
+                    ChatGptLoginOptions::for_provider(connection.id.to_string())
+                        .with_shared_store(self.store.clone()),
+                )
+                .await
+                {
+                    if let Some(reloaded) = self.resolve_from_auth_store(connection)?
+                        && reloaded_chatgpt_credential_is_usable(
+                            connection,
+                            &credential,
+                            &reloaded,
+                        )?
+                    {
+                        return Ok(Some(reloaded));
+                    }
+                    return Err(error);
+                }
+                credential = match self.resolve_from_auth_store(connection)? {
+                    Some(credential) => credential,
+                    None => {
+                        return Err(BelltowerError::Auth(format!(
+                            "refreshed ChatGPT credentials for `{}` but no credential was reloaded from the auth store",
+                            connection.id
+                        )));
+                    }
+                };
+            }
         }
 
         Ok(Some(credential))
@@ -282,6 +298,20 @@ impl CredentialResolver {
             ParsedSource::Special(_) => Ok(None),
         }
     }
+}
+
+/// Process-wide per-provider lock serializing OAuth token refreshes.
+fn oauth_refresh_lock(provider: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("oauth refresh lock registry poisoned")
+        .entry(provider.to_owned())
+        .or_default()
+        .clone()
 }
 
 fn reloaded_chatgpt_credential_is_usable(

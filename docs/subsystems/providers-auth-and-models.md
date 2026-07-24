@@ -84,6 +84,13 @@ Current shape:
   and the OpenAI chat-completions adapter clamps `xhigh` to `high` because
   that endpoint rejects it (observed 400 on gpt-5.4)
 - auth-method labels carried directly on readiness and model inspection surfaces so launcher, CLI, and TUI can render supported login paths from canonical state
+- one shared HTTP client (connection pool) behind every provider instance,
+  with connect/read-stall timeouts but never a total request timeout that
+  could kill a long streaming completion; providers are cheap to construct
+  per turn because the pool outlives them
+- OAuth refresh is serialized per provider with a re-check under the lock:
+  rotating refresh tokens (ChatGPT) must never be spent twice by racing
+  turns, which permanently burns the stored token
 - guided connection-plus-model selection through `/use`
 
 Future shape:

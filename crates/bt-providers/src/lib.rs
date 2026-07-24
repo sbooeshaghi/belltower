@@ -7,6 +7,28 @@ mod sse;
 
 use bt_core::{BelltowerError, ConnectionDescriptor, Result, RuntimeCredential, traits::Provider};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+/// One HTTP client (connection pool) shared by every provider instance.
+/// Providers were previously constructed per turn, each with a fresh client,
+/// paying a TLS handshake per turn. Streaming responses are read
+/// incrementally, so only connect/read-stall guards are set here — never a
+/// total request timeout, which would kill long completions.
+pub(crate) fn shared_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .read_timeout(Duration::from_secs(300))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .tcp_keepalive(Duration::from_secs(60))
+                .build()
+                .expect("default TLS-capable HTTP client must construct")
+        })
+        .clone()
+}
 
 pub use anthropic::AnthropicProvider;
 pub use chatgpt::{OpenAiChatGptProvider, chatgpt_account_id};

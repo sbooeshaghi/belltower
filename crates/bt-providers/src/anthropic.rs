@@ -34,7 +34,7 @@ impl AnthropicProvider {
             provider_id: provider_id.into(),
             base_url,
             api_key,
-            http: Client::builder().build().map_err(reqwest_error)?,
+            http: crate::shared_http_client(),
         })
     }
 

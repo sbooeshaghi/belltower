@@ -32,7 +32,7 @@ impl OpenAiCompatibleProvider {
             provider_id: provider_id.into(),
             base_url,
             auth_token,
-            http: Client::builder().build().map_err(reqwest_error)?,
+            http: crate::shared_http_client(),
         })
     }
 
