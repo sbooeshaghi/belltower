@@ -168,6 +168,7 @@ fn session_control_fixtures() -> SessionControlFixtures {
             protocol_version: bt_protocol::PROTOCOL_VERSION.to_owned(),
         },
         create_session_request: CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/belltower/project".to_owned(),
             connection_id: connection_id("openai"),
             model_id: Some("gpt-5.1".to_owned()),

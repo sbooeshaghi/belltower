@@ -403,6 +403,7 @@ fn public_belltower_client_methods_have_consumer_mode_annotations() {
         "run_shell_command",
         "session_events",
         "session_turns",
+        "wait_for_session_settle",
         "session_execution",
         "session_queue",
         "clear_session_queue",
@@ -692,6 +693,7 @@ async fn control_surface_methods_cover_current_release_candidate_routes() {
 
     let created = client
         .create_session(&CreateSessionRequest {
+            approval_mode: None,
             project_root: "/tmp/project".to_owned(),
             connection_id: ConnectionId::new("openai"),
             model_id: Some("gpt-5.1".to_owned()),

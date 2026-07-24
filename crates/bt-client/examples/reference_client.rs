@@ -29,6 +29,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let created = client
         .create_session(&CreateSessionRequest {
+            approval_mode: None,
             project_root: config.project_root,
             connection_id: ConnectionId::new(config.connection_id),
             model_id: config.model_id,
