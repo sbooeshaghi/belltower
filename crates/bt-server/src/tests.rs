@@ -3841,6 +3841,7 @@ async fn spawn_route_creates_child_session_with_lineage_and_events() {
             &format!("sessions/{}/spawn", created.session.session_id),
         )
         .json(&SpawnSessionRequest {
+            dispatch: Some(false),
             parent_branch_id: created.branch.branch_id,
             parent_turn_id: None,
             objective: "inspect recent tool approvals".to_owned(),
@@ -3979,6 +3980,7 @@ async fn workflow_route_reports_parent_child_runtime_state() {
             &format!("sessions/{}/spawn", created.session.session_id),
         )
         .json(&SpawnSessionRequest {
+            dispatch: Some(false),
             parent_branch_id: created.branch.branch_id,
             parent_turn_id: None,
             objective: "inspect recent tool approvals".to_owned(),
@@ -4026,6 +4028,94 @@ async fn workflow_route_reports_parent_child_runtime_state() {
     assert_eq!(workflow.inspection.runtime_counts.waiting_on_approval, 1);
     assert_eq!(workflow.inspection.nodes[0].child_session_count, 1);
     assert!(workflow.inspection.nodes[1].is_focus);
+}
+
+#[tokio::test]
+async fn operator_spawn_dispatches_child_objective_and_wakes_parent() {
+    let mock_provider = spawn_mock_provider().await;
+    let server = spawn_server(config_for_mock_provider(&mock_provider.base_url)).await;
+    let api = api_client(&server);
+    let client = Client::new();
+
+    let created: CreateSessionResponse = server
+        .request(&client, Method::POST, "sessions")
+        .json(&CreateSessionRequest {
+            approval_mode: None,
+            project_root: "/tmp/project".to_owned(),
+            connection_id: ConnectionId::new("local"),
+            model_id: None,
+            tool_mode: None,
+            display_name: Some("dispatching-parent".to_owned()),
+            objective: None,
+            budget: None,
+        })
+        .send()
+        .await
+        .expect("create session")
+        .json()
+        .await
+        .expect("create session body");
+
+    let spawned: SpawnSessionResponse = server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/spawn", created.session.session_id),
+        )
+        .json(&SpawnSessionRequest {
+            dispatch: None,
+            parent_branch_id: created.branch.branch_id,
+            parent_turn_id: None,
+            objective: "run the delegated objective".to_owned(),
+            display_name: Some("dispatched-child".to_owned()),
+            connection_id: None,
+            model_id: None,
+        })
+        .send()
+        .await
+        .expect("spawn request")
+        .json()
+        .await
+        .expect("spawn response body");
+
+    let child_id = spawned.child_session.session_id;
+    settle(&api, child_id).await;
+    let child_turns = api.session_turns(child_id).await.expect("child turns");
+    assert!(
+        child_turns
+            .turns
+            .iter()
+            .any(|turn| turn.status.as_deref() == Some("completed")),
+        "operator-spawned child must run its objective without a manual message, got {:?}",
+        child_turns
+            .turns
+            .iter()
+            .map(|turn| turn.status.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // The child's terminal result is a wake message; the pump must run a
+    // parent turn to consume it even though the parent has been idle.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let parent_turns = api
+            .session_turns(created.session.session_id)
+            .await
+            .expect("parent turns");
+        if parent_turns
+            .turns
+            .iter()
+            .any(|turn| turn.status.as_deref() == Some("completed"))
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "idle parent was never woken by the child result"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    settle(&api, created.session.session_id).await;
 }
 
 #[tokio::test]
@@ -8458,7 +8548,10 @@ async fn spawn_server_with_database_path(
         runtime: runtime.clone(),
         token: Arc::new(token.clone()),
     };
-    let app = build_app(state);
+    // Mirror production startup: the wake pump dispatches wake-mode
+    // related-session messages to idle destinations.
+    crate::agent_tools::spawn_wake_pump(state.clone());
+    let app = build_app(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let handle = tokio::spawn(async move {

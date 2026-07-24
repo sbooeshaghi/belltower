@@ -806,6 +806,7 @@ impl ChatApp {
             .spawn_session(
                 self.session_id,
                 &SpawnSessionRequest {
+            dispatch: None,
                     parent_branch_id: self.branch_id,
                     parent_turn_id: origin_turn_id,
                     objective: args.objective,

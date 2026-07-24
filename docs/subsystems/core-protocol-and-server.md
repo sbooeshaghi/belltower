@@ -189,6 +189,9 @@ same runtime/store boundary:
 
 - `spawn_agent` creates and dispatches one bounded child session, optionally on
   a different configured connection and model
+- the operator route `POST /sessions/{id}/spawn` has the same dispatch
+  contract: the objective is delivered as a wake instruction and the child
+  starts immediately; `dispatch: false` opts into a prepared-but-idle child
 - `send_agent_message` records a typed direct parent-child message and may wake
   an idle destination
 - `list_agents` returns canonical workflow lineage plus recent mailbox records

@@ -444,15 +444,43 @@ async fn spawn_session(
         "parent branch",
     )?;
     let parent_branch_id = request.parent_branch_id;
-    let (child_session, child_branch) = state.runtime.spawn_child_session(
-        session_id,
-        parent_branch_id,
-        request.parent_turn_id,
-        request.objective,
-        request.display_name,
-        request.connection_id,
-        request.model_id,
-    )?;
+    let dispatch = request.dispatch.unwrap_or(true);
+    let (child_session, child_branch) = if dispatch {
+        // Same contract as the model-facing spawn_agent tool: the objective is
+        // recorded as a wake instruction and the child starts immediately.
+        let (child_session, child_branch, _receipt) =
+            state.runtime.spawn_child_session_with_initial_objective(
+                session_id,
+                parent_branch_id,
+                request.parent_turn_id,
+                request.objective,
+                request.display_name,
+                request.connection_id,
+                request.model_id,
+            )?;
+        if let Some(admitted) = state
+            .runtime
+            .claim_next_related_session_message(child_session.session_id)?
+        {
+            detach_session_turn(
+                &state,
+                child_session.clone(),
+                child_branch.clone(),
+                admitted,
+            );
+        }
+        (child_session, child_branch)
+    } else {
+        state.runtime.spawn_child_session(
+            session_id,
+            parent_branch_id,
+            request.parent_turn_id,
+            request.objective,
+            request.display_name,
+            request.connection_id,
+            request.model_id,
+        )?
+    };
     Ok(Json(SpawnSessionResponse {
         parent_session_id: session_id,
         parent_branch_id,

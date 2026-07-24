@@ -195,6 +195,7 @@ fn session_control_fixtures() -> SessionControlFixtures {
             message: user_message("Please inspect the protocol surface."),
         },
         spawn_session_request: SpawnSessionRequest {
+            dispatch: None,
             parent_branch_id: branch_id(),
             parent_turn_id: Some(turn_id()),
             objective: "Review MCP state transitions".to_owned(),

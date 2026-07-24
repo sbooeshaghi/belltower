@@ -120,6 +120,12 @@ pub struct SpawnSessionRequest {
     pub display_name: Option<String>,
     pub connection_id: Option<ConnectionId>,
     pub model_id: Option<String>,
+    /// Whether to deliver the objective as a wake instruction so the child
+    /// starts working immediately (default true, matching the model-facing
+    /// spawn_agent tool). Set false to create a prepared-but-idle child that
+    /// only runs once it is messaged directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
