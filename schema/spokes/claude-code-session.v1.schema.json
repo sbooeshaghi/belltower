@@ -1,0 +1,640 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://belltower.dev/schemas/spokes/claude-code-session/v1.json",
+  "title": "Claude Code session line (observed v1)",
+  "description": "One JSONL line of a Claude Code session transcript (~/.claude/projects/<cwd-slug>/<sessionId>.jsonl) or of a sidecar subagent transcript (<sessionId>/subagents/**/agent-<agentId>.jsonl). Derived empirically from an operator corpus spanning harness versions 2.1.111-2.1.219 (2026-04 to 2026-07) plus controlled captures; see claude-code-session.v1.notes.md for provenance, linkage invariants, and quirks. Doctrine: strictness lives in `required` (load-bearing fields only), never in closure -- every object allows additional properties because the vendor evolves this format and importers must degrade gracefully. Every property listed here was observed in the corpus; fields observed with multiple JSON types are unions. The sidecar agent-*.meta.json file (not a JSONL line) is described by $defs/agentMetaFile.",
+  "oneOf": [
+    { "$ref": "#/$defs/assistantLine" },
+    { "$ref": "#/$defs/userLine" },
+    { "$ref": "#/$defs/queueOperationLine" },
+    { "$ref": "#/$defs/lastPromptLine" },
+    { "$ref": "#/$defs/aiTitleLine" },
+    { "$ref": "#/$defs/attachmentLine" },
+    { "$ref": "#/$defs/modeLine" },
+    { "$ref": "#/$defs/customTitleLine" },
+    { "$ref": "#/$defs/systemLine" },
+    { "$ref": "#/$defs/prLinkLine" },
+    { "$ref": "#/$defs/frameLinkLine" },
+    { "$ref": "#/$defs/fileHistorySnapshotLine" },
+    { "$ref": "#/$defs/permissionModeLine" },
+    { "$ref": "#/$defs/agentStartedLine" },
+    { "$ref": "#/$defs/agentResultLine" }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "description": "RFC 4122 UUID string. Record ids (`uuid`, `parentUuid`, `sessionId`, `promptId`, `leafUuid`, ...) all use this shape.",
+      "format": "uuid"
+    },
+    "timestamp": {
+      "type": "string",
+      "description": "ISO 8601 UTC timestamp with milliseconds, e.g. 2026-07-25T19:43:32.063Z.",
+      "format": "date-time"
+    },
+    "agentId": {
+      "type": "string",
+      "description": "Subagent id: observed as 'a' followed by 16 lowercase hex chars (e.g. a1b2c3d4e5f60718a). Matches the sidecar filename agent-<agentId>.jsonl."
+    },
+
+    "userLine": {
+      "type": "object",
+      "description": "A user-role chain record: a human prompt, an injected meta prompt (isMeta), a tool_result carrier, or a post-compaction summary (isCompactSummary). First record of a chain has parentUuid null.",
+      "required": ["type", "uuid", "parentUuid", "sessionId", "timestamp", "cwd", "isSidechain", "message"],
+      "properties": {
+        "type": { "const": "user" },
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "parentUuid": {
+          "anyOf": [{ "$ref": "#/$defs/uuid" }, { "type": "null" }],
+          "description": "uuid of the preceding record in this transcript's chain; null for a chain root."
+        },
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "cwd": { "type": "string" },
+        "isSidechain": {
+          "type": "boolean",
+          "description": "true iff the record belongs to a subagent (sidecar) transcript."
+        },
+        "message": { "$ref": "#/$defs/userMessage" },
+        "gitBranch": { "type": "string" },
+        "userType": { "type": "string", "description": "Observed: \"external\"." },
+        "version": { "type": "string", "description": "Claude Code version that wrote the line, e.g. \"2.1.217\"." },
+        "entrypoint": { "type": "string", "description": "Observed: \"claude-desktop\", \"sdk-cli\", \"cli\". Absent on some lines." },
+        "promptId": { "$ref": "#/$defs/uuid" },
+        "permissionMode": { "type": "string", "description": "Observed: \"default\", \"auto\", \"acceptEdits\"." },
+        "promptSource": { "type": "string", "description": "Observed: \"sdk\"." },
+        "origin": {
+          "type": "object",
+          "description": "Provenance of the prompt. Observed kinds: \"human\", \"task-notification\", \"coordinator\", \"peer\" (peer messages additionally carry from/senderTaskId/name/body).",
+          "properties": {
+            "kind": { "type": "string" },
+            "from": { "type": "string" },
+            "senderTaskId": { "type": "string" },
+            "name": { "type": "string" },
+            "body": { "type": "string" }
+          },
+          "additionalProperties": true
+        },
+        "slug": { "type": "string", "description": "Human-readable machine-generated session slug (three hyphenated words)." },
+        "agentId": { "$ref": "#/$defs/agentId" },
+        "toolUseResult": {
+          "type": ["string", "object", "array"],
+          "description": "Harness-internal structured result of the tool call whose tool_result block this line carries. String for plain/error text, object or array otherwise; keys are tool-specific (stdout/stderr/interrupted, file{filePath,content,numLines,...}, oldString/newString/structuredPatch, todos, ...). Advisory: richer than message.content but not part of the model-visible conversation."
+        },
+        "sourceToolAssistantUUID": {
+          "$ref": "#/$defs/uuid",
+          "description": "uuid of the assistant line whose tool_use block this tool_result answers."
+        },
+        "sourceToolUseID": { "type": "string", "description": "Tool call id (toolu_*) a meta record is associated with." },
+        "isMeta": { "type": "boolean", "description": "true on harness-injected records (e.g. local-command caveats) that are not operator prompts." },
+        "isCompactSummary": { "type": "boolean", "description": "true on the synthetic continuation prompt written after compaction." },
+        "isVisibleInTranscriptOnly": { "type": "boolean" },
+        "classifierMetaLines": { "type": "string", "description": "Newline-terminated JSON string with classifier metadata (e.g. gitStatus counts)." },
+        "toolDenialKind": { "type": "string", "description": "Observed: \"automode-blocked\"." }
+      },
+      "additionalProperties": true
+    },
+
+    "assistantLine": {
+      "type": "object",
+      "description": "An assistant-role chain record carrying exactly one API content block. A single API response is persisted as N consecutive assistant lines sharing message.id and requestId. API-failure records carry error/isApiErrorMessage and may keep an empty-ish message.",
+      "required": ["type", "uuid", "parentUuid", "sessionId", "timestamp", "cwd", "isSidechain", "message"],
+      "properties": {
+        "type": { "const": "assistant" },
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "parentUuid": {
+          "$ref": "#/$defs/uuid",
+          "description": "Never observed null on assistant lines (18,881 samples)."
+        },
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "cwd": { "type": "string" },
+        "isSidechain": { "type": "boolean" },
+        "message": { "$ref": "#/$defs/assistantMessage" },
+        "gitBranch": { "type": "string" },
+        "userType": { "type": "string" },
+        "version": { "type": "string" },
+        "entrypoint": { "type": "string" },
+        "requestId": { "type": "string", "description": "API request id (req_*); shared by all lines of one response. Absent on failure records." },
+        "agentId": { "$ref": "#/$defs/agentId" },
+        "attributionAgent": { "type": "string", "description": "Agent type the work is attributed to (sidechain records), e.g. \"general-purpose\"." },
+        "attributionMcpServer": { "type": "string" },
+        "attributionMcpTool": { "type": "string" },
+        "attributionSkill": { "type": "string" },
+        "effort": { "type": "string", "description": "Reasoning effort. Observed: \"max\", \"high\"." },
+        "slug": { "type": "string" },
+        "error": { "type": "string", "description": "Short error code on API-failure records, e.g. \"authentication_failed\", \"max_output_tokens\", \"invalid_request\"." },
+        "errorDetails": { "type": "string" },
+        "apiError": { "type": "string" },
+        "apiErrorStatus": { "type": "integer", "description": "HTTP status of a failed API call." },
+        "isApiErrorMessage": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+
+    "userMessage": {
+      "type": "object",
+      "required": ["role", "content"],
+      "properties": {
+        "role": { "const": "user" },
+        "content": {
+          "description": "Plain string for typed prompts; block array for tool results, images, documents, and mixed content.",
+          "anyOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "$ref": "#/$defs/userContentBlock" } }
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "assistantMessage": {
+      "type": "object",
+      "description": "Anthropic API message envelope as persisted. In this store content holds exactly one block per line.",
+      "required": ["role", "content"],
+      "properties": {
+        "role": { "const": "assistant" },
+        "content": { "type": "array", "items": { "$ref": "#/$defs/assistantContentBlock" } },
+        "id": { "type": "string", "description": "API message id (msg_*); shared by all lines of one response." },
+        "model": { "type": "string" },
+        "type": { "type": "string", "description": "Observed: \"message\"." },
+        "stop_reason": {
+          "type": ["string", "null"],
+          "description": "Observed: \"tool_use\", \"end_turn\", \"stop_sequence\", \"max_tokens\", or null."
+        },
+        "stop_sequence": { "type": ["string", "null"] },
+        "stop_details": { "type": "null", "description": "Only null observed." },
+        "container": { "type": "null", "description": "Only null observed." },
+        "context_management": {
+          "type": ["object", "null"],
+          "description": "Observed object shape: {\"applied_edits\": []}.",
+          "additionalProperties": true
+        },
+        "diagnostics": {
+          "type": ["object", "null"],
+          "description": "Observed object shape: {\"cache_miss_reason\": {...}}.",
+          "additionalProperties": true
+        },
+        "usage": { "$ref": "#/$defs/usage" }
+      },
+      "additionalProperties": true
+    },
+
+    "usage": {
+      "type": "object",
+      "description": "API token accounting. Advisory for importers; no field is load-bearing.",
+      "properties": {
+        "input_tokens": { "type": "integer" },
+        "output_tokens": { "type": "integer" },
+        "cache_creation_input_tokens": { "type": "integer" },
+        "cache_read_input_tokens": { "type": "integer" },
+        "cache_creation": {
+          "type": "object",
+          "properties": {
+            "ephemeral_5m_input_tokens": { "type": "integer" },
+            "ephemeral_1h_input_tokens": { "type": "integer" }
+          },
+          "additionalProperties": true
+        },
+        "server_tool_use": {
+          "type": "object",
+          "properties": {
+            "web_search_requests": { "type": "integer" },
+            "web_fetch_requests": { "type": "integer" }
+          },
+          "additionalProperties": true
+        },
+        "service_tier": { "type": ["string", "null"] },
+        "speed": { "type": ["string", "null"] },
+        "inference_geo": { "type": ["string", "null"] },
+        "iterations": {
+          "type": ["array", "null"],
+          "items": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "userContentBlock": {
+      "oneOf": [
+        { "$ref": "#/$defs/textBlock" },
+        { "$ref": "#/$defs/toolResultBlock" },
+        { "$ref": "#/$defs/imageBlock" },
+        { "$ref": "#/$defs/documentBlock" }
+      ]
+    },
+
+    "assistantContentBlock": {
+      "oneOf": [
+        { "$ref": "#/$defs/thinkingBlock" },
+        { "$ref": "#/$defs/textBlock" },
+        { "$ref": "#/$defs/toolUseBlock" },
+        { "$ref": "#/$defs/fallbackBlock" }
+      ]
+    },
+
+    "textBlock": {
+      "type": "object",
+      "required": ["type", "text"],
+      "properties": {
+        "type": { "const": "text" },
+        "text": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "thinkingBlock": {
+      "type": "object",
+      "required": ["type", "thinking"],
+      "properties": {
+        "type": { "const": "thinking" },
+        "thinking": { "type": "string" },
+        "signature": { "type": "string", "description": "Opaque server signature; required to replay thinking to the API." }
+      },
+      "additionalProperties": true
+    },
+
+    "toolUseBlock": {
+      "type": "object",
+      "required": ["type", "id", "name", "input"],
+      "properties": {
+        "type": { "const": "tool_use" },
+        "id": { "type": "string", "description": "Tool call id (toolu_*). Joined by the answering tool_result block's tool_use_id and, for Task spawns, by the sidecar meta toolUseId." },
+        "name": { "type": "string" },
+        "input": { "type": "object", "additionalProperties": true },
+        "caller": {
+          "type": "object",
+          "description": "Observed: {\"type\": \"direct\"}.",
+          "properties": { "type": { "type": "string" } },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "toolResultBlock": {
+      "type": "object",
+      "required": ["type", "tool_use_id"],
+      "properties": {
+        "type": { "const": "tool_result" },
+        "tool_use_id": { "type": "string" },
+        "content": {
+          "description": "String, or array of text/image/tool_reference blocks.",
+          "anyOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "$ref": "#/$defs/toolResultInnerBlock" } }
+          ]
+        },
+        "is_error": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+
+    "toolResultInnerBlock": {
+      "oneOf": [
+        { "$ref": "#/$defs/textBlock" },
+        { "$ref": "#/$defs/imageBlock" },
+        { "$ref": "#/$defs/toolReferenceBlock" }
+      ]
+    },
+
+    "toolReferenceBlock": {
+      "type": "object",
+      "required": ["type", "tool_name"],
+      "properties": {
+        "type": { "const": "tool_reference" },
+        "tool_name": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "imageBlock": {
+      "type": "object",
+      "required": ["type", "source"],
+      "properties": {
+        "type": { "const": "image" },
+        "source": { "$ref": "#/$defs/mediaSource" }
+      },
+      "additionalProperties": true
+    },
+
+    "documentBlock": {
+      "type": "object",
+      "required": ["type", "source"],
+      "properties": {
+        "type": { "const": "document" },
+        "source": { "$ref": "#/$defs/mediaSource" }
+      },
+      "additionalProperties": true
+    },
+
+    "mediaSource": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "type": "string", "description": "Observed: \"base64\"." },
+        "media_type": { "type": "string", "description": "Observed: \"image/jpeg\", \"image/png\", \"application/pdf\"." },
+        "data": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "fallbackBlock": {
+      "type": "object",
+      "description": "Model-fallback marker block. Observed shape: {\"type\": \"fallback\", \"from\": {\"model\": ...}, \"to\": {\"model\": ...}}.",
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "fallback" },
+        "from": { "type": "object", "additionalProperties": true },
+        "to": { "type": "object", "additionalProperties": true }
+      },
+      "additionalProperties": true
+    },
+
+    "attachmentLine": {
+      "type": "object",
+      "description": "Harness context-injection bookkeeping (skill/agent/tool listings, task reminders, queued commands, file snippets, ...). Chained like message records but not part of the model conversation proper.",
+      "required": ["type", "uuid", "parentUuid", "sessionId", "timestamp", "cwd", "isSidechain", "attachment"],
+      "properties": {
+        "type": { "const": "attachment" },
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "parentUuid": { "$ref": "#/$defs/uuid" },
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "cwd": { "type": "string" },
+        "isSidechain": { "type": "boolean" },
+        "attachment": { "$ref": "#/$defs/attachmentPayload" },
+        "gitBranch": { "type": "string" },
+        "userType": { "type": "string" },
+        "version": { "type": "string" },
+        "entrypoint": { "type": "string" },
+        "slug": { "type": "string" },
+        "agentId": { "$ref": "#/$defs/agentId" }
+      },
+      "additionalProperties": true
+    },
+
+    "attachmentPayload": {
+      "type": "object",
+      "description": "Discriminated by `type`. Observed types: task_reminder, queued_command, deferred_tools_delta, skill_listing, edited_text_file, agent_listing_delta, mcp_instructions_delta, file, todo_reminder, read_truncation_notice, hook_additional_context, compact_file_reference, date_change, command_permissions, ultra_effort_enter, auto_mode, plan_mode, plan_mode_exit, pdf_reference. Fields below are the union across types; each type populates a few.",
+      "required": ["type"],
+      "properties": {
+        "type": { "type": "string" },
+        "content": { "type": ["string", "object", "array"] },
+        "prompt": { "type": "string" },
+        "commandMode": { "type": "string" },
+        "itemCount": { "type": "integer" },
+        "skillCount": { "type": "integer" },
+        "isInitial": { "type": "boolean" },
+        "showConcurrencyNote": { "type": "boolean" },
+        "filename": { "type": "string" },
+        "displayPath": { "type": "string" },
+        "snippet": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "names": { "type": "array" },
+        "addedNames": { "type": "array" },
+        "removedNames": { "type": "array" },
+        "readdedNames": { "type": "array" },
+        "addedTypes": { "type": "array" },
+        "removedTypes": { "type": "array" },
+        "addedLines": { "type": "array" },
+        "addedBlocks": { "type": "array" },
+        "needsAuthMcpServers": { "type": "array" },
+        "pendingMcpServers": { "type": "array" }
+      },
+      "additionalProperties": true
+    },
+
+    "systemLine": {
+      "type": "object",
+      "description": "Harness event record, discriminated by `subtype`. Observed subtypes: stop_hook_summary, api_error, compact_boundary, local_command, model_refusal_fallback. compact_boundary rows have parentUuid null and logicalParentUuid pointing at the pre-compaction leaf.",
+      "required": ["type", "uuid", "parentUuid", "sessionId", "timestamp", "cwd", "isSidechain", "subtype"],
+      "properties": {
+        "type": { "const": "system" },
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "parentUuid": { "anyOf": [{ "$ref": "#/$defs/uuid" }, { "type": "null" }] },
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "cwd": { "type": "string" },
+        "isSidechain": { "type": "boolean" },
+        "subtype": { "type": "string" },
+        "level": { "type": "string", "description": "Observed: \"suggestion\", \"error\", \"info\", \"warning\"." },
+        "content": { "type": "string" },
+        "isMeta": { "type": "boolean" },
+        "gitBranch": { "type": "string" },
+        "userType": { "type": "string" },
+        "version": { "type": "string" },
+        "entrypoint": { "type": "string" },
+        "slug": { "type": "string" },
+        "logicalParentUuid": {
+          "$ref": "#/$defs/uuid",
+          "description": "compact_boundary only: uuid of the last pre-compaction record; the chain restarts at this row with parentUuid null."
+        },
+        "compactMetadata": {
+          "type": "object",
+          "properties": {
+            "trigger": { "type": "string", "description": "Observed: \"auto\"." },
+            "preTokens": { "type": "integer" },
+            "postTokens": { "type": "integer" },
+            "durationMs": { "type": "integer" },
+            "preCompactDiscoveredTools": { "type": "array" }
+          },
+          "additionalProperties": true
+        },
+        "toolUseID": {
+          "type": "string",
+          "description": "stop_hook_summary only: id of the associated hook callback record. NOTE: observed as a UUID here, not a toolu_* id."
+        },
+        "hookCount": { "type": "integer" },
+        "hookInfos": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+        "hookErrors": { "type": "array" },
+        "hookAdditionalContext": { "type": "array" },
+        "hasOutput": { "type": "boolean" },
+        "preventedContinuation": { "type": "boolean" },
+        "stopReason": { "type": "string" },
+        "error": {
+          "type": "object",
+          "description": "api_error only. Observed keys: message, formatted, connection{code,message,isSSLError}, isNetworkDown, rateLimits.",
+          "additionalProperties": true
+        },
+        "retryInMs": { "type": "number" },
+        "retryAttempt": { "type": "integer" },
+        "maxRetries": { "type": "integer" },
+        "source": { "type": "string", "description": "Observed: \"request_retry\"." },
+        "requestId": { "type": "string" },
+        "direction": { "type": "string", "description": "model_refusal_fallback only. Observed: \"retry\"." },
+        "trigger": { "type": "string", "description": "model_refusal_fallback only. Observed: \"refusal\"." },
+        "originalModel": { "type": "string" },
+        "fallbackModel": { "type": "string" },
+        "apiRefusalCategory": { "type": ["string", "null"] },
+        "apiRefusalExplanation": { "type": ["string", "null"], "description": "Only null observed; string allowed by symmetry with apiRefusalCategory." },
+        "refusedUserMessageUuid": { "$ref": "#/$defs/uuid" }
+      },
+      "additionalProperties": true
+    },
+
+    "queueOperationLine": {
+      "type": "object",
+      "description": "Prompt-queue bookkeeping. enqueue rows carry the queued prompt text in `content`; dequeue/remove rows do not. No uuid -- not part of the chain.",
+      "required": ["type", "operation", "sessionId", "timestamp"],
+      "properties": {
+        "type": { "const": "queue-operation" },
+        "operation": { "type": "string", "description": "Observed: \"enqueue\", \"dequeue\", \"remove\"." },
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "content": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "lastPromptLine": {
+      "type": "object",
+      "description": "UI bookkeeping: latest human prompt and the chain leaf at the time of writing. Rewritten repeatedly; many per file.",
+      "required": ["type", "sessionId"],
+      "properties": {
+        "type": { "const": "last-prompt" },
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "lastPrompt": { "type": "string" },
+        "leafUuid": { "$ref": "#/$defs/uuid" }
+      },
+      "additionalProperties": true
+    },
+
+    "aiTitleLine": {
+      "type": "object",
+      "description": "UI bookkeeping: model-generated session title.",
+      "required": ["type", "aiTitle", "sessionId"],
+      "properties": {
+        "type": { "const": "ai-title" },
+        "aiTitle": { "type": "string" },
+        "sessionId": { "$ref": "#/$defs/uuid" }
+      },
+      "additionalProperties": true
+    },
+
+    "customTitleLine": {
+      "type": "object",
+      "description": "UI bookkeeping: operator-set session title.",
+      "required": ["type", "customTitle", "sessionId"],
+      "properties": {
+        "type": { "const": "custom-title" },
+        "customTitle": { "type": "string" },
+        "sessionId": { "$ref": "#/$defs/uuid" }
+      },
+      "additionalProperties": true
+    },
+
+    "modeLine": {
+      "type": "object",
+      "description": "UI bookkeeping: interaction mode marker. Observed mode: \"normal\".",
+      "required": ["type", "mode", "sessionId"],
+      "properties": {
+        "type": { "const": "mode" },
+        "mode": { "type": "string" },
+        "sessionId": { "$ref": "#/$defs/uuid" }
+      },
+      "additionalProperties": true
+    },
+
+    "permissionModeLine": {
+      "type": "object",
+      "description": "UI bookkeeping: permission-mode marker. Observed value: \"default\".",
+      "required": ["type", "permissionMode", "sessionId"],
+      "properties": {
+        "type": { "const": "permission-mode" },
+        "permissionMode": { "type": "string" },
+        "sessionId": { "$ref": "#/$defs/uuid" }
+      },
+      "additionalProperties": true
+    },
+
+    "prLinkLine": {
+      "type": "object",
+      "description": "Bookkeeping: GitHub PR associated with the session.",
+      "required": ["type", "prNumber", "prRepository", "prUrl", "sessionId", "timestamp"],
+      "properties": {
+        "type": { "const": "pr-link" },
+        "prNumber": { "type": "integer" },
+        "prRepository": { "type": "string", "description": "\"owner/repo\"." },
+        "prUrl": { "type": "string" },
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "timestamp": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": true
+    },
+
+    "frameLinkLine": {
+      "type": "object",
+      "description": "Bookkeeping: published artifact (claude.ai frame) associated with a local file path.",
+      "required": ["type", "frameUrl", "path", "title", "sessionId", "timestamp"],
+      "properties": {
+        "type": { "const": "frame-link" },
+        "frameUrl": { "type": "string" },
+        "path": { "type": "string" },
+        "title": { "type": "string" },
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "timestamp": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": true
+    },
+
+    "fileHistorySnapshotLine": {
+      "type": "object",
+      "description": "Bookkeeping: checkpoint of tracked file backups keyed to a message. Observed with empty trackedFileBackups only.",
+      "required": ["type", "messageId", "snapshot", "isSnapshotUpdate"],
+      "properties": {
+        "type": { "const": "file-history-snapshot" },
+        "messageId": { "$ref": "#/$defs/uuid" },
+        "isSnapshotUpdate": { "type": "boolean" },
+        "snapshot": {
+          "type": "object",
+          "properties": {
+            "messageId": { "$ref": "#/$defs/uuid" },
+            "timestamp": { "$ref": "#/$defs/timestamp" },
+            "trackedFileBackups": { "type": "object", "additionalProperties": true }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "agentStartedLine": {
+      "type": "object",
+      "description": "Sidecar transcripts only (observed under subagents/workflows/): marks a keyed workflow-subagent run starting. Pairs with an agentResultLine by (key, agentId).",
+      "required": ["type", "key", "agentId"],
+      "properties": {
+        "type": { "const": "started" },
+        "key": { "type": "string", "description": "Observed: \"v2:\" + 64 hex chars (content-addressed run key)." },
+        "agentId": { "$ref": "#/$defs/agentId" }
+      },
+      "additionalProperties": true
+    },
+
+    "agentResultLine": {
+      "type": "object",
+      "description": "Sidecar transcripts only (observed under subagents/workflows/): the structured result of a keyed workflow-subagent run. `result` shape is task-defined (observed as object; n=4).",
+      "required": ["type", "key", "agentId", "result"],
+      "properties": {
+        "type": { "const": "result" },
+        "key": { "type": "string" },
+        "agentId": { "$ref": "#/$defs/agentId" },
+        "result": { "type": "object", "additionalProperties": true }
+      },
+      "additionalProperties": true
+    },
+
+    "agentMetaFile": {
+      "type": "object",
+      "description": "NOT a JSONL line: the whole content of a sidecar agent-<agentId>.meta.json file, sibling to agent-<agentId>.jsonl under <sessionId>/subagents/ (or subagents/workflows/wf_*/). toolUseId is the Task-spawn linkage back to the parent transcript's tool_use block; absent on workflow subagents (which link via started/result `key`). parentAgentId present only on nested spawns (spawnDepth >= 2). Empirical presence across 111 files: agentType 111, description 106, toolUseId 103, spawnDepth 100, parentAgentId 41 -- so only agentType can be required.",
+      "required": ["agentType"],
+      "properties": {
+        "agentType": { "type": "string", "description": "Observed: \"general-purpose\", \"Explore\", \"workflow-subagent\", ..." },
+        "description": { "type": "string" },
+        "toolUseId": { "type": "string", "description": "toolu_* id of the spawning Task tool_use in the parent transcript." },
+        "parentAgentId": { "$ref": "#/$defs/agentId" },
+        "spawnDepth": { "type": "integer", "description": "1 for direct children of the main session; 2+ for nested spawns." }
+      },
+      "additionalProperties": true
+    }
+  }
+}

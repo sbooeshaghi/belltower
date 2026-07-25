@@ -1,0 +1,835 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://belltower.dev/schemas/spokes/codex-session/v1.json",
+  "title": "Codex CLI rollout line (observed v1)",
+  "description": "One JSONL line of an OpenAI Codex rollout file (~/.codex/sessions/YYYY/MM/DD/rollout-<ISO8601>-<uuid>.jsonl, or ~/.codex/archived_sessions/<same-name>.jsonl). Derived empirically from an operator corpus of 966 rollout files / 1,510,157 lines written by codex-cli 0.46.0 through 0.146.0-alpha.3 (2025-10 to 2026-07), plus three controlled `codex exec` captures on 0.137.0 (2026-07-25). Nothing here is invented: every property was observed. Strictness lives in `required`; every object is open (`additionalProperties` defaults to true) because OpenAI owns this format and evolves it continuously. Top-level line types are validated strictly (the set has grown only from 4 to 7 across the whole corpus, so a new one is a signal an importer must see), while `response_item`/`event_msg` payload variants are matched with if/then so unrecognized payload types pass with only `type` required (that set grew from 10 to 34 over the same window). The companion record schema for ~/.codex/session_index.jsonl is $defs/sessionIndexRecord; it is deliberately not a branch of the root oneOf because it lives in a different file.",
+  "oneOf": [
+    { "$ref": "#/$defs/sessionMetaLine" },
+    { "$ref": "#/$defs/responseItemLine" },
+    { "$ref": "#/$defs/eventMsgLine" },
+    { "$ref": "#/$defs/turnContextLine" },
+    { "$ref": "#/$defs/compactedLine" },
+    { "$ref": "#/$defs/worldStateLine" },
+    { "$ref": "#/$defs/interAgentCommunicationMetadataLine" }
+  ],
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+      "description": "UTC ISO-8601 with exactly three fractional digits and a literal Z. 1,510,157 of 1,510,157 lines matched this shape; no other timestamp encoding was observed anywhere in the corpus."
+    },
+
+    "lineEnvelope": {
+      "type": "object",
+      "description": "Every rollout line, in every observed version, is an object with exactly these three keys. No line carried a fourth top-level key.",
+      "required": ["type", "timestamp", "payload"],
+      "properties": {
+        "type": { "type": "string" },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "payload": { "type": "object" }
+      }
+    },
+
+    "sessionMetaLine": {
+      "type": "object",
+      "description": "Session header. Always the first line of a rollout file (964/964 non-empty files). May recur later in the same file: Codex Desktop re-emits it on each resume of the thread (up to 556 occurrences in one file), and a forked thread writes its own meta at line 0 followed by the source thread's meta at line 1.",
+      "required": ["type", "timestamp", "payload"],
+      "allOf": [{ "$ref": "#/$defs/lineEnvelope" }],
+      "properties": {
+        "type": { "const": "session_meta" },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "payload": { "$ref": "#/$defs/sessionMetaPayload" }
+      }
+    },
+
+    "sessionMetaPayload": {
+      "type": "object",
+      "description": "Load-bearing for an importer: `id` is the session identity (it equals the UUID in the rollout filename in 802/802 checked files) and `cwd` is the placement anchor. Everything else is optional-typed; presence varies sharply by version (see notes).",
+      "required": ["id", "cwd"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "UUIDv7 thread id. Matches the filename UUID for the first meta of a file."
+        },
+        "cwd": { "type": "string" },
+        "timestamp": {
+          "$ref": "#/$defs/timestamp",
+          "description": "Session-start instant. Present on 100% of metas but distinct from the envelope timestamp on 5,047 of 5,050 (the envelope is written slightly later)."
+        },
+        "originator": {
+          "type": "string",
+          "description": "Observed: \"Codex Desktop\" (4896), \"codex-tui\" (106), \"codex_cli_rs\" (39), \"xtend\" (4), \"codex_exec\" (2)."
+        },
+        "cli_version": {
+          "type": "string",
+          "description": "Semver, sometimes with an -alpha.N suffix. 46 distinct values observed, 0.46.0 through 0.146.0-alpha.3."
+        },
+        "source": {
+          "description": "String for human-driven sessions (\"vscode\", \"cli\", \"exec\"); object for spawned sub-agent threads. Union is real, not an artifact.",
+          "oneOf": [
+            { "type": "string" },
+            { "$ref": "#/$defs/sessionSourceObject" }
+          ]
+        },
+        "thread_source": {
+          "type": "string",
+          "description": "Observed: \"user\" (4012), \"subagent\" (669). Absent before ~0.129 (366 metas)."
+        },
+        "session_id": {
+          "type": "string",
+          "description": "Redundant duplicate of `id` introduced ~2026-04. Never observed to disagree with `id`."
+        },
+        "parent_thread_id": {
+          "type": "string",
+          "description": "Present on 591 sub-agent session files. Points at the spawning thread's `id`; that thread's rollout file holds the spawn_agent function_call."
+        },
+        "forked_from_id": {
+          "type": "string",
+          "description": "Present when the thread was forked from another. The forked-from thread's own session_meta is replayed as the next line of the same file."
+        },
+        "model_provider": { "type": "string" },
+        "base_instructions": { "$ref": "#/$defs/instructionsBlob" },
+        "instructions": {
+          "type": ["string", "null"],
+          "description": "Pre-0.100 name for the system prompt slot; observed only as null on the single 0.46.0 session. Superseded by base_instructions."
+        },
+        "git": { "$ref": "#/$defs/gitInfo" },
+        "memory_mode": { "type": "string" },
+        "history_mode": { "type": "string" },
+        "multi_agent_version": { "type": "string" },
+        "agent_nickname": {
+          "type": "string",
+          "description": "Human-readable label given to a spawned agent (e.g. a scientist surname). Cosmetic; not an identifier."
+        },
+        "agent_role": { "type": "string" },
+        "agent_path": {
+          "type": "string",
+          "description": "Slash-delimited position of this agent in the multi-agent tree, e.g. \"/root/some_task\". Root is \"/root\"."
+        },
+        "context_window": {
+          "type": "object",
+          "description": "Observed shape: {\"window_id\": \"<uuid>\"}. Correlates with `compacted` lines' window ids.",
+          "properties": { "window_id": { "type": "string" } }
+        },
+        "dynamic_tools": {
+          "type": "array",
+          "description": "Tool/namespace declarations available to the thread. Two observed element shapes: namespace entries {type,name,description,tools} and flat tool entries {name,description,inputSchema[,namespace,deferLoading]}.",
+          "items": { "type": "object" }
+        }
+      }
+    },
+
+    "sessionSourceObject": {
+      "type": "object",
+      "description": "session_meta.payload.source when the thread is a spawned sub-agent (855 files).",
+      "properties": {
+        "subagent": {
+          "description": "Observed as an object with a `thread_spawn` descriptor (711), or as {\"other\": \"<string>\"} (144).",
+          "type": "object",
+          "properties": {
+            "thread_spawn": {
+              "type": "object",
+              "description": "parent_thread_id (711/711) is the spawning thread's id and is the child->parent linkage. agent_path and agent_role are frequently null (675 and 82 of 711 respectively).",
+              "properties": {
+                "parent_thread_id": { "type": "string" },
+                "agent_path": { "type": ["string", "null"] },
+                "agent_nickname": { "type": ["string", "null"] },
+                "agent_role": { "type": ["string", "null"] },
+                "depth": { "type": "integer" }
+              }
+            },
+            "other": { "type": "string" }
+          }
+        }
+      }
+    },
+
+    "instructionsBlob": {
+      "type": "object",
+      "description": "Observed shape is exactly {\"text\": \"<system prompt>\"} on all 5,049 occurrences.",
+      "properties": { "text": { "type": "string" } }
+    },
+
+    "gitInfo": {
+      "type": "object",
+      "description": "Repo context at session start, present on 4,379 metas. Keys observed: branch (4309), commit_hash (4088), repository_url (4088). All three are individually optional.",
+      "properties": {
+        "branch": { "type": "string" },
+        "commit_hash": { "type": "string" },
+        "repository_url": { "type": "string" }
+      }
+    },
+
+    "responseItemLine": {
+      "type": "object",
+      "description": "A model-conversation item: the authoritative content stream. These are the records Codex replays to the model on resume; the parallel event_msg stream is UI-derived. 773,449 lines.",
+      "required": ["type", "timestamp", "payload"],
+      "allOf": [{ "$ref": "#/$defs/lineEnvelope" }],
+      "properties": {
+        "type": { "const": "response_item" },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "payload": { "$ref": "#/$defs/responseItemPayload" }
+      }
+    },
+
+    "responseItemPayload": {
+      "type": "object",
+      "description": "Discriminated by `type`. Observed values, by frequency: function_call, function_call_output, reasoning, message, custom_tool_call_output, custom_tool_call, web_search_call, agent_message, tool_search_call, tool_search_output. `compaction` also occurs, but only nested inside a `compacted` line's replacement_history. Unlisted types validate against the base constraint alone.",
+      "required": ["type"],
+      "properties": { "type": { "type": "string" } },
+      "allOf": [
+        { "if": { "properties": { "type": { "const": "message" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/messagePayload" } },
+        { "if": { "properties": { "type": { "const": "reasoning" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/reasoningPayload" } },
+        { "if": { "properties": { "type": { "const": "function_call" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/functionCallPayload" } },
+        { "if": { "properties": { "type": { "const": "function_call_output" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/functionCallOutputPayload" } },
+        { "if": { "properties": { "type": { "const": "custom_tool_call" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/customToolCallPayload" } },
+        { "if": { "properties": { "type": { "const": "custom_tool_call_output" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/customToolCallOutputPayload" } },
+        { "if": { "properties": { "type": { "const": "web_search_call" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/webSearchCallPayload" } },
+        { "if": { "properties": { "type": { "const": "tool_search_call" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/toolSearchCallPayload" } },
+        { "if": { "properties": { "type": { "const": "tool_search_output" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/toolSearchOutputPayload" } },
+        { "if": { "properties": { "type": { "const": "agent_message" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/interAgentMessagePayload" } }
+      ]
+    },
+
+    "itemProvenance": {
+      "type": "object",
+      "description": "Fields that decorate most response_item payloads without carrying conversation content. `id` is the provider's item id (prefix encodes the kind: msg_, rs_, fc_, fco_, ctc_, ctco_, ws_, tsc_, tso_, amsg_) and is NOT the tool-call linkage key. Turn attribution lives under internal_chat_message_metadata_passthrough (current) or metadata (2026-02..2026-04); both observed only as {\"turn_id\": \"<uuid>\"}.",
+      "properties": {
+        "id": { "type": "string" },
+        "internal_chat_message_metadata_passthrough": {
+          "type": "object",
+          "properties": { "turn_id": { "type": "string" } }
+        },
+        "metadata": {
+          "type": "object",
+          "properties": { "turn_id": { "type": "string" } }
+        },
+        "namespace": { "type": "string" }
+      }
+    },
+
+    "messagePayload": {
+      "type": "object",
+      "description": "A conversation message. 107,526 observed. `content` was an array on 100% of them (never a bare string), and every element was an object.",
+      "required": ["role", "content"],
+      "allOf": [{ "$ref": "#/$defs/itemProvenance" }],
+      "properties": {
+        "role": {
+          "type": "string",
+          "description": "Observed: \"assistant\" (72,907), \"user\" (29,094), \"developer\" (5,525). \"system\" was never observed. Not enumerated so a future role does not fail validation."
+        },
+        "content": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/contentBlock" },
+          "minItems": 1
+        },
+        "phase": {
+          "type": "string",
+          "description": "Observed: \"commentary\" (55,504), \"final_answer\" (17,391). Introduced ~2026-05; absent on older assistant messages."
+        }
+      }
+    },
+
+    "contentBlock": {
+      "type": "object",
+      "description": "Observed block types: input_text (106,007), output_text (72,907), input_image (466). input_text/output_text carry `text`; input_image carries `image_url` (a data: URI in every observed case) and optionally `detail`.",
+      "required": ["type"],
+      "properties": { "type": { "type": "string" } },
+      "allOf": [
+        { "if": { "properties": { "type": { "const": "input_text" } }, "required": ["type"] },
+          "then": { "required": ["text"], "properties": { "text": { "type": "string" } } } },
+        { "if": { "properties": { "type": { "const": "output_text" } }, "required": ["type"] },
+          "then": { "required": ["text"], "properties": { "text": { "type": "string" } } } },
+        { "if": { "properties": { "type": { "const": "input_image" } }, "required": ["type"] },
+          "then": { "required": ["image_url"], "properties": { "image_url": { "type": "string" }, "detail": { "type": "string" } } } },
+        { "if": { "properties": { "type": { "const": "encrypted_content" } }, "required": ["type"] },
+          "then": { "required": ["encrypted_content"], "properties": { "encrypted_content": { "type": "string" } } } }
+      ]
+    },
+
+    "reasoningPayload": {
+      "type": "object",
+      "description": "Model reasoning. 148,195 observed; `encrypted_content` was a non-null string on 100% of them and `summary` was an array on 100% (empty on 131,928 -- i.e. 89% of reasoning items carry no plaintext at all). `content` was present-and-null on 71% and never non-null. The encrypted blob is opaque and account-scoped: it is evidence to preserve, not text to render.",
+      "required": ["summary", "encrypted_content"],
+      "allOf": [{ "$ref": "#/$defs/itemProvenance" }],
+      "properties": {
+        "summary": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/summaryBlock" }
+        },
+        "encrypted_content": { "type": "string" },
+        "content": { "type": ["array", "null"] }
+      }
+    },
+
+    "summaryBlock": {
+      "type": "object",
+      "description": "Only one shape was ever observed: {\"type\": \"summary_text\", \"text\": \"...\"} (30,110 blocks).",
+      "required": ["type"],
+      "properties": { "type": { "type": "string" }, "text": { "type": "string" } },
+      "allOf": [
+        { "if": { "properties": { "type": { "const": "summary_text" } }, "required": ["type"] },
+          "then": { "required": ["text"] } }
+      ]
+    },
+
+    "functionCallPayload": {
+      "type": "object",
+      "description": "A model tool call. LINKAGE KEY IS `call_id`, not `id`: call_id was present on 100% of 209,662 function_calls (always prefixed \"call_\"), while `id` (prefix \"fc_\") appeared on only 11.3% and is the provider item id. `arguments` was a JSON-encoded string on 100% -- never a nested object. Observed names include exec_command, write_stdin, wait, update_plan, view_image, shell, spawn_agent/wait_agent/close_agent/send_input/send_message/list_agents/resume_agent (multi-agent), and mcp__<server>__<tool>.",
+      "required": ["name", "arguments", "call_id"],
+      "allOf": [{ "$ref": "#/$defs/itemProvenance" }],
+      "properties": {
+        "name": { "type": "string" },
+        "arguments": { "type": "string" },
+        "call_id": { "type": "string" },
+        "status": { "type": "string" }
+      }
+    },
+
+    "functionCallOutputPayload": {
+      "type": "object",
+      "description": "Result of a function_call, linked solely by `call_id`. Across 257,456 output records (function/custom/tool_search) the referenced call_id always appeared earlier in the same file; no output ever preceded its call.",
+      "required": ["call_id", "output"],
+      "allOf": [{ "$ref": "#/$defs/itemProvenance" }],
+      "properties": {
+        "call_id": { "type": "string" },
+        "output": { "$ref": "#/$defs/toolOutput" },
+        "name": { "type": "string" }
+      }
+    },
+
+    "customToolCallPayload": {
+      "type": "object",
+      "description": "A freeform (non-JSON-argument) tool call. `input` is raw text, not JSON. Only two names observed: apply_patch (24,073) and exec (23,642). `status` was \"completed\" on 100% of 47,715.",
+      "required": ["call_id", "name", "input"],
+      "allOf": [{ "$ref": "#/$defs/itemProvenance" }],
+      "properties": {
+        "call_id": { "type": "string" },
+        "name": { "type": "string" },
+        "input": { "type": "string" },
+        "status": { "type": "string" }
+      }
+    },
+
+    "customToolCallOutputPayload": {
+      "type": "object",
+      "required": ["call_id", "output"],
+      "allOf": [{ "$ref": "#/$defs/itemProvenance" }],
+      "properties": {
+        "call_id": { "type": "string" },
+        "output": { "$ref": "#/$defs/toolOutput" },
+        "name": { "type": "string" }
+      }
+    },
+
+    "toolOutput": {
+      "description": "Tool output is a bare string (232,885 observed) or an array of content blocks (24,457). Both encodings appear in the same versions and even the same session; an importer must handle the union. No other encoding was observed.",
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "$ref": "#/$defs/contentBlock" } }
+      ]
+    },
+
+    "webSearchCallPayload": {
+      "type": "object",
+      "description": "A hosted web-search tool call. Deliberately requires nothing beyond `type`: 1,906 of 2,366 carried NO id field at all, and none carried `call_id`. When `id` is present (460, prefix \"ws_\") it is what the paired event_msg/web_search_end references in its own `call_id` field -- the only place in the format where an event_msg `call_id` points at a response_item `id`.",
+      "allOf": [{ "$ref": "#/$defs/itemProvenance" }],
+      "properties": {
+        "status": { "type": "string" },
+        "action": { "$ref": "#/$defs/webSearchAction" }
+      }
+    },
+
+    "webSearchAction": {
+      "type": "object",
+      "description": "Observed variants: search {query?,queries?}, open_page {url?}, find_in_page {pattern,url?}.",
+      "properties": {
+        "type": { "type": "string" },
+        "query": { "type": "string" },
+        "queries": { "type": "array", "items": { "type": "string" } },
+        "url": { "type": "string" },
+        "pattern": { "type": "string" }
+      }
+    },
+
+    "toolSearchCallPayload": {
+      "type": "object",
+      "description": "Client-side deferred-tool lookup. Note `arguments` here is an OBJECT ({query, limit}), unlike function_call where it is a JSON string.",
+      "required": ["call_id"],
+      "allOf": [{ "$ref": "#/$defs/itemProvenance" }],
+      "properties": {
+        "call_id": { "type": "string" },
+        "status": { "type": "string" },
+        "execution": { "type": "string", "description": "Observed only \"client\"." },
+        "arguments": { "type": "object" }
+      }
+    },
+
+    "toolSearchOutputPayload": {
+      "type": "object",
+      "description": "Result of a tool_search_call. Carries `tools`, not `output`.",
+      "required": ["call_id"],
+      "allOf": [{ "$ref": "#/$defs/itemProvenance" }],
+      "properties": {
+        "call_id": { "type": "string" },
+        "status": { "type": "string" },
+        "execution": { "type": "string" },
+        "tools": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+
+    "interAgentMessagePayload": {
+      "type": "object",
+      "description": "A message routed between agents in a multi-agent thread tree (response_item type \"agent_message\" -- not to be confused with the UI event of the same name). `author` and `recipient` are agent paths such as \"/root\" and \"/root/<task>\"; both were present on 100% of 413 observations, as was an id with prefix \"amsg_\". Content blocks are input_text and/or encrypted_content. Always accompanied by an adjacent inter_agent_communication_metadata line.",
+      "required": ["content"],
+      "allOf": [{ "$ref": "#/$defs/itemProvenance" }],
+      "properties": {
+        "author": { "type": "string" },
+        "recipient": { "type": "string" },
+        "content": { "type": "array", "items": { "$ref": "#/$defs/contentBlock" } }
+      }
+    },
+
+    "eventMsgLine": {
+      "type": "object",
+      "description": "A UI/telemetry event. Largely a re-rendering of the response_item stream for the transcript view, plus information that exists nowhere else (token accounting, exec/patch results, turn lifecycle, multi-agent activity). 701,177 lines. See notes for which are authoritative and which are skippable noise.",
+      "required": ["type", "timestamp", "payload"],
+      "allOf": [{ "$ref": "#/$defs/lineEnvelope" }],
+      "properties": {
+        "type": { "const": "event_msg" },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "payload": { "$ref": "#/$defs/eventMsgPayload" }
+      }
+    },
+
+    "eventMsgPayload": {
+      "type": "object",
+      "description": "Discriminated by `type`; 24 values observed: token_count, agent_message, agent_reasoning, patch_apply_end, user_message, task_started, task_complete, exec_command_end, web_search_end, mcp_tool_call_end, context_compacted, thread_settings_applied, sub_agent_activity, turn_aborted, collab_agent_spawn_end, thread_name_updated, collab_waiting_end, view_image_tool_call, collab_close_end, item_completed, thread_goal_updated, thread_rolled_back, collab_agent_interaction_end, collab_resume_end. Only the variants an importer plausibly reads are constrained below; the rest validate on `type` alone.",
+      "required": ["type"],
+      "properties": { "type": { "type": "string" } },
+      "allOf": [
+        { "if": { "properties": { "type": { "const": "user_message" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/eventUserMessage" } },
+        { "if": { "properties": { "type": { "const": "agent_message" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/eventAgentMessage" } },
+        { "if": { "properties": { "type": { "const": "agent_reasoning" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/eventAgentReasoning" } },
+        { "if": { "properties": { "type": { "const": "token_count" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/eventTokenCount" } },
+        { "if": { "properties": { "type": { "const": "task_started" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/eventTaskStarted" } },
+        { "if": { "properties": { "type": { "const": "task_complete" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/eventTaskComplete" } },
+        { "if": { "properties": { "type": { "const": "turn_aborted" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/eventTurnAborted" } },
+        { "if": { "properties": { "type": { "const": "exec_command_end" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/eventExecCommandEnd" } },
+        { "if": { "properties": { "type": { "const": "patch_apply_end" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/eventPatchApplyEnd" } },
+        { "if": { "properties": { "type": { "const": "mcp_tool_call_end" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/eventMcpToolCallEnd" } },
+        { "if": { "properties": { "type": { "const": "web_search_end" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/eventWebSearchEnd" } },
+        { "if": { "properties": { "type": { "const": "sub_agent_activity" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/eventSubAgentActivity" } },
+        { "if": { "properties": { "type": { "const": "collab_agent_spawn_end" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/eventCollabAgentSpawnEnd" } },
+        { "if": { "properties": { "type": { "const": "thread_name_updated" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/eventThreadNameUpdated" } },
+        { "if": { "properties": { "type": { "const": "thread_rolled_back" } }, "required": ["type"] },
+          "then": { "$ref": "#/$defs/eventThreadRolledBack" } }
+      ]
+    },
+
+    "eventUserMessage": {
+      "type": "object",
+      "description": "Emitted for operator input. Nothing in the response_item stream distinguishes a real operator turn from a synthetic user-role message (environment_context, AGENTS.md injection, subagent_notification, turn_aborted notices) -- both are message/role=user -- so this event is the primary discriminator, though not an exact one (96% precision / 86% recall against a tag-prefix heuristic; see notes 3.7). 18,507 observed.",
+      "required": ["message"],
+      "properties": {
+        "message": { "type": "string" },
+        "images": { "type": "array", "description": "Inline data: URIs of pasted images." },
+        "local_images": { "type": "array", "items": { "type": "string" }, "description": "Absolute paths to the same images on disk; the files are outside the rollout and may be gone." },
+        "text_elements": { "type": "array" },
+        "audio": { "type": "array" },
+        "local_audio": { "type": "array" },
+        "client_id": { "type": "string" },
+        "kind": { "type": "string", "description": "Only observed on 0.46.0 (\"plain\", 10 lines)." }
+      }
+    },
+
+    "eventAgentMessage": {
+      "type": "object",
+      "description": "UI mirror of assistant output. Does NOT pair 1:1 with message/role=assistant response_items (126,347 events vs 72,907 items): a single assistant response is emitted as several phase-tagged events.",
+      "required": ["message"],
+      "properties": {
+        "message": { "type": "string" },
+        "phase": { "type": "string" },
+        "memory_citation": { "type": ["object", "array", "string", "null"] }
+      }
+    },
+
+    "eventAgentReasoning": {
+      "type": "object",
+      "description": "Plaintext reasoning summary for the UI. Where a response_item/reasoning has an empty `summary`, this event is the only human-readable trace of that reasoning.",
+      "required": ["text"],
+      "properties": { "text": { "type": "string" } }
+    },
+
+    "eventTokenCount": {
+      "type": "object",
+      "description": "Usage and rate-limit snapshot; 366,554 lines, 24% of the entire corpus. Both fields are nullable. This is the only place token usage is recorded.",
+      "properties": {
+        "info": {
+          "type": ["object", "null"],
+          "properties": {
+            "total_token_usage": { "$ref": "#/$defs/tokenUsage" },
+            "last_token_usage": { "$ref": "#/$defs/tokenUsage" },
+            "model_context_window": { "type": ["integer", "null"] }
+          }
+        },
+        "rate_limits": { "type": ["object", "null"] }
+      }
+    },
+
+    "tokenUsage": {
+      "type": "object",
+      "properties": {
+        "input_tokens": { "type": "integer" },
+        "cached_input_tokens": { "type": "integer" },
+        "output_tokens": { "type": "integer" },
+        "reasoning_output_tokens": { "type": "integer" },
+        "total_tokens": { "type": "integer" }
+      }
+    },
+
+    "eventTaskStarted": {
+      "type": "object",
+      "description": "Opens a turn. `turn_id` was present on 100% of 17,311 and is the join key for turn_context and the *_metadata_passthrough turn ids on response items.",
+      "required": ["turn_id"],
+      "properties": {
+        "turn_id": { "type": "string" },
+        "started_at": { "type": "integer", "description": "Unix seconds." },
+        "model_context_window": { "type": ["integer", "null"] },
+        "collaboration_mode_kind": { "type": "string" }
+      }
+    },
+
+    "eventTaskComplete": {
+      "type": "object",
+      "description": "Closes a turn normally. `last_agent_message` is null when the turn produced no assistant text (observed on API-error turns, where the error itself is never persisted to the rollout).",
+      "required": ["turn_id"],
+      "properties": {
+        "turn_id": { "type": "string" },
+        "last_agent_message": { "type": ["string", "null"] },
+        "completed_at": { "type": "integer" },
+        "started_at": { "type": "integer" },
+        "duration_ms": { "type": "integer" },
+        "time_to_first_token_ms": { "type": "integer" }
+      }
+    },
+
+    "eventTurnAborted": {
+      "type": "object",
+      "description": "Closes a turn abnormally (269 observed). An importer must treat any tool call still open at this point as terminated-without-result.",
+      "required": ["turn_id"],
+      "properties": {
+        "turn_id": { "type": "string" },
+        "reason": { "type": "string", "description": "Observed: \"interrupted\"." },
+        "completed_at": { "type": "integer" },
+        "started_at": { "type": "integer" },
+        "duration_ms": { "type": "integer" }
+      }
+    },
+
+    "eventExecCommandEnd": {
+      "type": "object",
+      "description": "Full result of a shell execution, keyed by the originating function_call's `call_id` (resolved to a same-file response_item call on 12,236/12,236). Carries exit_code, stdout/stderr and a parsed command classification that the response_item output string does not.",
+      "required": ["call_id"],
+      "properties": {
+        "call_id": { "type": "string" },
+        "turn_id": { "type": "string" },
+        "process_id": { "type": "string" },
+        "command": { "type": "array", "items": { "type": "string" } },
+        "cwd": { "type": "string" },
+        "parsed_cmd": {
+          "type": "array",
+          "description": "Classifier output; observed element types read {cmd,name,path}, search {cmd,path,query}, list_files {cmd,path}, unknown {cmd}.",
+          "items": { "type": "object" }
+        },
+        "source": { "type": "string" },
+        "stdout": { "type": "string" },
+        "stderr": { "type": "string" },
+        "aggregated_output": { "type": "string" },
+        "formatted_output": { "type": "string" },
+        "exit_code": { "type": "integer" },
+        "duration": { "$ref": "#/$defs/duration" },
+        "status": { "type": "string" }
+      }
+    },
+
+    "eventPatchApplyEnd": {
+      "type": "object",
+      "description": "Result of an apply_patch custom_tool_call. `changes` is a map from absolute file path to a change descriptor; observed descriptor types are update {unified_diff, move_path}, add {content}, delete {content}. 17,507 of 29,399 did NOT resolve to a call_id present in the same file's response_item stream (the calls had been replaced by compaction) -- so this event is often the only surviving record of an edit.",
+      "required": ["call_id"],
+      "properties": {
+        "call_id": { "type": "string" },
+        "turn_id": { "type": "string" },
+        "success": { "type": "boolean" },
+        "status": { "type": "string" },
+        "stdout": { "type": "string" },
+        "stderr": { "type": "string" },
+        "changes": { "type": "object", "additionalProperties": { "type": "object" } }
+      }
+    },
+
+    "eventMcpToolCallEnd": {
+      "type": "object",
+      "description": "MCP tool result. `result` is a tagged union with exactly one of Ok (an MCP CallToolResult) or Err (a string message).",
+      "required": ["call_id"],
+      "properties": {
+        "call_id": { "type": "string" },
+        "invocation": {
+          "type": "object",
+          "properties": {
+            "server": { "type": "string" },
+            "tool": { "type": "string" },
+            "arguments": { "type": ["object", "null"] }
+          }
+        },
+        "duration": { "$ref": "#/$defs/duration" },
+        "result": {
+          "type": "object",
+          "properties": {
+            "Ok": { "type": "object" },
+            "Err": {}
+          }
+        },
+        "connector_id": { "type": "string" },
+        "link_id": { "type": "string" },
+        "app_name": { "type": "string" },
+        "action_name": { "type": "string" }
+      }
+    },
+
+    "eventWebSearchEnd": {
+      "type": "object",
+      "description": "Search results. `call_id` here references a response_item/web_search_call's `id` (prefix \"ws_\"), not a call_id; when the search call carried no id the reference dangles by construction (4,048 of 4,508).",
+      "required": ["call_id"],
+      "properties": {
+        "call_id": { "type": "string" },
+        "query": { "type": "string" },
+        "action": { "$ref": "#/$defs/webSearchAction" },
+        "results": {
+          "type": "array",
+          "description": "Observed element type: text_result {ref_id, title, url, domain, snippet, thumbnail_url} with everything but ref_id/type optional.",
+          "items": { "type": "object" }
+        }
+      }
+    },
+
+    "eventSubAgentActivity": {
+      "type": "object",
+      "description": "Child-thread lifecycle as seen from the parent (2,189 observed, all 2026-07). `agent_thread_id` is the child session's `id` -- i.e. the UUID of the child's own rollout file -- and `event_id` is the parent's spawn/interaction call_id.",
+      "required": ["agent_thread_id", "event_id"],
+      "properties": {
+        "agent_thread_id": { "type": "string" },
+        "event_id": { "type": "string" },
+        "agent_path": { "type": "string" },
+        "kind": { "type": "string", "description": "Observed: \"started\" (324), \"interacted\" (1,865)." },
+        "occurred_at_ms": { "type": "integer" }
+      }
+    },
+
+    "eventCollabAgentSpawnEnd": {
+      "type": "object",
+      "description": "Older (2026-04) multi-agent spawn record. `new_thread_id` is the child session id and is nullable while status is pending_init.",
+      "required": ["call_id", "sender_thread_id"],
+      "properties": {
+        "call_id": { "type": "string" },
+        "sender_thread_id": { "type": "string" },
+        "new_thread_id": { "type": ["string", "null"] },
+        "new_agent_nickname": { "type": "string" },
+        "new_agent_role": { "type": "string" },
+        "prompt": { "type": "string" },
+        "model": { "type": "string" },
+        "reasoning_effort": { "type": "string" },
+        "status": { "type": "string" }
+      }
+    },
+
+    "eventThreadNameUpdated": {
+      "type": "object",
+      "description": "The generated thread title; this is the value mirrored into ~/.codex/session_index.jsonl.",
+      "properties": {
+        "thread_id": { "type": "string" },
+        "thread_name": { "type": "string" }
+      }
+    },
+
+    "eventThreadRolledBack": {
+      "type": "object",
+      "description": "The operator rewound the thread by `num_turns`. The rolled-back lines remain in the file; nothing is deleted. An importer that replays file order without honoring this will resurrect abandoned turns.",
+      "properties": { "num_turns": { "type": "integer" } }
+    },
+
+    "duration": {
+      "type": "object",
+      "description": "Rust Duration serialization.",
+      "properties": {
+        "secs": { "type": "integer" },
+        "nanos": { "type": "integer" }
+      }
+    },
+
+    "turnContextLine": {
+      "type": "object",
+      "description": "Execution settings in force for a turn, written next to the operator input. 25,472 lines against 17,311 task_started events, so not strictly one per turn -- a settings change mid-session emits another.",
+      "required": ["type", "timestamp", "payload"],
+      "allOf": [{ "$ref": "#/$defs/lineEnvelope" }],
+      "properties": {
+        "type": { "const": "turn_context" },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "payload": { "$ref": "#/$defs/turnContextPayload" }
+      }
+    },
+
+    "turnContextPayload": {
+      "type": "object",
+      "description": "Note there is no `type` field inside this payload. `turn_id` is required by nothing: it was absent on the 0.46.0 session (185 lines) and present on every line after. cwd/model/approval_policy/sandbox_policy/effort/summary were present on 100% of observations.",
+      "required": ["cwd"],
+      "properties": {
+        "turn_id": { "type": "string" },
+        "cwd": { "type": "string" },
+        "workspace_roots": { "type": "array", "items": { "type": "string" } },
+        "model": { "type": "string" },
+        "effort": { "type": "string" },
+        "summary": { "type": "string" },
+        "personality": { "type": "string" },
+        "approval_policy": { "type": "string" },
+        "approvals_reviewer": { "type": "string" },
+        "sandbox_policy": {
+          "type": "object",
+          "description": "Discriminator renamed: 0.46.0 used `mode`, every later version uses `type`. Values observed: workspace-write (23,087), read-only (2,385).",
+          "properties": {
+            "type": { "type": "string" },
+            "mode": { "type": "string" },
+            "network_access": { "type": "boolean" },
+            "writable_roots": { "type": "array", "items": { "type": "string" } },
+            "exclude_tmpdir_env_var": { "type": "boolean" },
+            "exclude_slash_tmp": { "type": "boolean" }
+          }
+        },
+        "file_system_sandbox_policy": { "type": "object" },
+        "permission_profile": { "type": "object" },
+        "collaboration_mode": {
+          "type": ["object", "null"],
+          "properties": {
+            "mode": { "type": "string" },
+            "settings": { "type": ["object", "null"] }
+          }
+        },
+        "multi_agent_mode": { "type": "string" },
+        "multi_agent_version": { "type": "string" },
+        "current_date": { "type": "string" },
+        "timezone": { "type": "string" },
+        "realtime_active": { "type": "boolean" },
+        "truncation_policy": { "type": "object" },
+        "comp_hash": { "type": "string" },
+        "trace_id": { "type": "string" },
+        "final_output_json_schema": { "type": "object" },
+        "user_instructions": {
+          "type": ["string", "null"],
+          "description": "Project AGENTS.md content, inlined. Present on turn_context in 2026-02/03; later versions inject it as a synthetic user-role message instead."
+        },
+        "developer_instructions": { "type": ["string", "null"] }
+      }
+    },
+
+    "compactedLine": {
+      "type": "object",
+      "description": "History compaction. The line records the REPLACEMENT history that the model sees from this point on; the pre-compaction response_items remain earlier in the same file. 2,470 lines. An importer that concatenates the file's response_items and then also expands replacement_history will double-count.",
+      "required": ["type", "timestamp", "payload"],
+      "allOf": [{ "$ref": "#/$defs/lineEnvelope" }],
+      "properties": {
+        "type": { "const": "compacted" },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "payload": { "$ref": "#/$defs/compactedPayload" }
+      }
+    },
+
+    "compactedPayload": {
+      "type": "object",
+      "description": "No `type` field inside the payload. `window_id` is an integer in older versions and a UUID string in newer ones -- a real union, not a survey artifact.",
+      "required": ["replacement_history"],
+      "properties": {
+        "message": { "type": "string", "description": "Observed empty on every occurrence." },
+        "replacement_history": {
+          "type": "array",
+          "description": "Bare response_item payloads (no envelope). 409,186 were type=message; 2,470 were type=compaction, a payload type that never appears as a standalone response_item line.",
+          "items": { "$ref": "#/$defs/responseItemPayload" }
+        },
+        "window_id": { "type": ["string", "integer"] },
+        "window_number": { "type": "integer" },
+        "first_window_id": { "type": "string" },
+        "previous_window_id": { "type": "string" }
+      }
+    },
+
+    "worldStateLine": {
+      "type": "object",
+      "description": "Snapshot of ambient context the client injects (environments, AGENTS.md digest, skills/plugins/apps instruction toggles, permissions hash). Client bookkeeping; carries no conversation content. 2,126 lines, first seen 2026-02.",
+      "required": ["type", "timestamp", "payload"],
+      "allOf": [{ "$ref": "#/$defs/lineEnvelope" }],
+      "properties": {
+        "type": { "const": "world_state" },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "full": { "type": "boolean" },
+            "state": { "type": "object" }
+          }
+        }
+      }
+    },
+
+    "interAgentCommunicationMetadataLine": {
+      "type": "object",
+      "description": "Marker written adjacent to a response_item/agent_message saying whether the delivery triggers a turn in the recipient. 413 lines, all 2026-07, 1:1 with response_item/agent_message.",
+      "required": ["type", "timestamp", "payload"],
+      "allOf": [{ "$ref": "#/$defs/lineEnvelope" }],
+      "properties": {
+        "type": { "const": "inter_agent_communication_metadata" },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "payload": {
+          "type": "object",
+          "properties": { "trigger_turn": { "type": "boolean" } }
+        }
+      }
+    },
+
+    "sessionIndexRecord": {
+      "type": "object",
+      "description": "One line of ~/.codex/session_index.jsonl -- a separate file, not a rollout line, hence not a branch of the root oneOf. Append-only and lossy: 700 records covering 681 distinct ids, of which 525 had a live rollout file and 156 did not; 279 rollout files had no index entry at all (notably every `codex exec` run). It is a title cache for the Desktop/TUI picker, NOT an authoritative session inventory. `id` joins to session_meta.payload.id.",
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string" },
+        "thread_name": { "type": "string" },
+        "updated_at": {
+          "type": "string",
+          "description": "ISO-8601 UTC, e.g. \"2026-07-24T00:31:37.883386Z\". Unlike rollout envelope timestamps (3 fractional digits) this field carries 6, so a single timestamp regex cannot cover both files."
+        }
+      }
+    }
+  }
+}

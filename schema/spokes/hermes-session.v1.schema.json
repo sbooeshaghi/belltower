@@ -1,0 +1,232 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://belltower.dev/schemas/spokes/hermes-session/v1.json",
+  "title": "Hermes Agent session document (observed v1)",
+  "description": "Empirically derived schema for Hermes Agent (~/.hermes/sessions/session_<YYYYMMDD_HHMMSS>_<hex6>.json) session logs, as written by hermes-agent's AIAgent._save_session_log (observed with Hermes v0.6.0 / 2026.3.30). One session is one JSON document, atomically rewritten in full after every turn. This schema describes on-disk observed reality; it is deliberately permissive (additionalProperties: true throughout) because the format is foreign and unversioned. Only fields an importer must rely on are required. See hermes-session.v1.notes.md for linkage invariants, persistence semantics, source-code citations, and known drift in newer hermes revisions.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["session_id", "session_start", "model", "messages"],
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "description": "Session identity. Authoritative over the filename: observed convention is YYYYMMDD_HHMMSS_<hex6> and filenames are session_<session_id>.json, but the embedded id and the filename disagreed in 1 of 12 observed files (aborted first turn), and the source allows caller-supplied ids, so no pattern is enforced.",
+      "examples": ["20260101_120000_ab12cd"]
+    },
+    "model": {
+      "type": "string",
+      "description": "Model identifier as sent to the inference endpoint, at last save. Document-level: a mid-session model switch retroactively relabels the whole document.",
+      "examples": ["gpt-5.4", "qwen3.5:latest"]
+    },
+    "base_url": {
+      "type": "string",
+      "description": "Inference endpoint base URL at last save. Observed values include the ChatGPT Codex backend (https://chatgpt.com/backend-api/codex, driven via the Responses API even though this log stays chat-completions shaped) and local OpenAI-compatible servers (LM Studio, Ollama)."
+    },
+    "platform": {
+      "type": "string",
+      "description": "Frontend that hosted the session. Only \"cli\" observed; the source also tags gateway/messaging platforms via the same field.",
+      "examples": ["cli"]
+    },
+    "session_start": {
+      "type": "string",
+      "description": "Naive local-time ISO-8601 timestamp with microseconds and NO timezone offset (e.g. 2026-01-01T12:00:00.123456), so not RFC 3339 date-time. Set once at agent construction.",
+      "examples": ["2026-01-01T12:00:00.123456"]
+    },
+    "last_updated": {
+      "type": "string",
+      "description": "Same naive local-time format as session_start. Refreshed on every full-document rewrite (every turn)."
+    },
+    "system_prompt": {
+      "type": "string",
+      "description": "Full rendered system prompt (persona + instructions) embedded per session; empty string when unavailable. Typically tens of KB. Never appears as a messages[] entry on disk; hermes prepends it to the outgoing API request only."
+    },
+    "tools": {
+      "type": "array",
+      "description": "OpenAI function-spec array for the tools enabled at last save (a snapshot; count may vary between sessions). Re-embedded in full on every rewrite.",
+      "items": { "$ref": "#/$defs/tool_spec" }
+    },
+    "message_count": {
+      "type": "integer",
+      "description": "Writer-maintained count; equal to messages.length in all observed files. Hermes uses it as a no-shrink guard: a rewrite carrying fewer messages than the existing file is skipped. Importers should recompute rather than trust it."
+    },
+    "messages": {
+      "type": "array",
+      "description": "Whole conversation in OpenAI chat-completions message shape, in chronological order (array order is the only ordering; individual messages carry no timestamps). First message was role \"user\" in every observed file; a session may end on any role, including a lone user message from an aborted turn.",
+      "items": { "$ref": "#/$defs/message" }
+    }
+  },
+  "$defs": {
+    "message": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["role"],
+      "properties": {
+        "role": {
+          "type": "string",
+          "description": "Discriminator. Observed values: \"user\", \"assistant\", \"tool\". Kept an open string because the writer's docstring reserves injected system messages, though none were observed on disk.",
+          "examples": ["user", "assistant", "tool"]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "role": { "const": "user" } }, "required": ["role"] },
+          "then": { "$ref": "#/$defs/user_message" }
+        },
+        {
+          "if": { "properties": { "role": { "const": "assistant" } }, "required": ["role"] },
+          "then": { "$ref": "#/$defs/assistant_message" }
+        },
+        {
+          "if": { "properties": { "role": { "const": "tool" } }, "required": ["role"] },
+          "then": { "$ref": "#/$defs/tool_message" }
+        }
+      ]
+    },
+    "user_message": {
+      "description": "Operator input. Observed with exactly {role, content}; transient bookkeeping keys (e.g. a memory-flush sentinel) exist in source and are tolerated.",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["content"],
+      "properties": {
+        "content": { "type": "string" }
+      }
+    },
+    "assistant_message": {
+      "description": "Model output turn. content is always a string, often \"\" on pure tool-call turns (the writer coalesces null to \"\"); it may contain literal <think>...</think> blocks for models that inline reasoning. reasoning/finish_reason are present on the normal writer path but omitted on some fallback paths in source, so they are optional here.",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["content"],
+      "properties": {
+        "content": { "type": "string" },
+        "reasoning": {
+          "type": ["string", "null"],
+          "description": "Extracted reasoning/thinking text, or null when the model produced none. Observed union. May duplicate <think> blocks embedded in content."
+        },
+        "reasoning_content": {
+          "type": "string",
+          "description": "Rare (1 of 27 observed assistant messages): provider-style duplicate of reasoning, seen with a local OpenAI-compatible backend."
+        },
+        "finish_reason": {
+          "type": "string",
+          "description": "Observed: \"stop\", \"tool_calls\". Source can also record \"incomplete\" (Codex reasoning-only turns).",
+          "examples": ["stop", "tool_calls"]
+        },
+        "tool_calls": {
+          "type": "array",
+          "description": "Present iff the turn requested tools (1-2 calls observed per turn; more are possible). Each call's id is answered by a later role:\"tool\" message whose tool_call_id matches.",
+          "items": { "$ref": "#/$defs/tool_call" }
+        },
+        "codex_reasoning_items": {
+          "type": "array",
+          "description": "Codex Responses API reasoning items preserved for multi-turn continuity; opaque to importers.",
+          "items": { "$ref": "#/$defs/codex_reasoning_item" }
+        }
+      }
+    },
+    "tool_message": {
+      "description": "Tool result. content is always a string, commonly stringified JSON like {\"output\": ...}; hermes may append budget warnings, a truncation marker beyond 100k chars, or substitute bracketed synthetic strings for cancelled/unavailable results.",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["content", "tool_call_id"],
+      "properties": {
+        "content": { "type": "string" },
+        "tool_call_id": {
+          "type": "string",
+          "description": "Must equal the id of a tool_call in a preceding assistant message (1:1 in-order linkage; held in every observed file)."
+        }
+      }
+    },
+    "tool_call": {
+      "description": "One requested tool invocation. All observed calls carried exactly {id, call_id, response_item_id, type, function} with id == call_id; only id and function are load-bearing for import. Newer hermes revisions may add extra_content (provider continuity blobs).",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "function"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Call identity referenced by the matching tool message's tool_call_id. Provider-issued (e.g. call_<opaque>) or hermes-synthesized deterministic fallback (call_<sha256-12>).",
+          "examples": ["call_ab12cd34ef56"]
+        },
+        "call_id": {
+          "type": "string",
+          "description": "Duplicate of id in every observed call (Responses-API bookkeeping)."
+        },
+        "response_item_id": {
+          "type": "string",
+          "description": "Codex Responses function_call item id, always fc_-prefixed in observed data; synthesized from the call id (call_ -> fc_) for non-Codex backends.",
+          "examples": ["fc_ab12cd34ef56"]
+        },
+        "type": {
+          "type": "string",
+          "description": "Only \"function\" observed.",
+          "examples": ["function"]
+        },
+        "function": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["name", "arguments"],
+          "properties": {
+            "name": { "type": "string" },
+            "arguments": {
+              "type": "string",
+              "description": "JSON-encoded arguments object as a string (chat-completions convention); the source coerces non-strings before saving."
+            }
+          }
+        }
+      }
+    },
+    "codex_reasoning_item": {
+      "description": "Opaque encrypted reasoning item from the Codex Responses API, replayed verbatim on later turns. Preserve byte-exact; only summary[].text is human-readable. No field is load-bearing for import.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Only \"reasoning\" observed.",
+          "examples": ["reasoning"]
+        },
+        "id": {
+          "type": "string",
+          "description": "Responses item id, rs_-prefixed in observed data.",
+          "examples": ["rs_0abc123"]
+        },
+        "encrypted_content": {
+          "type": "string",
+          "description": "Opaque ciphertext blob; not decryptable by importers."
+        },
+        "summary": {
+          "type": "array",
+          "description": "Human-readable reasoning summaries; empty array observed when the model produced none.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "type": { "type": "string", "examples": ["summary_text"] },
+              "text": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "tool_spec": {
+      "description": "OpenAI function tool definition, embedded verbatim. Not load-bearing for import; kept for tool-availability provenance.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "type": { "type": "string", "examples": ["function"] },
+        "function": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "name": { "type": "string" },
+            "description": { "type": "string" },
+            "parameters": {
+              "type": "object",
+              "additionalProperties": true,
+              "description": "JSON-Schema-ish parameter spec: {type: \"object\", properties: {...}} with required[] present on most but not all observed tools."
+            }
+          }
+        }
+      }
+    }
+  }
+}
