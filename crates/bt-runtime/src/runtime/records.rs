@@ -415,6 +415,9 @@ impl BelltowerRuntime {
             SpanKind::Chain,
             EventPayload::ContextCompacted {
                 compaction_id: report.compaction_id,
+                window_number: report.window_number,
+                previous_compaction_id: report.previous_compaction_id,
+                first_compaction_id: report.first_compaction_id,
                 trigger: report.trigger,
                 phase: report.phase,
                 status: report.status,

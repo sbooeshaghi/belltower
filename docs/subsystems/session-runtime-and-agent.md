@@ -355,9 +355,44 @@ Compaction ownership needs to stay split cleanly between `bt-runtime` and `bt-co
 
 The clean model is:
 
-- `bt-context` owns prompt shaping, token budgeting, and compaction algorithms
+- `bt-context` owns prompt shaping, token budgeting, and the compaction
+  policy (trigger math, retention selection, summary composition); it is
+  pure — the runtime supplies provider-observed usage and previous-summary
+  chain state as inputs
 - the runtime assembles the prompt-ready history for the next turn
-- if that history does not fit the effective budget, the runtime invokes compaction before calling the agent
+- compaction fires proactively when provider-observed context tokens (the
+  last real `completion.finished` usage total on the branch plus a bytes/4
+  estimate of messages appended since) exceed
+  `context.compaction_trigger_fraction` (default 0.9) of the model window;
+  the whole-history estimate remains the hard fit guarantee and the
+  fallback when no prior completion exists. The check runs in the
+  orchestrator preflight for the initial turn and for every continuation
+  dispatch. A model downshift is handled by the same pre-turn detection:
+  usage observed under the old model is compared against the new model's
+  window at the next preflight, so shrinking the window forces a
+  compaction before the next completion (the sync settings-change path has
+  no provider seam, so no separate downshift hook exists)
+- retention is a sliding window on the canonical substrate: pinned system
+  prefix, then older real user messages verbatim (newest-first within
+  `context.compaction_user_message_budget_tokens`, default 20k), then the
+  summary as a system message, then the recent tail verbatim (all roles).
+  Cuts land only at message-unit boundaries: a tool_use and its
+  tool_result — including approval-paused calls with interposed messages —
+  are one indivisible unit and are never split
+- the summary is model-written: the orchestrator preflight runs a
+  summarization completion via the normal provider seam (same connection;
+  model from `context.summarizer_model`, defaulting to the turn's model)
+  over the dropped messages plus any previous summary, recorded
+  canonically as `completion.requested`/`completion.chunk`/
+  `completion.finished` under the reserved context-maintenance
+  `llm_call_ordinal` 0 so it is auditable and cost-accounted. Any
+  summarizer failure falls back to the deterministic digest — compaction
+  never fails a turn. Summaries are always plaintext
+- composition is a chain, not a stack: the previous summary (from the last
+  `context.compacted` event, plus any marker-prefixed summary message
+  found in history) is folded into the new summarization input and never
+  retained alongside the new summary. Manual `/compact` keeps working on
+  the synchronous path with the deterministic digest
 - provider/auth/model preflight happens before runtime records model-visible
   context mutations such as `context.compacted`; a provider path that cannot
   execute records a durable failure instead of leaving a successful compaction
@@ -367,24 +402,29 @@ The clean model is:
 Compaction must remain a canonical event and record:
 
 - a stable compaction id
+- the window chain: window number plus previous/first compaction ids on the branch
 - whether compaction was forced or token-budget driven
 - whether the compaction happened as manual operator work or as pre-turn context preparation
 - completed or failed status
 - provider and model for the prepared request
 - the context boundary sequence id used for the prepared request
 - the synthetic summary message id
-- the first kept message id, branch id, and sequence id when known
+- the first kept message id, branch id, and sequence id — message-id refs
+  are mandatory (seq ids are stripped from portable bundles)
 - compaction latency
 - what was dropped or summarized
-- the replacement summary
+- the replacement summary (and, in `reason`, whether it was model-written
+  or the digest fallback)
 - token/message accounting before and after
 - preserved file-read and file-modified metadata
 
 When compaction succeeds, `bt-context` constructs the synthetic system summary
-message and returns its message id. `bt-runtime` assigns the durable
-`compaction_id`, records `context.compacted`, and records a model-visible
-compaction attachment in the following context manifest. `bt-agent` only sees
-the prepared provider request; it does not decide or persist compaction.
+message (its text begins with the stable `[compaction summary]` marker) and
+returns its message id. `bt-runtime` assigns the durable `compaction_id`,
+derives the window chain from the branch's previous `context.compacted`
+event, records `context.compacted`, and records a model-visible compaction
+attachment in the following context manifest. `bt-agent` only sees the
+prepared provider request; it does not decide or persist compaction.
 
 ## Branching Model
 

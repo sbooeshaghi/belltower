@@ -10,6 +10,55 @@ fn related_message_context_text(message: &RelatedSessionMessage) -> String {
     )
 }
 
+/// Observed-context input for a prepare call: compute from the store now, or
+/// reuse a value already computed by the plan phase so the trigger decision
+/// stays consistent across plan -> summarize -> build (the recorded
+/// summarization completion must not shift the observation).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum ObservedContextTokensInput {
+    #[default]
+    Compute,
+    Provided(Option<u64>),
+}
+
+/// Compaction inputs threaded from the orchestrator preflight into the final
+/// context build.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TurnContextCompactionInputs {
+    pub(crate) observed_context_tokens: ObservedContextTokensInput,
+    /// Model-written summary body from the recorded summarization
+    /// completion; `None` falls back to the deterministic digest.
+    pub(crate) summary_override: Option<String>,
+    /// Appended to the recorded compaction reason (summarizer provenance or
+    /// fallback cause).
+    pub(crate) reason_suffix: Option<String>,
+}
+
+/// Plan-phase output for one preflight: the frozen observation plus the
+/// summarization work (when the trigger fires and there is content to
+/// summarize).
+#[derive(Clone, Debug)]
+pub(crate) struct TurnContextPlan {
+    pub(crate) observed_context_tokens: Option<u64>,
+    pub(crate) summarization: Option<TurnContextSummarizationPlan>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TurnContextSummarizationPlan {
+    pub(crate) transcript: String,
+    pub(crate) summary_budget_tokens: u64,
+    pub(crate) summarizer_model: String,
+}
+
+/// Chain state of the most recent `context.compacted` event on a branch.
+struct PreviousCompactionState {
+    /// Number of `context.compacted` events already on the branch.
+    count: u64,
+    last_compaction_id: bt_core::CompactionId,
+    first_compaction_id: bt_core::CompactionId,
+    summary: String,
+}
+
 impl BelltowerRuntime {
     pub(crate) fn context_message_sources_for_request(
         &self,
@@ -151,7 +200,134 @@ impl BelltowerRuntime {
             turn_id,
             settings_revision_id,
             force_compaction,
+            TurnContextCompactionInputs::default(),
         )
+    }
+
+    /// Provider-observed context size for the branch: the usage total of the
+    /// last real (non-maintenance) `completion.finished` on this branch plus
+    /// an estimate of the messages appended after it. `None` when no prior
+    /// real completion exists.
+    fn observed_context_tokens(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        context_messages: &[ContextMessageRecord],
+    ) -> Result<Option<u64>> {
+        let finished = self.events_of_kind(session_id, "completion.finished", Some(branch_id))?;
+        let last = finished
+            .iter()
+            .rev()
+            .find_map(|event| match &event.payload {
+                EventPayload::CompletionFinished {
+                    llm_call_ordinal,
+                    usage,
+                    ..
+                } if *llm_call_ordinal != bt_core::CONTEXT_MAINTENANCE_LLM_CALL_ORDINAL => {
+                    Some((event.seq_id, usage.total_tokens))
+                }
+                _ => None,
+            });
+        let Some((boundary_seq_id, base_tokens)) = last else {
+            return Ok(None);
+        };
+        let Some(boundary_seq_id) = boundary_seq_id else {
+            return Ok(Some(base_tokens));
+        };
+        let appended_tokens: u64 = context_messages
+            .iter()
+            .filter(|record| {
+                record
+                    .source_seq_id
+                    .is_some_and(|seq_id| seq_id > boundary_seq_id)
+            })
+            .map(|record| {
+                bt_context::estimate_messages_tokens(std::slice::from_ref(&record.message))
+            })
+            .sum();
+        Ok(Some(base_tokens.saturating_add(appended_tokens)))
+    }
+
+    /// Chain state from the most recent `context.compacted` event on the
+    /// branch (kind-indexed lookup, never a full log replay).
+    fn previous_compaction_state(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+    ) -> Result<Option<PreviousCompactionState>> {
+        let events = self.events_of_kind(session_id, "context.compacted", Some(branch_id))?;
+        let mut compactions = events.iter().filter_map(|event| match &event.payload {
+            EventPayload::ContextCompacted {
+                compaction_id,
+                first_compaction_id,
+                summary,
+                ..
+            } => Some((*compaction_id, *first_compaction_id, summary.clone())),
+            _ => None,
+        });
+        let Some(first) = compactions.next() else {
+            return Ok(None);
+        };
+        let count = 1 + compactions.clone().count() as u64;
+        let last = compactions.last().unwrap_or_else(|| first.clone());
+        Ok(Some(PreviousCompactionState {
+            count,
+            last_compaction_id: last.0,
+            // Legacy events predate the chain fields; the branch's first
+            // compaction is the chain root by construction.
+            first_compaction_id: last.1.unwrap_or(first.0),
+            summary: last.2,
+        }))
+    }
+
+    /// Plan phase of a turn preflight: loads the branch context once,
+    /// computes the provider-observed size, and — when the compaction
+    /// trigger fires — describes the summarization completion the
+    /// orchestrator should run. Pure with respect to the store: nothing is
+    /// recorded here.
+    pub(crate) fn plan_turn_context_compaction(
+        &self,
+        session: &SessionRecord,
+        branch: &BranchRecord,
+        connection: &ConnectionDescriptor,
+        model_id: &str,
+        system_prompt: Option<&str>,
+        force_compaction: bool,
+    ) -> Result<TurnContextPlan> {
+        let context_messages =
+            self.load_context_messages_with_related_sessions(session.session_id, branch.branch_id)?;
+        let observed =
+            self.observed_context_tokens(session.session_id, branch.branch_id, &context_messages)?;
+        let previous = self.previous_compaction_state(session.session_id, branch.branch_id)?;
+        let messages = context_messages
+            .into_iter()
+            .map(|record| record.message)
+            .collect::<Vec<_>>();
+        let assembler = ContextAssembler::new(self.config.clone())?;
+        let summarizer_model = self
+            .config
+            .context
+            .summarizer_model
+            .clone()
+            .unwrap_or_else(|| model_id.to_owned());
+        let plan = assembler.plan_compaction(
+            &connection.provider,
+            model_id,
+            &summarizer_model,
+            system_prompt,
+            &messages,
+            force_compaction,
+            observed,
+            previous.as_ref().map(|state| state.summary.as_str()),
+        );
+        Ok(TurnContextPlan {
+            observed_context_tokens: observed,
+            summarization: plan.map(|plan| TurnContextSummarizationPlan {
+                transcript: plan.summarization_transcript,
+                summary_budget_tokens: plan.summary_budget_tokens,
+                summarizer_model,
+            }),
+        })
     }
 
     pub(crate) fn prepare_turn_context_for_resolved_settings(
@@ -166,9 +342,20 @@ impl BelltowerRuntime {
         turn_id: Option<TurnId>,
         settings_revision_id: u64,
         force_compaction: bool,
+        compaction_inputs: TurnContextCompactionInputs,
     ) -> Result<PreparedTurnContext> {
         let context_messages =
             self.load_context_messages_with_related_sessions(session.session_id, branch.branch_id)?;
+        let observed_context_tokens = match compaction_inputs.observed_context_tokens {
+            ObservedContextTokensInput::Compute => self.observed_context_tokens(
+                session.session_id,
+                branch.branch_id,
+                &context_messages,
+            )?,
+            ObservedContextTokensInput::Provided(value) => value,
+        };
+        let previous_compaction =
+            self.previous_compaction_state(session.session_id, branch.branch_id)?;
         let context_boundary_seq_id = context_messages
             .iter()
             .filter_map(|record| record.source_seq_id)
@@ -197,7 +384,14 @@ impl BelltowerRuntime {
             messages,
             tools,
             thinking,
-            force_compaction,
+            bt_context::ContextBuildOptions {
+                force_compaction,
+                observed_context_tokens,
+                previous_summary: previous_compaction
+                    .as_ref()
+                    .map(|state| state.summary.clone()),
+                summary_override: compaction_inputs.summary_override,
+            },
         );
         let build_latency_ms =
             u64::try_from(build_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -212,6 +406,22 @@ impl BelltowerRuntime {
             report.model = Some(model_id.clone());
             report.context_boundary_seq_id = context_boundary_seq_id;
             report.latency_ms = Some(build_latency_ms);
+            report.window_number = Some(
+                previous_compaction
+                    .as_ref()
+                    .map(|state| state.count)
+                    .unwrap_or(0)
+                    + 1,
+            );
+            report.previous_compaction_id = previous_compaction
+                .as_ref()
+                .map(|state| state.last_compaction_id);
+            report.first_compaction_id = Some(
+                previous_compaction
+                    .as_ref()
+                    .map(|state| state.first_compaction_id)
+                    .unwrap_or(report.compaction_id),
+            );
             if let Some(message_id) = report.first_kept_message_id
                 && let Some(source) = message_sources
                     .iter()
@@ -219,6 +429,17 @@ impl BelltowerRuntime {
             {
                 report.first_kept_branch_id = Some(source.branch_id);
                 report.first_kept_seq_id = Some(source.seq_id);
+            }
+            // Portable identity lives in message ids; the branch ref must
+            // always accompany them (seq ids are stripped from bundles).
+            if report.first_kept_branch_id.is_none() {
+                report.first_kept_branch_id = Some(branch.branch_id);
+            }
+            if let Some(suffix) = &compaction_inputs.reason_suffix {
+                report.reason = Some(match report.reason.take() {
+                    Some(base) => format!("{base}; {suffix}"),
+                    None => suffix.clone(),
+                });
             }
             report
         });

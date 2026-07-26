@@ -20,6 +20,16 @@ pub struct ServerConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ContextConfig {
     pub compaction_threshold: f32,
+    /// Fraction of the model context window at which proactive compaction
+    /// fires when provider-observed usage is available. Must satisfy
+    /// `0 < fraction <= 1`.
+    pub compaction_trigger_fraction: f64,
+    /// Verbatim retention budget (estimated tokens) for older real user
+    /// messages kept across a compaction, selected newest-first.
+    pub compaction_user_message_budget_tokens: u64,
+    /// Model used for the recorded compaction summarization call. `None`
+    /// falls back to the turn's model on the same connection.
+    pub summarizer_model: Option<String>,
     pub reserve_tokens: u64,
     pub max_tool_result_lines: usize,
     pub max_tool_result_bytes: usize,
@@ -251,6 +261,9 @@ struct PartialServerConfig {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct PartialContextConfig {
     compaction_threshold: Option<f32>,
+    compaction_trigger_fraction: Option<f64>,
+    compaction_user_message_budget_tokens: Option<u64>,
+    summarizer_model: Option<String>,
     reserve_tokens: Option<u64>,
     max_tool_result_lines: Option<usize>,
     max_tool_result_bytes: Option<usize>,
@@ -377,6 +390,9 @@ impl BelltowerConfig {
             },
             context: ContextConfig {
                 compaction_threshold: 0.75,
+                compaction_trigger_fraction: 0.9,
+                compaction_user_message_budget_tokens: 20_000,
+                summarizer_model: None,
                 reserve_tokens: 16_384,
                 max_tool_result_lines: 2_000,
                 max_tool_result_bytes: 51_200,
@@ -472,6 +488,20 @@ impl BelltowerConfig {
         if let Some(context) = partial.context {
             if let Some(threshold) = context.compaction_threshold {
                 self.context.compaction_threshold = threshold;
+            }
+            if let Some(fraction) = context.compaction_trigger_fraction {
+                if !(fraction > 0.0 && fraction <= 1.0) {
+                    return Err(BelltowerError::Config(format!(
+                        "context.compaction_trigger_fraction must satisfy 0 < fraction <= 1, got {fraction}"
+                    )));
+                }
+                self.context.compaction_trigger_fraction = fraction;
+            }
+            if let Some(budget) = context.compaction_user_message_budget_tokens {
+                self.context.compaction_user_message_budget_tokens = budget;
+            }
+            if let Some(summarizer_model) = context.summarizer_model {
+                self.context.summarizer_model = trimmed_optional_string(summarizer_model);
             }
             if let Some(tokens) = context.reserve_tokens {
                 self.context.reserve_tokens = tokens;
@@ -731,6 +761,9 @@ fn reject_unknown_override_keys(raw_toml: &str) -> Result<()> {
         "context",
         &[
             "compaction_threshold",
+            "compaction_trigger_fraction",
+            "compaction_user_message_budget_tokens",
+            "summarizer_model",
             "reserve_tokens",
             "max_tool_result_lines",
             "max_tool_result_bytes",
@@ -1420,6 +1453,40 @@ auth_methods = [{ id = "custom_api_key", kind = "api_key", label = "API key", su
             message.contains("connections.custom.auth_methods[0].support_refresh"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn context_compaction_overrides_apply_and_validate_fraction() {
+        let mut config = BelltowerConfig::from_embedded().expect("embedded config");
+        assert_eq!(config.context.compaction_trigger_fraction, 0.9);
+        assert_eq!(config.context.compaction_user_message_budget_tokens, 20_000);
+        assert_eq!(config.context.summarizer_model, None);
+
+        config
+            .apply_overrides(
+                r#"
+[context]
+compaction_trigger_fraction = 0.8
+compaction_user_message_budget_tokens = 4096
+summarizer_model = "qwen3:0.6b"
+"#,
+            )
+            .expect("valid context overrides");
+        assert_eq!(config.context.compaction_trigger_fraction, 0.8);
+        assert_eq!(config.context.compaction_user_message_budget_tokens, 4_096);
+        assert_eq!(
+            config.context.summarizer_model.as_deref(),
+            Some("qwen3:0.6b")
+        );
+
+        let error = config
+            .apply_overrides("[context]\ncompaction_trigger_fraction = 0.0\n")
+            .expect_err("zero fraction must be rejected");
+        assert!(error.to_string().contains("compaction_trigger_fraction"));
+        let error = config
+            .apply_overrides("[context]\ncompaction_trigger_fraction = 1.5\n")
+            .expect_err("fraction above one must be rejected");
+        assert!(error.to_string().contains("compaction_trigger_fraction"));
     }
 
     #[test]

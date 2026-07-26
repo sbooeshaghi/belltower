@@ -243,6 +243,18 @@ pub enum EventPayload {
         #[serde(default)]
         #[schemars(skip_serializing_if = "crate::schema_support::omit_nondeterministic_default")]
         compaction_id: CompactionId,
+        /// 1-based compaction window ordinal on this branch: how many
+        /// compactions (including this one) have been recorded on the branch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_number: Option<u64>,
+        /// `compaction_id` of the previous `context.compacted` event on this
+        /// branch, forming the window chain.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_compaction_id: Option<CompactionId>,
+        /// `compaction_id` of the first `context.compacted` event in this
+        /// branch's window chain (self-referential for the first window).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        first_compaction_id: Option<CompactionId>,
         #[serde(default)]
         trigger: ContextCompactionTrigger,
         #[serde(default)]

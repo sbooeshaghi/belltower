@@ -2062,6 +2062,14 @@
                   },
                   "type": "array"
                 },
+                "first_compaction_id": {
+                  "description": "`compaction_id` of the first `context.compacted` event in this\nbranch's window chain (self-referential for the first window).",
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "first_kept_branch_id": {
                   "format": "uuid",
                   "type": [
@@ -2112,6 +2120,14 @@
                   "$ref": "#/$defs/ContextCompactionPhase",
                   "default": "pre_turn"
                 },
+                "previous_compaction_id": {
+                  "description": "`compaction_id` of the previous `context.compacted` event on this\nbranch, forming the window chain.",
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "provider": {
                   "type": [
                     "string",
@@ -2152,6 +2168,15 @@
                 "trigger": {
                   "$ref": "#/$defs/ContextCompactionTrigger",
                   "default": "token_budget"
+                },
+                "window_number": {
+                  "description": "1-based compaction window ordinal on this branch: how many\ncompactions (including this one) have been recorded on the branch.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 }
               },
               "required": [

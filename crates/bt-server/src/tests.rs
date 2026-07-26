@@ -2438,6 +2438,204 @@ async fn compact_route_runs_runtime_owned_compaction() {
 }
 
 #[tokio::test]
+async fn proactive_compaction_records_model_summary_and_session_continues() {
+    let mock_provider = spawn_mock_compaction_provider().await;
+    let server = spawn_server(config_for_mock_provider(&mock_provider.base_url)).await;
+    let client = Client::new();
+    let api = api_client(&server);
+
+    let created: CreateSessionResponse = server
+        .request(&client, Method::POST, "sessions")
+        .json(&CreateSessionRequest {
+            approval_mode: None,
+            project_root: "/tmp/project".to_owned(),
+            connection_id: ConnectionId::new("local"),
+            model_id: None,
+            tool_mode: None,
+            display_name: Some("proactive-compaction".to_owned()),
+            objective: None,
+            budget: None,
+        })
+        .send()
+        .await
+        .expect("create session")
+        .json()
+        .await
+        .expect("create session body");
+
+    // Turn 1: the provider reports 190k used tokens against o4-mini's 200k
+    // window, putting the session past the 0.9 proactive threshold.
+    let send = server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/message", created.session.session_id),
+        )
+        .json(&SendMessageRequest {
+            branch_id: created.branch.branch_id,
+            message: Message::text(Role::User, "first question"),
+        })
+        .send()
+        .await
+        .expect("send first message");
+    assert_eq!(send.status(), StatusCode::ACCEPTED);
+    settle(&api, created.session.session_id).await;
+
+    // Turn 2: preflight must compact with a recorded model-written summary
+    // before the turn's own completion, and the turn must still succeed.
+    let send = server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/message", created.session.session_id),
+        )
+        .json(&SendMessageRequest {
+            branch_id: created.branch.branch_id,
+            message: Message::text(Role::User, "second question"),
+        })
+        .send()
+        .await
+        .expect("send second message");
+    assert_eq!(send.status(), StatusCode::ACCEPTED);
+    let state = settle(&api, created.session.session_id).await;
+    assert_eq!(state, SessionRuntimeState::Idle);
+
+    let events = server
+        .runtime
+        .all_events(created.session.session_id)
+        .expect("events after compaction turn");
+
+    let compacted = events
+        .iter()
+        .find(|event| matches!(event.payload, EventPayload::ContextCompacted { .. }))
+        .expect("context compacted event");
+    let compacted_turn_id = compacted.turn_id.expect("compaction is turn-scoped");
+    match &compacted.payload {
+        EventPayload::ContextCompacted {
+            compaction_id,
+            window_number,
+            previous_compaction_id,
+            first_compaction_id,
+            trigger,
+            phase,
+            reason,
+            summary_message_id,
+            first_kept_message_id,
+            first_kept_branch_id,
+            summary,
+            ..
+        } => {
+            assert_eq!(*trigger, ContextCompactionTrigger::TokenBudget);
+            assert_eq!(*phase, ContextCompactionPhase::PreTurn);
+            assert_eq!(*window_number, Some(1));
+            assert_eq!(*previous_compaction_id, None);
+            assert_eq!(*first_compaction_id, Some(*compaction_id));
+            assert!(
+                summary_message_id.is_some(),
+                "registry rule: message-id refs"
+            );
+            assert!(first_kept_message_id.is_some());
+            assert_eq!(*first_kept_branch_id, Some(created.branch.branch_id));
+            assert!(
+                summary.contains("MOCK MODEL SUMMARY"),
+                "the model-written summary is recorded, not the digest: {summary}"
+            );
+            assert!(
+                reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("summary=model:o4-mini")),
+                "reason carries summarizer provenance: {reason:?}"
+            );
+        }
+        _ => unreachable!("matched context compacted payload"),
+    }
+
+    // The summarization completion is recorded canonically at the reserved
+    // maintenance ordinal: requested -> chunks -> finished, before the
+    // compaction record and the turn's own (ordinal 1) completion.
+    let summarizer_requested = events
+        .iter()
+        .find(|event| {
+            matches!(
+                event.payload,
+                EventPayload::CompletionRequested {
+                    llm_call_ordinal: 0,
+                    ..
+                }
+            )
+        })
+        .expect("summarization completion.requested");
+    let summarizer_finished = events
+        .iter()
+        .find(|event| {
+            matches!(
+                event.payload,
+                EventPayload::CompletionFinished {
+                    llm_call_ordinal: 0,
+                    ..
+                }
+            )
+        })
+        .expect("summarization completion.finished");
+    assert!(
+        events.iter().any(|event| matches!(
+            event.payload,
+            EventPayload::CompletionChunk {
+                llm_call_ordinal: Some(0),
+                ..
+            }
+        )),
+        "summarization chunks are recorded"
+    );
+    assert_eq!(summarizer_requested.turn_id, Some(compacted_turn_id));
+    assert_eq!(summarizer_finished.turn_id, Some(compacted_turn_id));
+    match &summarizer_finished.payload {
+        EventPayload::CompletionFinished { usage, model, .. } => {
+            assert_eq!(model, "o4-mini");
+            assert_eq!(usage.total_tokens, 52, "summarizer usage is cost-accounted");
+        }
+        _ => unreachable!("matched summarizer completion.finished"),
+    }
+    let turn_two_main_requested = events
+        .iter()
+        .find(|event| {
+            event.turn_id == Some(compacted_turn_id)
+                && matches!(
+                    event.payload,
+                    EventPayload::CompletionRequested {
+                        llm_call_ordinal: 1,
+                        ..
+                    }
+                )
+        })
+        .expect("turn 2 main completion.requested");
+    assert!(summarizer_requested.seq_id < summarizer_finished.seq_id);
+    assert!(summarizer_finished.seq_id < compacted.seq_id);
+    assert!(compacted.seq_id < turn_two_main_requested.seq_id);
+
+    // Both turns finished cleanly; the session keeps working after
+    // compaction.
+    let finished_turns: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::TurnFinished { status, .. } => Some(status.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished_turns, vec!["completed", "completed"]);
+    let messages = server
+        .runtime
+        .messages(created.session.session_id, Some(created.branch.branch_id))
+        .expect("messages after compaction");
+    assert!(messages.iter().any(|message| {
+        message.role == Role::Assistant
+            && message
+                .text_parts()
+                .any(|text| text.contains("continued fine"))
+    }));
+}
+
+#[tokio::test]
 async fn degraded_mcp_servers_do_not_break_turn_execution() {
     let mock_provider = spawn_mock_provider().await;
     let mut config = config_for_mock_provider(&mock_provider.base_url);
@@ -8872,6 +9070,85 @@ async fn spawn_mock_otlp_collector_with_response(
         base_url: format!("http://{addr}"),
         captured,
         handle,
+    }
+}
+
+/// Mock provider for the proactive-compaction path: the first turn reports
+/// near-window usage, the recorded summarization call (recognized by the
+/// compaction prompt) returns a distinctive model-written summary, and every
+/// later turn completes normally.
+async fn spawn_mock_compaction_provider() -> MockProvider {
+    async fn models() -> &'static str {
+        "{\"data\":[]}"
+    }
+
+    async fn completions(
+        axum::extract::State(state): axum::extract::State<MockApprovalProviderState>,
+        Json(payload): Json<Value>,
+    ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+        state
+            .requests
+            .lock()
+            .expect("requests lock")
+            .push(payload.clone());
+        let is_summarization = serde_json::to_string(&payload)
+            .unwrap_or_default()
+            .contains("context checkpoint compaction");
+        let events = if is_summarization {
+            vec![
+                Event::default().data(
+                    "{\"choices\":[{\"delta\":{\"content\":\"MOCK MODEL SUMMARY: seed facts preserved; path /tmp/alpha.rs\"},\"finish_reason\":null}]}",
+                ),
+                Event::default().data(
+                    "{\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":12,\"total_tokens\":52}}",
+                ),
+                Event::default().data("[DONE]"),
+            ]
+        } else if state.counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            vec![
+                Event::default().data(
+                    "{\"choices\":[{\"delta\":{\"content\":\"first answer\"},\"finish_reason\":null}]}",
+                ),
+                Event::default().data(
+                    "{\"choices\":[],\"usage\":{\"prompt_tokens\":189000,\"completion_tokens\":1000,\"total_tokens\":190000}}",
+                ),
+                Event::default().data("[DONE]"),
+            ]
+        } else {
+            vec![
+                Event::default().data(
+                    "{\"choices\":[{\"delta\":{\"content\":\"continued fine\"},\"finish_reason\":null}]}",
+                ),
+                Event::default().data(
+                    "{\"choices\":[],\"usage\":{\"prompt_tokens\":80,\"completion_tokens\":10,\"total_tokens\":90}}",
+                ),
+                Event::default().data("[DONE]"),
+            ]
+        };
+
+        Sse::new(futures_util::stream::iter(
+            events.into_iter().map(Ok::<_, Infallible>),
+        ))
+    }
+
+    let state = MockApprovalProviderState {
+        counter: Arc::new(AtomicUsize::new(0)),
+        requests: Arc::new(Mutex::new(Vec::new())),
+    };
+    let app = Router::new()
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(completions))
+        .with_state(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let addr = listener.local_addr().expect("mock addr");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("mock should run");
+    });
+
+    MockProvider {
+        base_url: format!("http://{addr}/v1/"),
+        handle,
+        requests: Some(state.requests),
     }
 }
 

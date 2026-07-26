@@ -6834,6 +6834,9 @@ fn continuous_export_prefix_stability_with_context_compacted_event() {
             SpanKind::Chain,
             EventPayload::ContextCompacted {
                 compaction_id: bt_core::CompactionId::new(),
+                window_number: None,
+                previous_compaction_id: None,
+                first_compaction_id: None,
                 trigger: bt_core::ContextCompactionTrigger::TokenBudget,
                 phase: bt_core::ContextCompactionPhase::PreTurn,
                 status: bt_core::ContextCompactionStatus::Completed,

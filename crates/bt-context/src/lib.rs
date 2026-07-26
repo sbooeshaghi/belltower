@@ -9,6 +9,30 @@ use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::fs;
 
+/// Stable prefix marking synthetic compaction summary messages. A previous
+/// summary message found in the input history is folded into the next
+/// summarization input and never retained alongside the new summary
+/// (chain-not-stack composition).
+pub const COMPACTION_SUMMARY_MARKER: &str = "[compaction summary]";
+
+/// First line of the deterministic fallback digest. Summary messages written
+/// before the marker existed start with this line; recognize them so legacy
+/// summaries still fold into the chain.
+const LEGACY_SUMMARY_FIRST_LINE: &str =
+    "Earlier conversation compacted to fit the model context window.";
+
+/// Fraction of the model window used for the proactive trigger when the
+/// configured value is out of range.
+const DEFAULT_TRIGGER_FRACTION: f64 = 0.9;
+
+/// Bounds for the token budget reserved for the summary inside the compacted
+/// context (an eighth of the available budget, clamped).
+const SUMMARY_BUDGET_MIN_TOKENS: u64 = 64;
+const SUMMARY_BUDGET_MAX_TOKENS: u64 = 4_096;
+
+/// Estimated prompt overhead reserved when sizing the summarization input.
+const SUMMARIZATION_PROMPT_OVERHEAD_TOKENS: u64 = 768;
+
 #[derive(Clone, Debug)]
 pub struct ContextAssembler {
     config: BelltowerConfig,
@@ -19,6 +43,39 @@ pub struct ContextAssembler {
 pub struct ContextBuildOutput {
     pub request: CompletionRequest,
     pub compaction: Option<ContextCompaction>,
+}
+
+/// Compaction-relevant inputs for one request build. The assembler stays
+/// pure: provider-observed usage and the previous summary chain state are
+/// computed by the runtime and passed in.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ContextBuildOptions {
+    pub force_compaction: bool,
+    /// Provider-observed context size: last real `completion.finished` usage
+    /// total plus an estimate of messages appended since. `None` when no
+    /// prior completion exists; the whole-history estimate then decides.
+    pub observed_context_tokens: Option<u64>,
+    /// Summary text of the previous `context.compacted` event on this
+    /// branch. Folded into the new summary input, never retained.
+    pub previous_summary: Option<String>,
+    /// Model-written summary body from the recorded summarization
+    /// completion. `None` falls back to the deterministic digest.
+    pub summary_override: Option<String>,
+}
+
+/// Pure description of the summarization work a triggered compaction needs.
+/// The runtime runs the actual completion and passes the result back through
+/// [`ContextBuildOptions::summary_override`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompactionPlan {
+    pub trigger: ContextCompactionTrigger,
+    /// Plaintext transcript of the previous summary plus the messages that
+    /// will be dropped, sized to the summarizer model's window. Submit as
+    /// the single user message of the summarization completion.
+    pub summarization_transcript: String,
+    /// Token budget reserved for the summary in the compacted context; use
+    /// as the summarization completion's `max_tokens`.
+    pub summary_budget_tokens: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -107,11 +164,10 @@ impl ContextAssembler {
         messages: Vec<Message>,
         tools: Vec<ToolSpec>,
         thinking: Option<ThinkingConfig>,
-        force_compaction: bool,
+        options: ContextBuildOptions,
     ) -> ContextBuildOutput {
-        let max_prompt_tokens = self
-            .context_window_for(provider, model)
-            .saturating_sub(self.config.context.reserve_tokens);
+        let window_tokens = self.context_window_for(provider, model);
+        let max_prompt_tokens = window_tokens.saturating_sub(self.config.context.reserve_tokens);
         let system_tokens = system_prompt
             .as_deref()
             .map(estimate_text_tokens)
@@ -124,22 +180,33 @@ impl ContextAssembler {
         let tokens_before =
             estimate_messages_tokens(&normalized_messages).saturating_add(system_tokens);
 
-        let (selected_messages, compaction) =
-            if force_compaction || tokens_before > max_prompt_tokens {
-                let trigger = if force_compaction {
-                    ContextCompactionTrigger::Forced
-                } else {
-                    ContextCompactionTrigger::TokenBudget
-                };
-                compact_messages(
-                    normalized_messages,
-                    max_prompt_tokens.saturating_sub(system_tokens),
-                    force_compaction,
-                    trigger,
-                )
-            } else {
-                (normalized_messages, None)
-            };
+        let trigger = compaction_trigger(
+            options.force_compaction,
+            tokens_before,
+            max_prompt_tokens,
+            options.observed_context_tokens,
+            trigger_tokens(
+                window_tokens,
+                self.config.context.compaction_trigger_fraction,
+            ),
+        );
+        let (selected_messages, compaction) = if let Some(trigger) = trigger {
+            let effective_budget = effective_prompt_budget(
+                max_prompt_tokens,
+                tokens_before,
+                options.observed_context_tokens,
+            );
+            compact_messages(
+                normalized_messages,
+                effective_budget.saturating_sub(system_tokens),
+                trigger,
+                self.config.context.compaction_user_message_budget_tokens,
+                options.previous_summary.as_deref(),
+                options.summary_override.as_deref(),
+            )
+        } else {
+            (normalized_messages, None)
+        };
 
         let tokens_after =
             estimate_messages_tokens(&selected_messages).saturating_add(system_tokens);
@@ -191,8 +258,77 @@ impl ContextAssembler {
             messages,
             tools,
             thinking,
-            false,
+            ContextBuildOptions::default(),
         )
+    }
+
+    /// Decides whether the next build for these inputs will compact and, if
+    /// so, describes the summarization work: which content is being dropped
+    /// (rendered as a plaintext transcript sized for `summarizer_model`) and
+    /// the summary token budget. Pure — runs no completion and records
+    /// nothing. Returns `None` when no compaction would occur or when there
+    /// is nothing to summarize.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_compaction(
+        &self,
+        provider: &str,
+        model: &str,
+        summarizer_model: &str,
+        system_prompt: Option<&str>,
+        messages: &[Message],
+        force_compaction: bool,
+        observed_context_tokens: Option<u64>,
+        previous_summary: Option<&str>,
+    ) -> Option<CompactionPlan> {
+        let window_tokens = self.context_window_for(provider, model);
+        let max_prompt_tokens = window_tokens.saturating_sub(self.config.context.reserve_tokens);
+        let system_tokens = system_prompt.map(estimate_text_tokens).unwrap_or(0);
+        let normalized_messages = normalize_messages(
+            messages.to_vec(),
+            self.config.context.max_tool_result_lines,
+            self.config.context.max_tool_result_bytes,
+        );
+        let tokens_before =
+            estimate_messages_tokens(&normalized_messages).saturating_add(system_tokens);
+        let trigger = compaction_trigger(
+            force_compaction,
+            tokens_before,
+            max_prompt_tokens,
+            observed_context_tokens,
+            trigger_tokens(
+                window_tokens,
+                self.config.context.compaction_trigger_fraction,
+            ),
+        )?;
+        let effective_budget =
+            effective_prompt_budget(max_prompt_tokens, tokens_before, observed_context_tokens);
+        let selection = resolve_retention_selection(
+            normalized_messages,
+            effective_budget.saturating_sub(system_tokens),
+            self.config.context.compaction_user_message_budget_tokens,
+            trigger == ContextCompactionTrigger::Forced,
+            previous_summary,
+        );
+        if selection.dropped.is_empty() && selection.folded_summaries.is_empty() {
+            return None;
+        }
+
+        let summarizer_window = self.context_window_for(provider, summarizer_model);
+        let input_budget = summarizer_window
+            .saturating_sub(self.config.context.reserve_tokens)
+            .saturating_sub(selection.summary_budget)
+            .saturating_sub(SUMMARIZATION_PROMPT_OVERHEAD_TOKENS)
+            .max(512);
+        Some(CompactionPlan {
+            trigger,
+            summarization_transcript: render_summarization_transcript(
+                &selection.folded_summaries,
+                &selection.dropped,
+                input_budget,
+            ),
+            summary_budget_tokens: selection.summary_budget,
+        })
     }
 
     #[must_use]
@@ -203,6 +339,58 @@ impl ContextAssembler {
             .find(|entry| entry.provider == provider && model.contains(&entry.model_pattern))
             .map(|entry| entry.context_window_tokens)
             .unwrap_or(32_768)
+    }
+}
+
+/// Trigger threshold in tokens: `fraction` of the full model window,
+/// falling back to the default fraction when the configured value is out of
+/// the valid `(0, 1]` range.
+fn trigger_tokens(window_tokens: u64, fraction: f64) -> u64 {
+    let fraction = if fraction > 0.0 && fraction <= 1.0 {
+        fraction
+    } else {
+        DEFAULT_TRIGGER_FRACTION
+    };
+    (window_tokens as f64 * fraction).floor() as u64
+}
+
+/// Decides whether compaction fires. Provider-observed usage beats the local
+/// estimate for the proactive check; the whole-history estimate remains the
+/// hard fit guarantee.
+fn compaction_trigger(
+    force_compaction: bool,
+    estimated_tokens: u64,
+    max_prompt_tokens: u64,
+    observed_context_tokens: Option<u64>,
+    trigger_tokens: u64,
+) -> Option<ContextCompactionTrigger> {
+    if force_compaction {
+        return Some(ContextCompactionTrigger::Forced);
+    }
+    if estimated_tokens > max_prompt_tokens {
+        return Some(ContextCompactionTrigger::TokenBudget);
+    }
+    if observed_context_tokens.is_some_and(|observed| observed > trigger_tokens) {
+        return Some(ContextCompactionTrigger::TokenBudget);
+    }
+    None
+}
+
+/// Retention budget in estimated-token space. When the provider observed
+/// more tokens than the local estimate for the same content, the estimator
+/// undercounts; scale the budget down proportionally so retention fits the
+/// real window. An observation below the estimate never grows the budget.
+fn effective_prompt_budget(
+    max_prompt_tokens: u64,
+    estimated_tokens: u64,
+    observed_context_tokens: Option<u64>,
+) -> u64 {
+    match observed_context_tokens {
+        Some(observed) if observed > estimated_tokens && observed > 0 => {
+            ((u128::from(max_prompt_tokens) * u128::from(estimated_tokens.max(1)))
+                / u128::from(observed)) as u64
+        }
+        _ => max_prompt_tokens,
     }
 }
 
@@ -578,66 +766,422 @@ pub fn summarize_messages(messages: &[Message], max_tokens: u64) -> Option<Branc
     })
 }
 
-fn compact_messages(
+/// One compaction retention decision: what stays verbatim, what gets
+/// summarized, and which previous summaries fold into the chain.
+#[derive(Clone, Debug)]
+struct RetentionSelection {
+    pinned_prefix: Vec<Message>,
+    /// Older real user messages kept verbatim (chronological order),
+    /// selected newest-first within the user budget.
+    retained_users: Vec<Message>,
+    /// Recent tail kept verbatim, all roles, cut only at message-unit
+    /// boundaries (chronological order).
+    tail: Vec<Message>,
+    /// Messages leaving the selected context; the summarization input
+    /// (chronological order, excludes retained user messages).
+    dropped: Vec<Message>,
+    /// Bodies of previous compaction summaries (event chain state plus any
+    /// summary messages found in the history), oldest first. Folded into
+    /// the summarization input and never retained.
+    folded_summaries: Vec<String>,
+    /// Token budget reserved for the summary message.
+    summary_budget: u64,
+    messages_before: u32,
+}
+
+/// Selects retention for one compaction: [pinned system prefix] + [older
+/// user messages within budget] + [summary] + [assistant-boundary tail],
+/// then shrinks deterministically until the estimated total (with the
+/// summary budget as a placeholder) fits `budget_tokens`.
+fn resolve_retention_selection(
     messages: Vec<Message>,
-    max_prompt_tokens: u64,
+    budget_tokens: u64,
+    user_budget_config: u64,
     force_compaction: bool,
-    trigger: ContextCompactionTrigger,
-) -> (Vec<Message>, Option<ContextCompaction>) {
+    previous_summary: Option<&str>,
+) -> RetentionSelection {
+    let messages_before = messages.len() as u32;
+    let (mut folded_summaries, messages) = extract_summary_messages(messages);
+    if let Some(previous) = previous_summary {
+        let body = normalize_summary_body(previous);
+        if !body.is_empty() && !folded_summaries.iter().any(|existing| *existing == body) {
+            folded_summaries.insert(0, body);
+        }
+    }
+
     let (pinned_prefix, remainder) = split_system_prefix(messages);
     let prefix_tokens = estimate_messages_tokens(&pinned_prefix);
-    let mut retained_units = build_message_units(remainder);
-    let mut dropped_units = Vec::new();
+    let units = build_message_units(remainder);
 
-    if force_compaction && retained_units.len() > 1 {
-        dropped_units.push(retained_units.remove(0));
+    let available = budget_tokens.saturating_sub(prefix_tokens);
+    let summary_budget =
+        (available / 8).clamp(SUMMARY_BUDGET_MIN_TOKENS, SUMMARY_BUDGET_MAX_TOKENS);
+    let content_budget = available.saturating_sub(summary_budget);
+    let user_budget = user_budget_config.min(content_budget / 2);
+    let tail_budget = content_budget.saturating_sub(user_budget);
+
+    // Tail: walk backward from the newest unit, cutting only at unit
+    // boundaries; the last unit is always kept.
+    let mut tail_units: Vec<MessageUnit> = Vec::new();
+    let mut tail_tokens = 0u64;
+    let mut cut_index = units.len();
+    for (index, unit) in units.iter().enumerate().rev() {
+        let unit_tokens = estimate_messages_tokens(&unit.messages);
+        if tail_units.is_empty() || tail_tokens.saturating_add(unit_tokens) <= tail_budget {
+            tail_units.insert(0, unit.clone());
+            tail_tokens = tail_tokens.saturating_add(unit_tokens);
+            cut_index = index;
+        } else {
+            break;
+        }
+    }
+    let mut dropped_units: Vec<MessageUnit> = units[..cut_index].to_vec();
+    // The retained tail must never open on an orphan tool-result message.
+    while tail_units.len() > 1
+        && tail_units
+            .first()
+            .and_then(|unit| unit.messages.first())
+            .is_some_and(|message| message.role == Role::Tool)
+    {
+        dropped_units.push(tail_units.remove(0));
     }
 
+    // Older real user messages: newest-first selection within the user
+    // budget, retained verbatim in chronological order.
+    let dropped_messages = flatten_units(&dropped_units);
+    let mut retained_user_ids = BTreeSet::new();
+    let mut user_tokens = 0u64;
+    for message in dropped_messages.iter().rev() {
+        if message.role != Role::User {
+            continue;
+        }
+        if message.text_parts().next().is_none() {
+            continue;
+        }
+        let message_tokens = estimate_message_tokens(message);
+        if user_tokens.saturating_add(message_tokens) > user_budget {
+            continue;
+        }
+        user_tokens = user_tokens.saturating_add(message_tokens);
+        retained_user_ids.insert(message.message_id);
+    }
+    let mut retained_users: Vec<Message> = dropped_messages
+        .iter()
+        .filter(|message| retained_user_ids.contains(&message.message_id))
+        .cloned()
+        .collect();
+    let mut dropped: Vec<Message> = dropped_messages
+        .into_iter()
+        .filter(|message| !retained_user_ids.contains(&message.message_id))
+        .collect();
+
+    // Forced compaction must summarize something even when everything
+    // fits: age the oldest tail unit(s) into the dropped set. Forced drops
+    // are not re-offered verbatim user retention.
+    while force_compaction && dropped.is_empty() && tail_units.len() > 1 {
+        let unit = tail_units.remove(0);
+        dropped.extend(unit.messages);
+    }
+
+    // Deterministic shrink until the placeholder-estimated total fits.
     loop {
-        let retained_messages = flatten_units(&retained_units);
-        let available_summary_tokens = max_prompt_tokens
-            .saturating_sub(prefix_tokens)
-            .saturating_sub(estimate_messages_tokens(&retained_messages));
-        let dropped_messages = flatten_units(&dropped_units);
-        let file_activity = collect_file_activity(&dropped_messages);
-        let summary = build_summary(&dropped_messages, &file_activity, available_summary_tokens);
-
-        let mut selected_messages = pinned_prefix.clone();
-        let first_kept_message_id = retained_messages.first().map(|message| message.message_id);
-        let messages_before_count =
-            (pinned_prefix.len() + retained_messages.len() + dropped_messages.len()) as u32;
-        let mut summary_message_id = None;
-        if let Some(summary) = &summary {
-            let summary_message = Message::text(Role::System, summary.clone());
-            summary_message_id = Some(summary_message.message_id);
-            selected_messages.push(summary_message);
+        let tail_messages = flatten_units(&tail_units);
+        let total = prefix_tokens
+            .saturating_add(estimate_messages_tokens(&retained_users))
+            .saturating_add(summary_budget)
+            .saturating_add(estimate_messages_tokens(&tail_messages));
+        if total <= budget_tokens {
+            break;
         }
-        selected_messages.extend(retained_messages);
-
-        if estimate_messages_tokens(&selected_messages) <= max_prompt_tokens
-            || retained_units.is_empty()
-        {
-            let compaction = summary.map(|summary| ContextCompaction {
-                summary,
-                trigger,
-                reason: Some(match trigger {
-                    ContextCompactionTrigger::Forced => "forced".to_owned(),
-                    ContextCompactionTrigger::TokenBudget => "token_budget".to_owned(),
-                }),
-                summary_message_id,
-                first_kept_message_id,
-                messages_before: messages_before_count,
-                messages_after: 0,
-                tokens_before: 0,
-                tokens_after: 0,
-                files_read: file_activity.files_read.into_iter().collect(),
-                files_modified: file_activity.files_modified.into_iter().collect(),
-            });
-            return (selected_messages, compaction);
+        if !retained_users.is_empty() {
+            let removed = retained_users.remove(0);
+            dropped.push(removed);
+            dropped.sort_by_key(|message| message.created_at);
+            continue;
         }
-
-        dropped_units.push(retained_units.remove(0));
+        if tail_units.len() > 1 {
+            let unit = tail_units.remove(0);
+            dropped.extend(unit.messages);
+            continue;
+        }
+        break;
     }
+
+    RetentionSelection {
+        pinned_prefix,
+        retained_users,
+        tail: flatten_units(&tail_units),
+        dropped,
+        folded_summaries,
+        summary_budget,
+        messages_before,
+    }
+}
+
+fn compact_messages(
+    messages: Vec<Message>,
+    budget_tokens: u64,
+    trigger: ContextCompactionTrigger,
+    user_budget_config: u64,
+    previous_summary: Option<&str>,
+    summary_override: Option<&str>,
+) -> (Vec<Message>, Option<ContextCompaction>) {
+    let selection = resolve_retention_selection(
+        messages,
+        budget_tokens,
+        user_budget_config,
+        trigger == ContextCompactionTrigger::Forced,
+        previous_summary,
+    );
+    let file_activity = collect_file_activity(&selection.dropped);
+
+    let non_summary_tokens = estimate_messages_tokens(&selection.pinned_prefix)
+        .saturating_add(estimate_messages_tokens(&selection.retained_users))
+        .saturating_add(estimate_messages_tokens(&selection.tail));
+    let summary_token_room = budget_tokens
+        .saturating_sub(non_summary_tokens)
+        .clamp(16, selection.summary_budget.max(16));
+    let summary_body = match summary_override {
+        Some(text) if !text.trim().is_empty() => Some(truncate_to_token_estimate(
+            text.trim(),
+            summary_token_room.max(selection.summary_budget),
+        )),
+        _ => compose_fallback_summary_body(
+            &selection.dropped,
+            &selection.folded_summaries,
+            &file_activity,
+            summary_token_room,
+        ),
+    };
+
+    let Some(summary_body) = summary_body else {
+        // Nothing dropped and no chain to carry: leave the context as-is.
+        let mut original = selection.pinned_prefix;
+        original.extend(selection.retained_users);
+        original.extend(selection.dropped);
+        original.extend(selection.tail);
+        return (original, None);
+    };
+
+    let summary_text = format!("{COMPACTION_SUMMARY_MARKER}\n{summary_body}");
+    let summary_message = Message::text(Role::System, summary_text.clone());
+    let summary_message_id = summary_message.message_id;
+    let first_kept_message_id = selection
+        .tail
+        .first()
+        .or_else(|| selection.retained_users.first())
+        .map(|message| message.message_id);
+
+    let mut selected_messages = selection.pinned_prefix;
+    selected_messages.extend(selection.retained_users);
+    selected_messages.push(summary_message);
+    selected_messages.extend(selection.tail);
+
+    let compaction = ContextCompaction {
+        summary: summary_text,
+        trigger,
+        reason: Some(match trigger {
+            ContextCompactionTrigger::Forced => "forced".to_owned(),
+            ContextCompactionTrigger::TokenBudget => "token_budget".to_owned(),
+        }),
+        summary_message_id: Some(summary_message_id),
+        first_kept_message_id,
+        messages_before: selection.messages_before,
+        messages_after: 0,
+        tokens_before: 0,
+        tokens_after: 0,
+        files_read: file_activity.files_read.into_iter().collect(),
+        files_modified: file_activity.files_modified.into_iter().collect(),
+    };
+    (selected_messages, Some(compaction))
+}
+
+/// Removes synthetic compaction summary messages from the history and
+/// returns their bodies (oldest first) for chain folding.
+fn extract_summary_messages(messages: Vec<Message>) -> (Vec<String>, Vec<Message>) {
+    let mut folded = Vec::new();
+    let mut remaining = Vec::with_capacity(messages.len());
+    for message in messages {
+        if let Some(body) = summary_message_body(&message) {
+            if !folded.contains(&body) {
+                folded.push(body);
+            }
+        } else {
+            remaining.push(message);
+        }
+    }
+    (folded, remaining)
+}
+
+/// Recognizes a synthetic compaction summary message (marker prefix, or the
+/// legacy digest first line) and returns its body text.
+fn summary_message_body(message: &Message) -> Option<String> {
+    if message.role != Role::System {
+        return None;
+    }
+    let text = message.text_parts().collect::<Vec<_>>().join("\n");
+    let trimmed = text.trim_start();
+    if trimmed.starts_with(COMPACTION_SUMMARY_MARKER)
+        || trimmed.starts_with(LEGACY_SUMMARY_FIRST_LINE)
+    {
+        let body = normalize_summary_body(trimmed);
+        (!body.is_empty()).then_some(body)
+    } else {
+        None
+    }
+}
+
+/// Strips the summary marker prefix (when present) and surrounding
+/// whitespace, leaving the summary body.
+fn normalize_summary_body(text: &str) -> String {
+    let trimmed = text.trim();
+    trimmed
+        .strip_prefix(COMPACTION_SUMMARY_MARKER)
+        .unwrap_or(trimmed)
+        .trim()
+        .to_owned()
+}
+
+/// Deterministic digest fallback: the rule-based digest of the dropped
+/// messages first (legacy shape), then previous summaries carried forward so
+/// the chain never loses its accumulated state.
+fn compose_fallback_summary_body(
+    dropped: &[Message],
+    folded_summaries: &[String],
+    file_activity: &FileActivity,
+    budget_tokens: u64,
+) -> Option<String> {
+    let mut sections = Vec::new();
+    if !folded_summaries.is_empty() {
+        let folded_budget = (budget_tokens / 2).max(SUMMARY_BUDGET_MIN_TOKENS);
+        sections.push(truncate_to_token_estimate(
+            &format!("Previous summary:\n{}", folded_summaries.join("\n\n")),
+            folded_budget,
+        ));
+    }
+    let folded_tokens = sections
+        .iter()
+        .map(|section| estimate_text_tokens(section))
+        .sum::<u64>();
+    if let Some(digest) = build_summary(
+        dropped,
+        file_activity,
+        budget_tokens.saturating_sub(folded_tokens).max(64),
+    ) {
+        sections.insert(0, digest);
+    }
+    (!sections.is_empty()).then(|| sections.join("\n"))
+}
+
+fn truncate_to_token_estimate(text: &str, budget_tokens: u64) -> String {
+    if estimate_text_tokens(text) <= budget_tokens {
+        return text.to_owned();
+    }
+    let approx_chars = (budget_tokens.saturating_mul(4)) as usize;
+    let mut truncated = text.chars().take(approx_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+/// Renders the summarization input: previous summaries first, then the
+/// dropped messages as a plaintext transcript. When the input budget binds,
+/// the oldest dropped messages are elided (they are covered by the previous
+/// summary chain) and the elision is stated.
+fn render_summarization_transcript(
+    folded_summaries: &[String],
+    dropped: &[Message],
+    input_budget_tokens: u64,
+) -> String {
+    let mut header = String::new();
+    if !folded_summaries.is_empty() {
+        header.push_str(
+            "Previous compaction summary (fold its still-relevant content into the new summary):\n",
+        );
+        header.push_str(&folded_summaries.join("\n\n"));
+        header.push_str("\n\n");
+    }
+
+    let lines: Vec<String> = dropped.iter().map(render_message_for_transcript).collect();
+    let line_tokens: Vec<u64> = lines
+        .iter()
+        .map(|line| estimate_text_tokens(line))
+        .collect();
+    let header_tokens = estimate_text_tokens(&header).saturating_add(64);
+    let body_budget = input_budget_tokens.saturating_sub(header_tokens);
+    let mut start = lines.len();
+    let mut used = 0u64;
+    while start > 0 {
+        let next = used.saturating_add(line_tokens[start - 1]);
+        if next > body_budget && start < lines.len() {
+            break;
+        }
+        used = next;
+        start -= 1;
+    }
+
+    let mut transcript = header;
+    if lines.is_empty() {
+        transcript.push_str("No additional messages are being dropped in this compaction.\n");
+        return transcript;
+    }
+    if start > 0 {
+        transcript.push_str(&format!(
+            "[{start} older dropped messages omitted from this excerpt; they are covered by the previous summary and remain in session history]\n"
+        ));
+    }
+    transcript.push_str("Messages being dropped from the model-visible context:\n");
+    transcript.push_str(&lines[start..].join("\n"));
+    transcript
+}
+
+fn render_message_for_transcript(message: &Message) -> String {
+    let role = match message.role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    };
+    let rendered = message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Text { text } => Some(text.clone()),
+            MessagePart::ToolCall { call } => Some(format!(
+                "[tool_call {} {}]",
+                call.tool_name,
+                truncate_chars(&call.arguments.to_string(), 400)
+            )),
+            MessagePart::ToolResult { result } => Some(format!(
+                "[tool_result {}{} {}]",
+                result.tool_name,
+                if result.is_error { " error" } else { "" },
+                truncate_chars(&result.output.to_string(), 800)
+            )),
+            MessagePart::Refusal {
+                text: Some(text), ..
+            } => Some(format!("[refusal] {text}")),
+            MessagePart::Structured { value, .. } => Some(format!(
+                "[structured] {}",
+                truncate_chars(&value.to_string(), 400)
+            )),
+            MessagePart::Reasoning { .. } | MessagePart::Refusal { text: None, .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rendered = if rendered.is_empty() {
+        "[non-text message]".to_owned()
+    } else {
+        rendered
+    };
+    format!("[{role}] {rendered}")
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut truncated = text.chars().take(max_chars).collect::<String>();
+    if truncated.chars().count() < text.chars().count() {
+        truncated.push_str("...");
+    }
+    truncated.replace('\n', " ")
 }
 
 fn split_system_prefix(messages: Vec<Message>) -> (Vec<Message>, Vec<Message>) {
@@ -650,36 +1194,59 @@ fn split_system_prefix(messages: Vec<Message>) -> (Vec<Message>, Vec<Message>) {
     (messages, remainder)
 }
 
+/// Groups messages into indivisible retention units. A unit opens at any
+/// message and, while it has tool calls awaiting results, absorbs following
+/// messages (matching results, further same-step tool calls, and anything
+/// interposed between a call and its result). Cuts happen only at unit
+/// boundaries, so a tool_use and its tool_result — and an approval-paused
+/// assistant call and its later result — are never split.
 fn build_message_units(messages: Vec<Message>) -> Vec<MessageUnit> {
     let mut units = Vec::new();
     let mut index = 0usize;
     while index < messages.len() {
-        if let Some(unit) = tool_pair_unit(&messages, index) {
-            index += unit.messages.len();
-            units.push(unit);
-            continue;
-        }
-
-        units.push(MessageUnit {
-            messages: vec![messages[index].clone()],
-        });
+        let mut pending = message_tool_call_ids(&messages[index])
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut unit_messages = vec![messages[index].clone()];
         index += 1;
+        while !pending.is_empty() && index < messages.len() {
+            let next = &messages[index];
+            for call_id in message_tool_result_ids(next) {
+                pending.remove(&call_id);
+            }
+            for call_id in message_tool_call_ids(next) {
+                pending.insert(call_id);
+            }
+            unit_messages.push(next.clone());
+            index += 1;
+        }
+        units.push(MessageUnit {
+            messages: unit_messages,
+        });
     }
     units
 }
 
-fn tool_pair_unit(messages: &[Message], index: usize) -> Option<MessageUnit> {
-    let current = messages.get(index)?;
-    let next = messages.get(index + 1)?;
-    let call = current.tool_call()?;
-    let result = next.tool_result()?;
-    if result.call_id.to_string() != call.call_id {
-        return None;
-    }
+fn message_tool_call_ids(message: &Message) -> Vec<String> {
+    message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::ToolCall { call } => Some(call.call_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
 
-    Some(MessageUnit {
-        messages: vec![current.clone(), next.clone()],
-    })
+fn message_tool_result_ids(message: &Message) -> Vec<String> {
+    message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::ToolResult { result } => Some(result.call_id.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn flatten_units(units: &[MessageUnit]) -> Vec<Message> {
@@ -1440,7 +2007,10 @@ mod tests {
             messages,
             Vec::new(),
             None,
-            true,
+            super::ContextBuildOptions {
+                force_compaction: true,
+                ..Default::default()
+            },
         );
 
         let compaction = output.compaction.expect("forced compaction report");
@@ -1450,5 +2020,419 @@ mod tests {
                 .contains("Earlier conversation compacted")
         );
         assert!(output.request.messages.len() <= 3);
+    }
+
+    fn compaction_options(
+        observed_context_tokens: Option<u64>,
+        previous_summary: Option<&str>,
+    ) -> super::ContextBuildOptions {
+        super::ContextBuildOptions {
+            force_compaction: false,
+            observed_context_tokens,
+            previous_summary: previous_summary.map(ToOwned::to_owned),
+            summary_override: None,
+        }
+    }
+
+    fn message_text(message: &Message) -> String {
+        message.text_parts().collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn compaction_orders_prefix_users_summary_tail_with_verbatim_users() {
+        let config = bt_core::BelltowerConfig::from_embedded().expect("config");
+        let assembler = ContextAssembler::new(config).expect("assembler");
+        let messages = vec![
+            Message::text(Role::System, "pinned system preamble"),
+            Message::text(Role::User, "old user question alpha"),
+            Message::text(Role::Assistant, "assistant chatter ".repeat(4_000)),
+            Message::text(Role::User, "old user question beta"),
+            Message::text(Role::Assistant, "more assistant chatter ".repeat(4_000)),
+            Message::text(Role::User, "latest request"),
+        ];
+        let latest_id = messages.last().expect("latest").message_id;
+
+        let output = assembler.build_request_with_metadata(
+            ConnectionId::new("local"),
+            "openai-compatible",
+            "qwen3:latest",
+            None,
+            messages,
+            Vec::new(),
+            None,
+        );
+
+        let compaction = output.compaction.expect("compaction fires over budget");
+        let rendered: Vec<(Role, String)> = output
+            .request
+            .messages
+            .iter()
+            .map(|message| (message.role.clone(), message_text(message)))
+            .collect();
+        assert_eq!(rendered[0].0, Role::System);
+        assert_eq!(rendered[0].1, "pinned system preamble");
+        assert_eq!(
+            rendered[1],
+            (Role::User, "old user question alpha".to_owned())
+        );
+        assert_eq!(
+            rendered[2],
+            (Role::User, "old user question beta".to_owned())
+        );
+        assert_eq!(rendered[3].0, Role::System);
+        assert!(rendered[3].1.starts_with(super::COMPACTION_SUMMARY_MARKER));
+        assert_eq!(rendered[4], (Role::User, "latest request".to_owned()));
+        assert_eq!(
+            rendered.len(),
+            5,
+            "assistant chatter must be summarized away"
+        );
+        assert_eq!(compaction.first_kept_message_id, Some(latest_id));
+        assert_eq!(
+            compaction.summary_message_id,
+            Some(output.request.messages[3].message_id)
+        );
+    }
+
+    #[test]
+    fn compaction_never_splits_tool_call_from_delayed_result() {
+        let config = bt_core::BelltowerConfig::from_embedded().expect("config");
+        let assembler = ContextAssembler::new(config).expect("assembler");
+        let call_message = Message::from_part(
+            Role::Assistant,
+            MessagePart::ToolCall {
+                call: ToolCall {
+                    tool_name: "shell".to_owned(),
+                    call_id: "call-delayed".to_owned(),
+                    arguments: json!({"command": "cargo test"}),
+                },
+            },
+        );
+        // The approval pause interposes a message between the call and its
+        // result: the unit must absorb it so the pair is never split.
+        let interposed = Message::text(Role::User, "steer note during approval");
+        let result_message = Message::from_part(
+            Role::Tool,
+            MessagePart::ToolResult {
+                result: ToolResultEnvelope {
+                    call_id: bt_core::ToolCallId::new("call-delayed"),
+                    tool_name: "shell".to_owned(),
+                    is_error: false,
+                    output: json!({"stdout": "x".repeat(200_000)}),
+                    duration_ms: None,
+                },
+            },
+        );
+        let messages = vec![
+            Message::text(Role::User, "old context ".repeat(4_000)),
+            call_message,
+            interposed,
+            result_message,
+            Message::text(Role::User, "latest request"),
+        ];
+
+        let output = assembler.build_request_with_metadata(
+            ConnectionId::new("local"),
+            "openai-compatible",
+            "qwen3:latest",
+            None,
+            messages,
+            Vec::new(),
+            None,
+        );
+
+        assert!(output.compaction.is_some());
+        let call_retained = output.request.messages.iter().any(|message| {
+            message
+                .tool_call()
+                .is_some_and(|call| call.call_id == "call-delayed")
+        });
+        let result_retained = output.request.messages.iter().any(|message| {
+            message
+                .tool_result()
+                .is_some_and(|result| result.call_id.to_string() == "call-delayed")
+        });
+        assert_eq!(
+            call_retained, result_retained,
+            "tool_use and its delayed tool_result must be kept or dropped together"
+        );
+        for message in &output.request.messages {
+            assert!(
+                message.tool_result().is_none()
+                    || output.request.messages.iter().any(|candidate| {
+                        candidate.tool_call().is_some_and(|call| {
+                            Some(call.call_id.clone())
+                                == message
+                                    .tool_result()
+                                    .map(|result| result.call_id.to_string())
+                        })
+                    }),
+                "the retained tail must never open on an orphan tool result"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_user_budget_keeps_newest_users_within_budget() {
+        let mut config = bt_core::BelltowerConfig::from_embedded().expect("config");
+        config.context.compaction_user_message_budget_tokens = 30;
+        let assembler = ContextAssembler::new(config).expect("assembler");
+        let old_long_user = "much older long user question ".repeat(20);
+        let messages = vec![
+            Message::text(Role::User, old_long_user.clone()),
+            Message::text(Role::Assistant, "assistant chatter ".repeat(4_000)),
+            Message::text(Role::User, "newer short ask"),
+            Message::text(Role::Assistant, "more chatter ".repeat(4_000)),
+            Message::text(Role::User, "latest request"),
+        ];
+
+        let output = assembler.build_request_with_metadata(
+            ConnectionId::new("local"),
+            "openai-compatible",
+            "qwen3:latest",
+            None,
+            messages,
+            Vec::new(),
+            None,
+        );
+
+        assert!(output.compaction.is_some());
+        let texts: Vec<String> = output.request.messages.iter().map(message_text).collect();
+        assert!(
+            texts.iter().any(|text| text == "newer short ask"),
+            "the newest user message within budget is retained verbatim"
+        );
+        assert!(
+            !texts.iter().any(|text| *text == old_long_user),
+            "the older user message over budget is summarized, not retained"
+        );
+    }
+
+    #[test]
+    fn compaction_folds_previous_summary_and_never_retains_it() {
+        let config = bt_core::BelltowerConfig::from_embedded().expect("config");
+        let assembler = ContextAssembler::new(config).expect("assembler");
+        let previous_summary_message = Message::text(
+            Role::System,
+            format!(
+                "{}\nkey earlier facts: path /tmp/alpha.rs decided",
+                super::COMPACTION_SUMMARY_MARKER
+            ),
+        );
+        let previous_summary_id = previous_summary_message.message_id;
+        let messages = vec![
+            previous_summary_message,
+            Message::text(Role::User, "old question ".repeat(4_000)),
+            Message::text(Role::Assistant, "old answer ".repeat(4_000)),
+            Message::text(Role::User, "latest request"),
+        ];
+
+        let output = assembler.build_request_with_options(
+            ConnectionId::new("local"),
+            "openai-compatible",
+            "qwen3:latest",
+            None,
+            messages.clone(),
+            Vec::new(),
+            None,
+            compaction_options(None, Some("event-recorded earlier summary body")),
+        );
+
+        let compaction = output.compaction.expect("compaction fires");
+        let summary_messages: Vec<&Message> = output
+            .request
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == Role::System
+                    && message_text(message).starts_with(super::COMPACTION_SUMMARY_MARKER)
+            })
+            .collect();
+        assert_eq!(
+            summary_messages.len(),
+            1,
+            "chain-not-stack: exactly one summary message after compaction"
+        );
+        assert_ne!(
+            summary_messages[0].message_id, previous_summary_id,
+            "the previous summary message is never retained"
+        );
+        assert!(
+            compaction.summary.contains("key earlier facts"),
+            "previous in-history summary folds into the new summary"
+        );
+        assert!(
+            compaction
+                .summary
+                .contains("event-recorded earlier summary body"),
+            "previous event summary folds into the new summary"
+        );
+
+        let plan = assembler
+            .plan_compaction(
+                "openai-compatible",
+                "qwen3:latest",
+                "qwen3:latest",
+                None,
+                &messages,
+                false,
+                None,
+                Some("event-recorded earlier summary body"),
+            )
+            .expect("plan for over-budget history");
+        assert!(
+            plan.summarization_transcript.contains("key earlier facts"),
+            "summarizer input includes previous in-history summary"
+        );
+        assert!(
+            plan.summarization_transcript
+                .contains("event-recorded earlier summary body"),
+            "summarizer input includes previous event summary"
+        );
+    }
+
+    #[test]
+    fn observed_tokens_trigger_compaction_when_estimate_fits() {
+        let config = bt_core::BelltowerConfig::from_embedded().expect("config");
+        let assembler = ContextAssembler::new(config).expect("assembler");
+        let messages = vec![
+            Message::text(Role::User, "first task context"),
+            Message::text(Role::Assistant, "acknowledged"),
+            Message::text(Role::User, "latest request"),
+        ];
+
+        // qwen3 window 32768; default fraction 0.9 -> threshold 29491.
+        let over = assembler.build_request_with_options(
+            ConnectionId::new("local"),
+            "openai-compatible",
+            "qwen3:latest",
+            None,
+            messages.clone(),
+            Vec::new(),
+            None,
+            compaction_options(Some(30_000), None),
+        );
+        assert!(
+            over.compaction.is_some(),
+            "provider-observed usage beats the local estimate"
+        );
+        assert_eq!(
+            over.compaction.expect("compaction").trigger,
+            bt_core::ContextCompactionTrigger::TokenBudget
+        );
+
+        let under = assembler.build_request_with_options(
+            ConnectionId::new("local"),
+            "openai-compatible",
+            "qwen3:latest",
+            None,
+            messages.clone(),
+            Vec::new(),
+            None,
+            compaction_options(Some(20_000), None),
+        );
+        assert!(under.compaction.is_none());
+    }
+
+    #[test]
+    fn compaction_trigger_fraction_config_is_respected() {
+        let mut config = bt_core::BelltowerConfig::from_embedded().expect("config");
+        config.context.compaction_trigger_fraction = 0.95;
+        let assembler = ContextAssembler::new(config).expect("assembler");
+        let messages = vec![
+            Message::text(Role::User, "first task context"),
+            Message::text(Role::Assistant, "acknowledged"),
+            Message::text(Role::User, "latest request"),
+        ];
+
+        // threshold at 0.95 * 32768 = 31129; 30_000 stays under it.
+        let output = assembler.build_request_with_options(
+            ConnectionId::new("local"),
+            "openai-compatible",
+            "qwen3:latest",
+            None,
+            messages.clone(),
+            Vec::new(),
+            None,
+            compaction_options(Some(30_000), None),
+        );
+        assert!(output.compaction.is_none());
+
+        let output = assembler.build_request_with_options(
+            ConnectionId::new("local"),
+            "openai-compatible",
+            "qwen3:latest",
+            None,
+            messages,
+            Vec::new(),
+            None,
+            compaction_options(Some(31_500), None),
+        );
+        assert!(output.compaction.is_some());
+    }
+
+    #[test]
+    fn summary_override_is_used_verbatim_with_marker() {
+        let config = bt_core::BelltowerConfig::from_embedded().expect("config");
+        let assembler = ContextAssembler::new(config).expect("assembler");
+        let messages = vec![
+            Message::text(Role::User, "old question ".repeat(4_000)),
+            Message::text(Role::Assistant, "old answer ".repeat(4_000)),
+            Message::text(Role::User, "latest request"),
+        ];
+
+        let output = assembler.build_request_with_options(
+            ConnectionId::new("local"),
+            "openai-compatible",
+            "qwen3:latest",
+            None,
+            messages,
+            Vec::new(),
+            None,
+            super::ContextBuildOptions {
+                force_compaction: false,
+                observed_context_tokens: None,
+                previous_summary: None,
+                summary_override: Some("model-written checkpoint body".to_owned()),
+            },
+        );
+
+        let compaction = output.compaction.expect("compaction fires");
+        assert!(
+            compaction
+                .summary
+                .starts_with(super::COMPACTION_SUMMARY_MARKER)
+        );
+        assert!(compaction.summary.contains("model-written checkpoint body"));
+        assert!(
+            !compaction
+                .summary
+                .contains("Earlier conversation compacted"),
+            "the model summary replaces the deterministic digest"
+        );
+    }
+
+    #[test]
+    fn plan_compaction_is_none_when_context_fits() {
+        let config = bt_core::BelltowerConfig::from_embedded().expect("config");
+        let assembler = ContextAssembler::new(config).expect("assembler");
+        let messages = vec![
+            Message::text(Role::User, "small question"),
+            Message::text(Role::Assistant, "small answer"),
+        ];
+        assert!(
+            assembler
+                .plan_compaction(
+                    "openai-compatible",
+                    "qwen3:latest",
+                    "qwen3:latest",
+                    None,
+                    &messages,
+                    false,
+                    None,
+                    None,
+                )
+                .is_none()
+        );
     }
 }

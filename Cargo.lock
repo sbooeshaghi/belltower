@@ -417,6 +417,7 @@ dependencies = [
  "bt-session",
  "bt-tools",
  "camino",
+ "futures-util",
  "rusqlite",
  "serde_json",
  "tempfile",

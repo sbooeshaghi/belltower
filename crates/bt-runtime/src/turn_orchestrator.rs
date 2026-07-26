@@ -3,6 +3,10 @@
 //! This module owns turn-loop sequencing while callers provide adapters for
 //! provider/auth/tool construction that are not yet runtime-owned.
 
+use crate::runtime::{
+    ObservedContextTokensInput, TurnContextCompactionInputs, TurnContextPlan,
+    TurnContextSummarizationPlan,
+};
 use crate::{
     AdmittedTurn, BelltowerRuntime, BudgetEnforcementOutcome, ContextCompactionReport,
     PostTurnControlAction,
@@ -13,11 +17,13 @@ use bt_agent::{
 };
 use bt_context::{SystemPromptBuilder, SystemPromptInput};
 use bt_core::{
-    BelltowerError, BranchId, BranchRecord, ConnectionDescriptor, InstructionDocument,
-    PlanInspection, Result, SessionId, SessionRecord, ToolResultEnvelope, ToolSpec, TurnId,
-    TurnInstructionProvenance, traits::Provider,
+    BelltowerError, BranchId, BranchRecord, CompletionChunk, CompletionDelta, CompletionRequest,
+    CompletionSummary, ConnectionDescriptor, FinishReason, InstructionDocument, Message,
+    PlanInspection, Result, Role, SessionId, SessionRecord, TokenUsage, ToolResultEnvelope,
+    ToolSpec, TurnId, TurnInstructionProvenance, traits::Provider,
 };
 use bt_tools::BuiltInToolRegistry;
+use futures_util::StreamExt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -235,7 +241,188 @@ impl BelltowerRuntime {
     }
 }
 
+/// Fully collected summarization completion, buffered before any canonical
+/// recording so a failed call leaves no half-open completion pair.
+struct CollectedSummarization {
+    chunks: Vec<CompletionChunk>,
+    summary_text: String,
+    usage: Option<TokenUsage>,
+    latency_ms: u64,
+}
+
 impl TurnOrchestrator<'_> {
+    /// Runs the planned compaction summarization (when any) via the normal
+    /// provider seam and returns the compaction inputs for the final context
+    /// build. Provider failures fall back to the deterministic digest —
+    /// compaction never fails a turn for summarizer reasons. Record-path
+    /// failures propagate: they mean the canonical log itself is broken.
+    async fn run_planned_summarization(
+        &self,
+        provider: &dyn Provider,
+        connection: &ConnectionDescriptor,
+        session: &SessionRecord,
+        branch: &BranchRecord,
+        turn_id: TurnId,
+        plan: &TurnContextPlan,
+    ) -> Result<TurnContextCompactionInputs> {
+        let observed_context_tokens =
+            ObservedContextTokensInput::Provided(plan.observed_context_tokens);
+        let Some(summarization) = &plan.summarization else {
+            return Ok(TurnContextCompactionInputs {
+                observed_context_tokens,
+                summary_override: None,
+                reason_suffix: None,
+            });
+        };
+
+        match self
+            .collect_summarization_stream(provider, connection, summarization)
+            .await
+        {
+            Ok(collected) => {
+                let summary_text = collected.summary_text.clone();
+                self.record_summarization_completion(
+                    provider,
+                    connection,
+                    session,
+                    branch,
+                    turn_id,
+                    summarization,
+                    collected,
+                )?;
+                Ok(TurnContextCompactionInputs {
+                    observed_context_tokens,
+                    summary_override: Some(summary_text),
+                    reason_suffix: Some(format!(
+                        "summary=model:{}",
+                        summarization.summarizer_model
+                    )),
+                })
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session.session_id,
+                    branch_id = %branch.branch_id,
+                    turn_id = %turn_id,
+                    summarizer_model = %summarization.summarizer_model,
+                    error = %error,
+                    "compaction summarization failed; falling back to deterministic digest"
+                );
+                Ok(TurnContextCompactionInputs {
+                    observed_context_tokens,
+                    summary_override: None,
+                    reason_suffix: Some(format!(
+                        "summary=fallback_digest; summarizer_error={}",
+                        error.code()
+                    )),
+                })
+            }
+        }
+    }
+
+    /// Streams the summarization completion to the end without recording
+    /// anything, so failures can fall back cleanly.
+    async fn collect_summarization_stream(
+        &self,
+        provider: &dyn Provider,
+        connection: &ConnectionDescriptor,
+        plan: &TurnContextSummarizationPlan,
+    ) -> Result<CollectedSummarization> {
+        let request = CompletionRequest {
+            connection_id: connection.id.clone(),
+            model: plan.summarizer_model.clone(),
+            system_prompt: Some(bt_core::COMPACTION_SUMMARY_PROMPT.to_owned()),
+            messages: vec![Message::text(Role::User, plan.transcript.clone())],
+            tools: Vec::new(),
+            structured_output: None,
+            max_tokens: Some(plan.summary_budget_tokens),
+            temperature: None,
+            thinking: None,
+        };
+        let started = Instant::now();
+        let mut stream = provider.stream_completion(request).await?;
+        let mut chunks = Vec::new();
+        let mut summary_text = String::new();
+        let mut usage = None;
+        while let Some(chunk) = stream.next().await {
+            let mut chunk = chunk?;
+            chunk.llm_call_ordinal = Some(bt_core::CONTEXT_MAINTENANCE_LLM_CALL_ORDINAL);
+            if let Some(chunk_usage) = chunk.usage.clone() {
+                usage = Some(chunk_usage);
+            }
+            for delta in &chunk.deltas {
+                if let CompletionDelta::AppendText { text } = delta {
+                    summary_text.push_str(text);
+                }
+            }
+            chunks.push(chunk);
+        }
+        if summary_text.trim().is_empty() {
+            return Err(BelltowerError::Provider(
+                "summarization completion returned no text".to_owned(),
+            ));
+        }
+        Ok(CollectedSummarization {
+            chunks,
+            summary_text,
+            usage,
+            latency_ms: started.elapsed().as_millis() as u64,
+        })
+    }
+
+    /// Records the buffered summarization canonically like any llm call:
+    /// `completion.requested` / `completion.chunk` (with raw chunk
+    /// durability) / `completion.finished`, all under the reserved
+    /// context-maintenance ordinal so it is auditable and cost-accounted.
+    fn record_summarization_completion(
+        &self,
+        provider: &dyn Provider,
+        connection: &ConnectionDescriptor,
+        session: &SessionRecord,
+        branch: &BranchRecord,
+        turn_id: TurnId,
+        plan: &TurnContextSummarizationPlan,
+        collected: CollectedSummarization,
+    ) -> Result<()> {
+        self.runtime.record_completion_requested(
+            session.session_id,
+            branch.branch_id,
+            bt_core::CONTEXT_MAINTENANCE_LLM_CALL_ORDINAL,
+            connection.provider.clone(),
+            plan.summarizer_model.clone(),
+            1,
+            turn_id,
+        )?;
+        for chunk in &collected.chunks {
+            self.runtime
+                .record_live_completion_chunk(session, branch, connection, turn_id, chunk)?;
+        }
+        let mut summary = provider.completion_summary(CompletionSummary {
+            provider: connection.provider.clone(),
+            model: plan.summarizer_model.clone(),
+            finish_reason: FinishReason::Stop,
+            usage: collected.usage.unwrap_or(TokenUsage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+            }),
+            cost: None,
+            latency_ms: collected.latency_ms,
+        })?;
+        summary.provider = connection.provider.clone();
+        self.runtime.record_completion_finished(
+            session.session_id,
+            branch.branch_id,
+            summary,
+            bt_core::CONTEXT_MAINTENANCE_LLM_CALL_ORDINAL,
+            turn_id,
+        )?;
+        Ok(())
+    }
+
     fn record_pre_turn_failure(
         &self,
         session: &SessionRecord,
@@ -314,6 +501,31 @@ impl TurnOrchestrator<'_> {
                         .runtime
                         .resolve_turn_settings(turn_session.session_id, settings_revision_id)?;
                     let provider = adapters.provider_for_connection(&connection).await?;
+                    // Compaction check point: runs for the initial pre-turn
+                    // preflight and for every continuation dispatch
+                    // (steer/queued/related-session follow-ups), since each
+                    // loop iteration re-enters this preflight. The plan
+                    // freezes the provider-observed context size so the
+                    // recorded summarization completion cannot shift the
+                    // trigger decision for the build below.
+                    let context_plan = self.runtime.plan_turn_context_compaction(
+                        &turn_session,
+                        &current_branch,
+                        &connection,
+                        &model_id,
+                        Some(built_system_prompt.prompt.as_str()),
+                        false,
+                    )?;
+                    let compaction_inputs = self
+                        .run_planned_summarization(
+                            provider.as_ref(),
+                            &connection,
+                            &turn_session,
+                            &current_branch,
+                            turn_id,
+                            &context_plan,
+                        )
+                        .await?;
                     let prepared = self.runtime.prepare_turn_context_for_resolved_settings(
                         &turn_session,
                         &current_branch,
@@ -325,6 +537,7 @@ impl TurnOrchestrator<'_> {
                         Some(turn_id),
                         settings_revision_id,
                         false,
+                        compaction_inputs,
                     )?;
                     let connection = prepared.connection;
                     let model_id = prepared.model_id;

@@ -53,6 +53,10 @@ mod support;
 mod tests;
 mod types;
 
+pub(crate) use context::{
+    ObservedContextTokensInput, TurnContextCompactionInputs, TurnContextPlan,
+    TurnContextSummarizationPlan,
+};
 pub use types::{
     AdmittedTurn, BranchTranscriptPage, BudgetEnforcementOutcome, ContextCompactionReport,
     PostTurnControlAction, PreparedTurnContext, QueuedDispatch, ResumableToolCall,

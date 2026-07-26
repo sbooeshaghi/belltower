@@ -19,6 +19,9 @@ pub(super) fn compaction_report_from_context(
 ) -> ContextCompactionReport {
     ContextCompactionReport {
         compaction_id: bt_core::CompactionId::new(),
+        window_number: None,
+        previous_compaction_id: None,
+        first_compaction_id: None,
         trigger: compaction.trigger,
         phase: bt_core::ContextCompactionPhase::PreTurn,
         status: bt_core::ContextCompactionStatus::Completed,

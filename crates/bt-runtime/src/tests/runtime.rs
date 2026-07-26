@@ -4739,3 +4739,289 @@ fn session_execution_includes_projected_context_manifests() {
     );
     assert_eq!(manifest.messages[0].source_seq_id, Some(message_seq_id));
 }
+
+#[test]
+fn observed_provider_usage_triggers_proactive_compaction_with_window_chain() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("local"),
+            Some("qwen3:latest".to_owned()),
+            SessionToolMode::Extended,
+            Some("proactive-compaction".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    runtime
+        .append_message(&session, &branch, Role::User, "seed question")
+        .expect("seed question");
+    runtime
+        .append_message(&session, &branch, Role::Assistant, "seed answer")
+        .expect("seed answer");
+    let admitted = match runtime
+        .admit_user_message(
+            &session,
+            &branch,
+            Message::text(Role::User, "latest request"),
+        )
+        .expect("admit latest request")
+    {
+        UserMessageAdmission::Started(admitted) => admitted,
+        UserMessageAdmission::Queued { .. } => panic!("idle session should start the turn"),
+    };
+    // Provider-observed usage from the last real completion: well over the
+    // 0.9 * 32768 threshold for qwen3, while the local estimate is tiny.
+    runtime
+        .record_completion_finished(
+            session.session_id,
+            branch.branch_id,
+            CompletionSummary {
+                provider: "openai-compatible".to_owned(),
+                model: "qwen3:latest".to_owned(),
+                finish_reason: FinishReason::Stop,
+                usage: TokenUsage {
+                    prompt_tokens: 30_500,
+                    completion_tokens: 500,
+                    total_tokens: 31_000,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
+                cost: None,
+                latency_ms: 5,
+            },
+            1,
+            admitted.turn_id(),
+        )
+        .expect("record observed usage");
+
+    let prepared = runtime
+        .prepare_turn_context(
+            &session,
+            &branch,
+            None,
+            Vec::new(),
+            None,
+            Some(admitted.turn_id()),
+            admitted.settings_revision_id(),
+        )
+        .expect("prepare turn context");
+    let compaction = prepared
+        .compaction
+        .expect("observed usage beats the small estimate and triggers compaction");
+    assert_eq!(compaction.trigger, ContextCompactionTrigger::TokenBudget);
+    assert_eq!(compaction.window_number, Some(1));
+    assert_eq!(compaction.previous_compaction_id, None);
+    assert_eq!(
+        compaction.first_compaction_id,
+        Some(compaction.compaction_id)
+    );
+    assert!(compaction.summary_message_id.is_some());
+    assert!(compaction.first_kept_message_id.is_some());
+    assert_eq!(compaction.first_kept_branch_id, Some(branch.branch_id));
+
+    // A later prepare chains onto the recorded window instead of stacking.
+    let second = runtime
+        .prepare_turn_context(
+            &session,
+            &branch,
+            None,
+            Vec::new(),
+            None,
+            Some(admitted.turn_id()),
+            admitted.settings_revision_id(),
+        )
+        .expect("prepare again")
+        .compaction
+        .expect("still over the observed threshold");
+    assert_eq!(second.window_number, Some(2));
+    assert_eq!(
+        second.previous_compaction_id,
+        Some(compaction.compaction_id)
+    );
+    assert_eq!(second.first_compaction_id, Some(compaction.compaction_id));
+
+    let events = runtime.all_events(session.session_id).expect("events");
+    let compacted_events = events
+        .iter()
+        .filter(|event| matches!(event.payload, EventPayload::ContextCompacted { .. }))
+        .count();
+    assert_eq!(compacted_events, 2);
+}
+
+#[test]
+fn compaction_trigger_fraction_config_gates_observed_usage() {
+    let mut config = BelltowerConfig::from_embedded().expect("config");
+    config.context.compaction_trigger_fraction = 1.0;
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("local"),
+            Some("qwen3:latest".to_owned()),
+            SessionToolMode::Extended,
+            Some("fraction-gate".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    runtime
+        .append_message(&session, &branch, Role::User, "seed question")
+        .expect("seed question");
+    let admitted = match runtime
+        .admit_user_message(
+            &session,
+            &branch,
+            Message::text(Role::User, "latest request"),
+        )
+        .expect("admit latest request")
+    {
+        UserMessageAdmission::Started(admitted) => admitted,
+        UserMessageAdmission::Queued { .. } => panic!("idle session should start the turn"),
+    };
+    // 31_000 observed tokens sit under a 1.0 fraction of the 32768 window,
+    // so the proactive trigger must not fire.
+    runtime
+        .record_completion_finished(
+            session.session_id,
+            branch.branch_id,
+            CompletionSummary {
+                provider: "openai-compatible".to_owned(),
+                model: "qwen3:latest".to_owned(),
+                finish_reason: FinishReason::Stop,
+                usage: TokenUsage {
+                    prompt_tokens: 30_500,
+                    completion_tokens: 500,
+                    total_tokens: 31_000,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
+                cost: None,
+                latency_ms: 5,
+            },
+            1,
+            admitted.turn_id(),
+        )
+        .expect("record observed usage");
+
+    let prepared = runtime
+        .prepare_turn_context(
+            &session,
+            &branch,
+            None,
+            Vec::new(),
+            None,
+            Some(admitted.turn_id()),
+            admitted.settings_revision_id(),
+        )
+        .expect("prepare turn context");
+    assert!(
+        prepared.compaction.is_none(),
+        "raising the trigger fraction must defer proactive compaction"
+    );
+}
+
+#[test]
+fn model_downshift_triggers_pre_turn_compaction_under_new_window() {
+    // Downshift handling is pre-turn detection: the provider-observed usage
+    // accumulated under the old model is compared against the *new* model's
+    // window at the next preflight, so switching to a smaller window forces
+    // a compaction before the next completion is built.
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("local"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("downshift".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    runtime
+        .append_message(&session, &branch, Role::User, "seed question")
+        .expect("seed question");
+    let admitted = match runtime
+        .admit_user_message(
+            &session,
+            &branch,
+            Message::text(Role::User, "latest request"),
+        )
+        .expect("admit latest request")
+    {
+        UserMessageAdmission::Started(admitted) => admitted,
+        UserMessageAdmission::Queued { .. } => panic!("idle session should start the turn"),
+    };
+    // 100k observed tokens: comfortable inside o4-mini's 200k window.
+    runtime
+        .record_completion_finished(
+            session.session_id,
+            branch.branch_id,
+            CompletionSummary {
+                provider: "openai-compatible".to_owned(),
+                model: "o4-mini".to_owned(),
+                finish_reason: FinishReason::Stop,
+                usage: TokenUsage {
+                    prompt_tokens: 99_000,
+                    completion_tokens: 1_000,
+                    total_tokens: 100_000,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                },
+                cost: None,
+                latency_ms: 5,
+            },
+            1,
+            admitted.turn_id(),
+        )
+        .expect("record observed usage");
+
+    let before_downshift = runtime
+        .prepare_turn_context(
+            &session,
+            &branch,
+            None,
+            Vec::new(),
+            None,
+            Some(admitted.turn_id()),
+            admitted.settings_revision_id(),
+        )
+        .expect("prepare under the old model");
+    assert!(
+        before_downshift.compaction.is_none(),
+        "100k observed tokens fit the 200k window"
+    );
+
+    let updated = runtime
+        .update_session_settings(
+            session.session_id,
+            None,
+            Some(Some("qwen3:latest".to_owned())),
+            None,
+        )
+        .expect("downshift to a smaller-window model");
+
+    let after_downshift = runtime
+        .prepare_turn_context(
+            &session,
+            &branch,
+            None,
+            Vec::new(),
+            None,
+            Some(admitted.turn_id()),
+            updated.settings_revision_id,
+        )
+        .expect("prepare under the new model");
+    let compaction = after_downshift
+        .compaction
+        .expect("window shrank below the observed usage: compaction must fire");
+    assert_eq!(compaction.trigger, ContextCompactionTrigger::TokenBudget);
+    assert_eq!(compaction.model.as_deref(), Some("qwen3:latest"));
+}

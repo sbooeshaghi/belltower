@@ -270,12 +270,22 @@ The control-plane rule is now explicit:
   because tools may already have produced side effects. Recovery terminalizes
   the interrupted turn and sends one typed durable error to the originating
   session instead
-- `context.compacted` records a stable `compaction_id`, trigger, phase, status,
+- `context.compacted` records a stable `compaction_id`, the window chain
+  (`window_number`, `previous_compaction_id`, `first_compaction_id` linking
+  successive compactions on a branch), trigger, phase, status,
   provider/model, context boundary, summary message reference, first-kept
-  message/source reference when available, latency, and before/after accounting.
-  Context manifests use the same `compaction_id` in a model-visible compaction
-  attachment, so inspection/export can prove which synthetic summary replaced
-  dropped context without reverse-engineering the prompt text.
+  message/branch references (mandatory — seq ids are transport-only and
+  stripped from bundles), latency, and before/after accounting. The
+  proactive trigger compares provider-observed usage (last real
+  `completion.finished` plus an appended-message estimate) against a
+  configurable fraction of the model window. The summary is model-written
+  by a summarization completion recorded like any llm call
+  (`completion.requested`/`chunk`/`finished`) under the reserved
+  context-maintenance `llm_call_ordinal` 0, with a deterministic digest
+  fallback noted in `reason`. Context manifests use the same
+  `compaction_id` in a model-visible compaction attachment, so
+  inspection/export can prove which synthetic summary replaced dropped
+  context without reverse-engineering the prompt text.
 
 ### Event Taxonomy Rule
 

@@ -13,6 +13,12 @@ pub struct BranchTranscriptPage<T> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContextCompactionReport {
     pub compaction_id: bt_core::CompactionId,
+    /// 1-based compaction window ordinal on this branch.
+    pub window_number: Option<u64>,
+    /// `compaction_id` of the previous compaction on this branch.
+    pub previous_compaction_id: Option<bt_core::CompactionId>,
+    /// `compaction_id` of the first compaction in this branch's chain.
+    pub first_compaction_id: Option<bt_core::CompactionId>,
     pub trigger: bt_core::ContextCompactionTrigger,
     pub phase: bt_core::ContextCompactionPhase,
     pub status: bt_core::ContextCompactionStatus,
