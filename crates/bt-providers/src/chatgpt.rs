@@ -79,6 +79,9 @@ impl OpenAiChatGptProvider {
             input,
             stream: true,
             store: false,
+            include: reasoning
+                .is_some()
+                .then(|| vec!["reasoning.encrypted_content"]),
             reasoning,
             tools: (!request.tools.is_empty()).then(|| {
                 request
@@ -214,6 +217,10 @@ struct ChatGptResponsesRequest {
     input: Vec<Value>,
     stream: bool,
     store: bool,
+    /// With store=false the backend only returns replayable encrypted
+    /// reasoning items when explicitly asked for them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include: Option<Vec<&'static str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ChatGptReasoning>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -348,6 +355,20 @@ fn extend_assistant_input_items(
             MessagePart::ToolResult { result } => {
                 flush_assistant_text(items, assistant_message_index, &mut buffered_text);
                 items.push(function_call_output_item(result));
+            }
+            // Encrypted reasoning items captured from this backend are
+            // replayed verbatim in part order, as the codex harness does;
+            // display-only reasoning and foreign-provider blobs are omitted.
+            MessagePart::Reasoning {
+                opaque_replay: Some(replay),
+                ..
+            } => {
+                if replay.get("provider").and_then(Value::as_str) == Some("openai-chatgpt")
+                    && let Some(item) = replay.get("item")
+                {
+                    flush_assistant_text(items, assistant_message_index, &mut buffered_text);
+                    items.push(item.clone());
+                }
             }
             MessagePart::Reasoning { .. } | MessagePart::Refusal { text: None, .. } => {}
         }
@@ -688,6 +709,27 @@ fn apply_output_item_done(
     item: &Value,
     raw_json: &Value,
 ) -> Vec<CompletionChunk> {
+    // Completed reasoning items carry the encrypted replay payload. The
+    // readable summary already streamed via reasoning_summary_text deltas;
+    // this discrete part is the verbatim item to replay on later requests,
+    // exactly as the codex harness does.
+    if item.get("type").and_then(Value::as_str) == Some("reasoning")
+        && item.get("encrypted_content").is_some()
+    {
+        return vec![CompletionChunk {
+            llm_call_ordinal: None,
+            deltas: vec![CompletionDelta::AppendReasoning {
+                text: None,
+                redacted: false,
+                opaque_replay: Some(serde_json::json!({
+                    "provider": "openai-chatgpt",
+                    "item": item.clone(),
+                })),
+            }],
+            usage: None,
+            raw: None,
+        }];
+    }
     if item.get("type").and_then(Value::as_str) != Some("function_call") {
         return Vec::new();
     }
@@ -902,6 +944,90 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap;
     use url::Url;
+
+    #[test]
+    fn encrypted_reasoning_item_captures_replay_part() {
+        let mut tool_calls = BTreeMap::new();
+        let event = json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_123",
+                "summary": [],
+                "encrypted_content": "gAAAAA-blob"
+            }
+        });
+        let chunks = completion_chunks_from_responses_event(&event.to_string(), &mut tool_calls)
+            .expect("translate");
+        let replay = chunks
+            .iter()
+            .flat_map(|chunk| &chunk.deltas)
+            .find_map(|delta| match delta {
+                CompletionDelta::AppendReasoning {
+                    opaque_replay: Some(replay),
+                    ..
+                } => Some(replay.clone()),
+                _ => None,
+            })
+            .expect("encrypted reasoning item must be captured for replay");
+        assert_eq!(replay["provider"], "openai-chatgpt");
+        assert_eq!(replay["item"]["encrypted_content"], "gAAAAA-blob");
+        assert_eq!(replay["item"]["id"], "rs_123");
+    }
+
+    #[test]
+    fn captured_reasoning_items_replay_in_input_order() {
+        let request = CompletionRequest {
+            connection_id: ConnectionId::new("chatgpt"),
+            model: "gpt-5.4-mini".to_owned(),
+            system_prompt: None,
+            messages: vec![
+                Message::text(Role::User, "question"),
+                Message::new(
+                    Role::Assistant,
+                    vec![
+                        MessagePart::Reasoning {
+                            text: Some("summary text".to_owned()),
+                            redacted: false,
+                            opaque_replay: None,
+                        },
+                        MessagePart::Reasoning {
+                            text: None,
+                            redacted: false,
+                            opaque_replay: Some(json!({
+                                "provider": "openai-chatgpt",
+                                "item": {"type":"reasoning","id":"rs_1",
+                                          "encrypted_content":"blob1","summary":[]},
+                            })),
+                        },
+                        MessagePart::Reasoning {
+                            text: None,
+                            redacted: false,
+                            opaque_replay: Some(json!({
+                                "provider": "anthropic",
+                                "block": {"type":"thinking","thinking":"t","signature":"s"},
+                            })),
+                        },
+                        MessagePart::Text {
+                            text: "the answer".to_owned(),
+                        },
+                    ],
+                ),
+            ],
+            tools: Vec::new(),
+            structured_output: None,
+            max_tokens: Some(128),
+            temperature: None,
+            thinking: None,
+        };
+        let items = request_input_items(&request);
+        let kinds: Vec<&str> = items
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or("?"))
+            .collect();
+        assert_eq!(kinds, vec!["message", "reasoning", "message"]);
+        assert_eq!(items[1]["encrypted_content"], "blob1");
+    }
 
     #[test]
     fn request_translation_uses_responses_items() {

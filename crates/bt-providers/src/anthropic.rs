@@ -66,7 +66,8 @@ impl AnthropicProvider {
             thinking,
             ..
         } = request;
-        let (system, messages) = messages_to_anthropic(system_prompt, messages);
+        let thinking = thinking.and_then(thinking_to_anthropic);
+        let (system, messages) = messages_to_anthropic(system_prompt, messages, thinking.is_some());
 
         AnthropicMessagesRequest {
             model,
@@ -76,7 +77,7 @@ impl AnthropicProvider {
             stream: true,
             temperature,
             tools: (!tools.is_empty()).then(|| tools.iter().map(tool_spec_to_anthropic).collect()),
-            thinking: thinking.and_then(thinking_to_anthropic),
+            thinking,
         }
     }
 }
@@ -253,6 +254,7 @@ struct AnthropicThinking {
 fn messages_to_anthropic(
     system_prompt: Option<String>,
     messages: Vec<Message>,
+    include_thinking: bool,
 ) -> (Option<String>, Vec<AnthropicMessage>) {
     let mut system_parts = Vec::new();
     if let Some(system_prompt) = system_prompt.filter(|value| !value.trim().is_empty()) {
@@ -267,7 +269,7 @@ fn messages_to_anthropic(
         }
 
         let role = anthropic_role(&message.role);
-        let content = message_to_anthropic_blocks(&message.parts);
+        let content = message_to_anthropic_blocks(&message.parts, include_thinking);
         if content.is_empty() {
             continue;
         }
@@ -304,14 +306,22 @@ fn anthropic_role(role: &Role) -> String {
     .to_owned()
 }
 
-fn message_to_anthropic_blocks(parts: &[MessagePart]) -> Vec<Value> {
+fn message_to_anthropic_blocks(parts: &[MessagePart], include_thinking: bool) -> Vec<Value> {
     parts
         .iter()
-        .flat_map(message_part_to_anthropic_blocks)
+        .flat_map(|part| message_part_to_anthropic_blocks(part, include_thinking))
         .collect()
 }
 
-fn message_part_to_anthropic_blocks(part: &MessagePart) -> Vec<Value> {
+/// A signed provider block captured at stream time, replayable only to the
+/// provider that signed it.
+fn anthropic_replay_block(replay: &Value) -> Option<Value> {
+    (replay.get("provider").and_then(Value::as_str) == Some("anthropic"))
+        .then(|| replay.get("block").cloned())
+        .flatten()
+}
+
+fn message_part_to_anthropic_blocks(part: &MessagePart, include_thinking: bool) -> Vec<Value> {
     match part {
         MessagePart::Text { text } => vec![json!({
             "type": "text",
@@ -339,6 +349,15 @@ fn message_part_to_anthropic_blocks(part: &MessagePart) -> Vec<Value> {
             "type": "text",
             "text": render_value_as_text(value),
         })],
+        // Signed thinking / redacted-thinking blocks are replayed verbatim so
+        // same-turn tool loops satisfy Anthropic's preserved-thinking rule.
+        // Display-only reasoning parts (no opaque replay) and foreign-signed
+        // blocks are omitted; when thinking is disabled on this request,
+        // thinking blocks must not be sent at all.
+        MessagePart::Reasoning {
+            opaque_replay: Some(replay),
+            ..
+        } if include_thinking => anthropic_replay_block(replay).into_iter().collect(),
         MessagePart::Reasoning { .. } | MessagePart::Refusal { text: None, .. } => Vec::new(),
     }
 }
@@ -394,8 +413,15 @@ struct AnthropicToolUseAccumulator {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+struct AnthropicThinkingAccumulator {
+    thinking: String,
+    signature: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct AnthropicStreamState {
     tool_uses: BTreeMap<usize, AnthropicToolUseAccumulator>,
+    thinking_blocks: BTreeMap<usize, AnthropicThinkingAccumulator>,
     prompt_tokens: u64,
     completion_tokens: u64,
     cache_read_tokens: Option<u64>,
@@ -462,6 +488,39 @@ impl AnthropicStreamState {
             CompletionDelta::CloseToolCall { call_id: id },
             accumulator.source_raw,
         ))
+    }
+
+    fn start_thinking(&mut self, index: usize, initial_text: &str) {
+        let accumulator = self.thinking_blocks.entry(index).or_default();
+        accumulator.thinking.push_str(initial_text);
+    }
+
+    fn push_thinking(&mut self, index: usize, text: &str) {
+        if let Some(accumulator) = self.thinking_blocks.get_mut(&index) {
+            accumulator.thinking.push_str(text);
+        }
+    }
+
+    fn push_signature(&mut self, index: usize, signature: &str) {
+        if let Some(accumulator) = self.thinking_blocks.get_mut(&index) {
+            accumulator.signature.push_str(signature);
+        }
+    }
+
+    /// Closes a thinking block, returning the verbatim signed block for
+    /// replay. Unsigned blocks yield nothing — without the signature the
+    /// provider would reject the replay, and the display text was already
+    /// streamed.
+    fn finish_thinking(&mut self, index: usize) -> Option<Value> {
+        let accumulator = self.thinking_blocks.remove(&index)?;
+        if accumulator.signature.is_empty() {
+            return None;
+        }
+        Some(serde_json::json!({
+            "type": "thinking",
+            "thinking": accumulator.thinking,
+            "signature": accumulator.signature,
+        }))
     }
 
     fn update_usage(&mut self, usage: &Value) {
@@ -576,9 +635,9 @@ pub(crate) fn completion_chunks_from_sse_event(
                         }
                     }
                     Some("thinking") => {
-                        if let Some(text) = block.get("thinking").and_then(Value::as_str)
-                            && !text.is_empty()
-                        {
+                        let text = block.get("thinking").and_then(Value::as_str).unwrap_or("");
+                        state.start_thinking(index, text);
+                        if !text.is_empty() {
                             chunks.push(CompletionChunk {
                                 llm_call_ordinal: None,
                                 deltas: vec![CompletionDelta::AppendReasoning {
@@ -592,12 +651,23 @@ pub(crate) fn completion_chunks_from_sse_event(
                         }
                     }
                     Some("redacted_thinking") => {
+                        // Redacted thinking arrives as one complete block;
+                        // its opaque data is the replay material.
+                        let opaque_replay = block.get("data").and_then(Value::as_str).map(|data| {
+                            serde_json::json!({
+                                "provider": "anthropic",
+                                "block": {
+                                    "type": "redacted_thinking",
+                                    "data": data,
+                                },
+                            })
+                        });
                         chunks.push(CompletionChunk {
                             llm_call_ordinal: None,
                             deltas: vec![CompletionDelta::AppendReasoning {
                                 text: None,
                                 redacted: true,
-                                opaque_replay: None,
+                                opaque_replay,
                             }],
                             usage: None,
                             raw: None,
@@ -638,6 +708,7 @@ pub(crate) fn completion_chunks_from_sse_event(
                     }
                     Some("thinking_delta") => {
                         if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                            state.push_thinking(index, text);
                             chunks.push(CompletionChunk {
                                 llm_call_ordinal: None,
                                 deltas: vec![CompletionDelta::AppendReasoning {
@@ -648,6 +719,11 @@ pub(crate) fn completion_chunks_from_sse_event(
                                 usage: None,
                                 raw: None,
                             });
+                        }
+                    }
+                    Some("signature_delta") => {
+                        if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
+                            state.push_signature(index, signature);
                         }
                     }
                     Some("input_json_delta") => {
@@ -677,6 +753,23 @@ pub(crate) fn completion_chunks_from_sse_event(
                 chunks.push(CompletionChunk {
                     llm_call_ordinal: None,
                     deltas: vec![chunk],
+                    usage: None,
+                    raw: None,
+                });
+            }
+            if let Some(block) = state.finish_thinking(index) {
+                // The signed block closes as a discrete replay-bearing part
+                // (opaque parts never coalesce with the streamed text part).
+                chunks.push(CompletionChunk {
+                    llm_call_ordinal: None,
+                    deltas: vec![CompletionDelta::AppendReasoning {
+                        text: None,
+                        redacted: false,
+                        opaque_replay: Some(serde_json::json!({
+                            "provider": "anthropic",
+                            "block": block,
+                        })),
+                    }],
                     usage: None,
                     raw: None,
                 });
@@ -744,6 +837,170 @@ mod tests {
     use tokio::net::TcpListener;
     use url::Url;
 
+    fn sse(event: &str, data: Value) -> SseEvent {
+        SseEvent {
+            event: Some(event.to_owned()),
+            data: data.to_string(),
+        }
+    }
+
+    #[test]
+    fn thinking_stream_captures_signed_block_for_replay() {
+        let mut state = super::AnthropicStreamState::default();
+        let mut deltas = Vec::new();
+        for event in [
+            sse(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,
+                       "content_block":{"type":"thinking","thinking":""}}),
+            ),
+            sse(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,
+                       "delta":{"type":"thinking_delta","thinking":"step one"}}),
+            ),
+            sse(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,
+                       "delta":{"type":"signature_delta","signature":"sigAAA"}}),
+            ),
+            sse(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":0}),
+            ),
+        ] {
+            for chunk in completion_chunks_from_sse_event(&event, &mut state).expect("translate") {
+                deltas.extend(chunk.deltas);
+            }
+        }
+
+        let opaque = deltas
+            .iter()
+            .find_map(|delta| match delta {
+                CompletionDelta::AppendReasoning {
+                    opaque_replay: Some(replay),
+                    ..
+                } => Some(replay.clone()),
+                _ => None,
+            })
+            .expect("signed thinking block must produce a replay part");
+        assert_eq!(opaque["provider"], "anthropic");
+        assert_eq!(opaque["block"]["type"], "thinking");
+        assert_eq!(opaque["block"]["thinking"], "step one");
+        assert_eq!(opaque["block"]["signature"], "sigAAA");
+        assert!(
+            deltas.iter().any(|delta| matches!(delta,
+                CompletionDelta::AppendReasoning { text: Some(text), opaque_replay: None, .. }
+                    if text == "step one")),
+            "display text must still stream"
+        );
+    }
+
+    #[test]
+    fn unsigned_thinking_block_produces_no_replay_part() {
+        let mut state = super::AnthropicStreamState::default();
+        let mut opaque_count = 0;
+        for event in [
+            sse(
+                "content_block_start",
+                json!({"type":"content_block_start","index":0,
+                       "content_block":{"type":"thinking","thinking":"partial"}}),
+            ),
+            sse(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":0}),
+            ),
+        ] {
+            for chunk in completion_chunks_from_sse_event(&event, &mut state).expect("translate") {
+                opaque_count += chunk
+                    .deltas
+                    .iter()
+                    .filter(|delta| {
+                        matches!(
+                            delta,
+                            CompletionDelta::AppendReasoning {
+                                opaque_replay: Some(_),
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+            }
+        }
+        assert_eq!(opaque_count, 0);
+    }
+
+    #[test]
+    fn redacted_thinking_captures_opaque_data() {
+        let mut state = super::AnthropicStreamState::default();
+        let event = sse(
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,
+                   "content_block":{"type":"redacted_thinking","data":"opaqueXYZ"}}),
+        );
+        let chunks = completion_chunks_from_sse_event(&event, &mut state).expect("translate");
+        let replay = chunks
+            .iter()
+            .flat_map(|chunk| &chunk.deltas)
+            .find_map(|delta| match delta {
+                CompletionDelta::AppendReasoning {
+                    redacted: true,
+                    opaque_replay: Some(replay),
+                    ..
+                } => Some(replay.clone()),
+                _ => None,
+            })
+            .expect("redacted thinking must carry replay data");
+        assert_eq!(replay["block"]["type"], "redacted_thinking");
+        assert_eq!(replay["block"]["data"], "opaqueXYZ");
+    }
+
+    #[test]
+    fn signed_thinking_replays_only_when_thinking_enabled() {
+        let assistant = Message {
+            message_id: bt_core::MessageId::new(),
+            role: Role::Assistant,
+            parts: vec![
+                MessagePart::Reasoning {
+                    text: Some("visible trace".to_owned()),
+                    redacted: false,
+                    opaque_replay: None,
+                },
+                MessagePart::Reasoning {
+                    text: None,
+                    redacted: false,
+                    opaque_replay: Some(json!({
+                        "provider": "anthropic",
+                        "block": {"type":"thinking","thinking":"t","signature":"s"},
+                    })),
+                },
+                MessagePart::Reasoning {
+                    text: None,
+                    redacted: false,
+                    opaque_replay: Some(json!({
+                        "provider": "openai-chatgpt",
+                        "item": {"type":"reasoning"},
+                    })),
+                },
+                MessagePart::Text {
+                    text: "answer".to_owned(),
+                },
+            ],
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+
+        let (_, with_thinking) = messages_to_anthropic(None, vec![assistant.clone()], true);
+        assert_eq!(with_thinking.len(), 1);
+        assert_eq!(with_thinking[0].content.len(), 2);
+        assert_eq!(with_thinking[0].content[0]["type"], "thinking");
+        assert_eq!(with_thinking[0].content[0]["signature"], "s");
+        assert_eq!(with_thinking[0].content[1]["type"], "text");
+
+        let (_, without_thinking) = messages_to_anthropic(None, vec![assistant], false);
+        assert_eq!(without_thinking[0].content.len(), 1);
+        assert_eq!(without_thinking[0].content[0]["type"], "text");
+    }
+
     #[test]
     fn request_translation_merges_roles_and_maps_tools() {
         let (system, messages) = messages_to_anthropic(
@@ -777,6 +1034,7 @@ mod tests {
                     created_at: time::OffsetDateTime::now_utc(),
                 },
             ],
+            true,
         );
 
         assert_eq!(system.as_deref(), Some("system prompt"));

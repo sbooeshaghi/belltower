@@ -233,6 +233,10 @@ struct OpenAiStreamChoice {
 struct OpenAiStreamDelta {
     content: Option<String>,
     refusal: Option<String>,
+    // Reasoning field names vary by backend: ollama's OpenAI-compat layer
+    // streams `reasoning`, DeepSeek/vLLM stream `reasoning_content`.
+    reasoning: Option<String>,
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<OpenAiToolCallDelta>>,
 }
 
@@ -371,6 +375,25 @@ fn completion_chunks_from_sse_event(
     let mut should_flush_tool_calls = false;
 
     for choice in parsed.choices {
+        let reasoning = choice
+            .delta
+            .reasoning
+            .into_iter()
+            .chain(choice.delta.reasoning_content)
+            .find(|value| !value.is_empty());
+        if let Some(reasoning) = reasoning {
+            chunks.push(CompletionChunk {
+                llm_call_ordinal: None,
+                deltas: vec![CompletionDelta::AppendReasoning {
+                    text: Some(reasoning),
+                    redacted: false,
+                    opaque_replay: None,
+                }],
+                usage: None,
+                raw: None,
+            });
+        }
+
         if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
             chunks.push(CompletionChunk {
                 llm_call_ordinal: None,
@@ -838,6 +861,29 @@ mod tests {
     }
 
     #[test]
+    fn local_reasoning_delta_fields_capture_reasoning() {
+        for field in ["reasoning", "reasoning_content"] {
+            let mut tool_calls = Vec::new();
+            let data = format!(
+                r#"{{"choices":[{{"delta":{{"role":"assistant","content":"","{field}":"thinking about it"}}}}]}}"#
+            );
+            let chunks =
+                completion_chunks_from_sse_event(&data, &mut tool_calls).expect("translate");
+            let captured = chunks.iter().flat_map(|chunk| &chunk.deltas).any(|delta| {
+                matches!(
+                    delta,
+                    CompletionDelta::AppendReasoning {
+                        text: Some(text),
+                        redacted: false,
+                        opaque_replay: None,
+                    } if text == "thinking about it"
+                )
+            });
+            assert!(captured, "delta.{field} must become reasoning");
+        }
+    }
+
+    #[test]
     fn declared_tools_request_auto_tool_choice() {
         let provider = OpenAiCompatibleProvider::new(
             "openai-compatible",
@@ -1091,6 +1137,8 @@ mod tests {
         let response = serde_json::to_string(&OpenAiStreamResponse {
             choices: vec![OpenAiStreamChoice {
                 delta: OpenAiStreamDelta {
+                    reasoning: None,
+                    reasoning_content: None,
                     content: Some("hello".to_owned()),
                     refusal: None,
                     tool_calls: Some(vec![OpenAiToolCallDelta {
