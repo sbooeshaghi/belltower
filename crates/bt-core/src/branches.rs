@@ -7,7 +7,7 @@ pub const fn default_settings_revision_id() -> u64 {
     1
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum SessionStatus {
     Active,
     Completed,
@@ -15,16 +15,21 @@ pub enum SessionStatus {
     Abandoned,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct SessionRecord {
     pub session_id: SessionId,
+    /// UTF-8 project root path, serialized as a plain string.
+    #[schemars(with = "String")]
     pub project_root: Utf8PathBuf,
     pub connection_id: ConnectionId,
     pub model_id: Option<String>,
     pub tool_mode: SessionToolMode,
     #[serde(default = "default_settings_revision_id")]
     pub settings_revision_id: u64,
+    #[schemars(schema_with = "crate::schema_support::offset_date_time_schema")]
     pub created_at: OffsetDateTime,
+    #[schemars(schema_with = "crate::schema_support::offset_date_time_schema")]
     pub updated_at: OffsetDateTime,
     pub status: SessionStatus,
     pub display_name: Option<String>,

@@ -61,6 +61,24 @@ impl<'de> Deserialize<'de> for PortableHash {
     }
 }
 
+impl schemars::JsonSchema for PortableHash {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("PortableHash")
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("bt_core::PortableHash")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "description": "Portable content hash: `sha256:` followed by 64 lowercase hex characters."
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("portable hash must be sha256:<64 lowercase hex chars>")]
 pub struct PortableHashParseError;
@@ -81,7 +99,8 @@ fn validate_portable_hash(value: &str) -> Result<(), PortableHashParseError> {
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct SessionNodeRef {
     pub bundle_hash: Option<PortableHash>,
     pub session_id: SessionId,
@@ -92,7 +111,8 @@ pub struct SessionNodeRef {
     pub event_hash: PortableHash,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ContentRef {
     pub hash: PortableHash,
     pub media_type: Option<String>,
@@ -100,7 +120,8 @@ pub struct ContentRef {
     pub path: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct EventRange {
     pub branch_id: BranchId,
     pub ordinal_start: u64,
@@ -111,7 +132,8 @@ pub struct EventRange {
     pub exported_store_seq_end: Option<i64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct BundleArtifactRef {
     pub artifact_id: String,
     pub kind: String,
@@ -119,7 +141,8 @@ pub struct BundleArtifactRef {
     pub content: ContentRef,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct BranchManifest {
     pub branch_id: BranchId,
     pub parent_branch_id: Option<BranchId>,
@@ -129,19 +152,20 @@ pub struct BranchManifest {
     pub summary: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ProducerInfo {
     pub name: String,
     pub version: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RedactionPolicy {
     None,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionBundleArtifactMode {
     TraceOnly,
@@ -149,7 +173,8 @@ pub enum SessionBundleArtifactMode {
     TracePlusArtifacts,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct SessionBundleManifest {
     pub schema_version: u32,
     pub bundle_hash: PortableHash,

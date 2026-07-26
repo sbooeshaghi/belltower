@@ -7,7 +7,8 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use url::Url;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -17,7 +18,8 @@ pub struct TokenUsage {
     pub reasoning_tokens: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct CostBreakdown {
     pub prompt_usd: f64,
     pub completion_usd: f64,
@@ -46,7 +48,8 @@ pub struct ModelPricing {
     pub unpriced_reason: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ThinkingConfig {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,7 +62,7 @@ pub struct ThinkingConfig {
     pub include_summaries: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingEffort {
     None,
@@ -72,7 +75,8 @@ pub enum ThinkingEffort {
 
 /// Session-level autonomy limits. These are runtime-owned controls, not
 /// provider thinking-budget hints.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct BudgetConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_wall_clock_seconds: Option<u64>,
@@ -113,7 +117,7 @@ pub struct StructuredOutputSpec {
     pub schema: Value,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolRiskClass {
     Safe,
@@ -121,7 +125,7 @@ pub enum ToolRiskClass {
     High,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolInterruptBehavior {
     Immediate,
@@ -129,14 +133,14 @@ pub enum ToolInterruptBehavior {
     TerminateProcess,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolExecutionMode {
     Immediate,
     UserInput,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolDisplayGroup {
     Codebase,
@@ -149,7 +153,8 @@ pub enum ToolDisplayGroup {
     External,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ToolMetadata {
     pub risk_class: ToolRiskClass,
     pub is_read_only: bool,
@@ -161,7 +166,7 @@ pub struct ToolMetadata {
     pub display_group: ToolDisplayGroup,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStatus {
     Pending,
@@ -170,7 +175,8 @@ pub enum PlanStatus {
     Blocked,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct PlanItem {
     pub id: String,
     pub content: String,
@@ -252,18 +258,22 @@ pub struct WebFetchResponse {
     pub content_digest: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ContextSystemPromptRef {
     pub present: bool,
     pub char_count: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ContextMessageRef {
     pub message_id: crate::MessageId,
     pub role: crate::Role,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_branch_id: Option<BranchId>,
+    /// Store-local sequence ref; transport-only, removed from canonical
+    /// (hashed) bytes and from `session.bt` bundle event records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_seq_id: Option<i64>,
     pub part_count: u32,
@@ -277,7 +287,8 @@ pub struct ContextMessageSourceRef {
     pub seq_id: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ContextToolRef {
     pub name: String,
     pub risk_class: ToolRiskClass,
@@ -286,7 +297,7 @@ pub struct ContextToolRef {
     pub should_defer: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextAttachmentType {
     Generated,
@@ -296,7 +307,7 @@ pub enum ContextAttachmentType {
     Resource,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextAttachmentProducer {
     Runtime,
@@ -306,7 +317,8 @@ pub enum ContextAttachmentProducer {
     ExternalServer,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ContextAttachmentVisibility {
     #[serde(default)]
     pub model_visible: bool,
@@ -316,7 +328,7 @@ pub struct ContextAttachmentVisibility {
     pub exportable: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextPromptPlacement {
     #[default]
@@ -327,7 +339,7 @@ pub enum ContextPromptPlacement {
     AttachmentBlock,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextTruncationStatus {
     #[default]
@@ -336,7 +348,8 @@ pub enum ContextTruncationStatus {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ContextAttachment {
     pub id: String,
     pub attachment_type: ContextAttachmentType,
@@ -359,7 +372,9 @@ pub struct ContextAttachment {
     pub truncation: ContextTruncationStatus,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextCompactionTrigger {
     Forced,
@@ -367,7 +382,9 @@ pub enum ContextCompactionTrigger {
     TokenBudget,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextCompactionPhase {
     Manual,
@@ -375,7 +392,9 @@ pub enum ContextCompactionPhase {
     PreTurn,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextCompactionStatus {
     #[default]
@@ -389,7 +408,8 @@ pub enum ContextCompactionStatus {
 /// prompt bodies. Full message content and instruction provenance already live
 /// in canonical session events; this shape makes the model-visible boundary
 /// replayable without duplicating large payloads in every completion event.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ContextManifest {
     pub turn_id: TurnId,
     pub branch_id: BranchId,
@@ -398,6 +418,8 @@ pub struct ContextManifest {
     pub model: String,
     #[serde(default = "default_settings_revision_id")]
     pub settings_revision_id: u64,
+    /// Store-local sequence ref; transport-only, removed from canonical
+    /// (hashed) bytes and from `session.bt` bundle event records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_boundary_seq_id: Option<i64>,
     pub system_prompt: ContextSystemPromptRef,
@@ -410,7 +432,8 @@ pub struct ContextManifest {
     pub compacted: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ArtifactRef {
     pub id: String,
     pub kind: String,
@@ -430,7 +453,9 @@ pub struct ArtifactRef {
     pub preview: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolOperationInitiator {
     #[default]
@@ -440,7 +465,8 @@ pub enum ToolOperationInitiator {
     Mcp,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ToolOperationContext {
     #[serde(default)]
     pub initiator: ToolOperationInitiator,
@@ -467,7 +493,8 @@ impl ToolOperationContext {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ToolResultEnvelope {
     pub call_id: ToolCallId,
     pub tool_name: String,
@@ -542,7 +569,8 @@ impl ApprovalRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ApprovalRequestSnapshot {
     pub session_id: SessionId,
     pub call_id: ToolCallId,
@@ -560,10 +588,12 @@ pub struct ApprovalRequestSnapshot {
     pub registry_schema_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_rule: Option<String>,
+    #[schemars(schema_with = "crate::schema_support::offset_date_time_schema")]
     pub requested_at: OffsetDateTime,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ApprovalResolution {
     pub request_fingerprint: String,
     pub decision: ApprovalDecision,
@@ -579,14 +609,15 @@ impl ApprovalResolution {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum ApprovalScope {
     Once,
     Session,
     Always,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ApprovalDecisionSource {
     Human,
@@ -594,15 +625,18 @@ pub enum ApprovalDecisionSource {
     Runtime,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub enum ApprovalDecision {
     Approved {
+        #[schemars(schema_with = "crate::schema_support::offset_date_time_schema")]
         decided_at: OffsetDateTime,
         decided_by: String,
         scope: ApprovalScope,
         source: ApprovalDecisionSource,
     },
     Denied {
+        #[schemars(schema_with = "crate::schema_support::offset_date_time_schema")]
         decided_at: OffsetDateTime,
         decided_by: String,
         reason: Option<String>,
@@ -611,7 +645,8 @@ pub enum ApprovalDecision {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub enum ApprovalRequirement {
     Always,
     FirstUsePerSession,
@@ -710,14 +745,16 @@ fn stable_hash(value: &str) -> String {
     format!("fnv1a64:{hash:016x}")
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct InstructionDocument {
     pub source: String,
     pub title: String,
     pub body: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct TurnInstructionProvenance {
     pub turn_id: TurnId,
     pub provider: String,
@@ -915,7 +952,8 @@ impl ContextManifest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub enum CompletionDelta {
     AppendText {
         text: String,
@@ -1309,7 +1347,9 @@ pub enum SessionRuntimeState {
     CancelRequested,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionToolMode {
     Standard,

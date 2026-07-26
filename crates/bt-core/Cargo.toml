@@ -11,6 +11,7 @@ publish = true
 [dependencies]
 camino.workspace = true
 futures-core.workspace = true
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

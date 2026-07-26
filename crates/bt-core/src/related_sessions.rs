@@ -7,7 +7,7 @@ use time::OffsetDateTime;
 pub const MAX_RELATED_SESSION_DEPTH: usize = 4;
 pub const MAX_RELATED_SESSION_DESCENDANTS: usize = 8;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RelatedSessionMessageKind {
     Instruction,
@@ -18,21 +18,21 @@ pub enum RelatedSessionMessageKind {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RelatedSessionDeliveryMode {
     Notify,
     Wake,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RelatedSessionMessageDirection {
     Sent,
     Received,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RelatedSessionMessageStatus {
     Delivered,
@@ -41,7 +41,8 @@ pub enum RelatedSessionMessageStatus {
     Dropped,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct RelatedSessionMessage {
     pub message_id: RelatedSessionMessageId,
     pub context_message_id: MessageId,
@@ -56,6 +57,7 @@ pub struct RelatedSessionMessage {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifact_refs: Vec<ArtifactRef>,
+    #[schemars(schema_with = "crate::schema_support::offset_date_time_schema")]
     pub created_at: OffsetDateTime,
 }
 

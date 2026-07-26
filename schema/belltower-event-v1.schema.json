@@ -1,0 +1,3412 @@
+{
+  "$defs": {
+    "ApprovalDecision": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Approved": {
+              "additionalProperties": false,
+              "properties": {
+                "decided_at": {
+                  "description": "Timestamp in the `time` crate's default serde representation: [year, day_of_year, hour, minute, second, nanosecond, offset_hour, offset_minute, offset_second].",
+                  "items": false,
+                  "maxItems": 9,
+                  "minItems": 9,
+                  "prefixItems": [
+                    {
+                      "description": "calendar year",
+                      "maximum": 9999,
+                      "minimum": -9999,
+                      "type": "integer"
+                    },
+                    {
+                      "description": "ordinal day of the year",
+                      "maximum": 366,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    {
+                      "description": "hour",
+                      "maximum": 23,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "description": "minute",
+                      "maximum": 59,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "description": "second",
+                      "maximum": 59,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "description": "nanosecond",
+                      "maximum": 999999999,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "description": "UTC offset hours",
+                      "maximum": 25,
+                      "minimum": -25,
+                      "type": "integer"
+                    },
+                    {
+                      "description": "UTC offset minutes",
+                      "maximum": 59,
+                      "minimum": -59,
+                      "type": "integer"
+                    },
+                    {
+                      "description": "UTC offset seconds",
+                      "maximum": 59,
+                      "minimum": -59,
+                      "type": "integer"
+                    }
+                  ],
+                  "type": "array"
+                },
+                "decided_by": {
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/$defs/ApprovalScope"
+                },
+                "source": {
+                  "$ref": "#/$defs/ApprovalDecisionSource"
+                }
+              },
+              "required": [
+                "decided_at",
+                "decided_by",
+                "scope",
+                "source"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "Approved"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Denied": {
+              "additionalProperties": false,
+              "properties": {
+                "decided_at": {
+                  "description": "Timestamp in the `time` crate's default serde representation: [year, day_of_year, hour, minute, second, nanosecond, offset_hour, offset_minute, offset_second].",
+                  "items": false,
+                  "maxItems": 9,
+                  "minItems": 9,
+                  "prefixItems": [
+                    {
+                      "description": "calendar year",
+                      "maximum": 9999,
+                      "minimum": -9999,
+                      "type": "integer"
+                    },
+                    {
+                      "description": "ordinal day of the year",
+                      "maximum": 366,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    {
+                      "description": "hour",
+                      "maximum": 23,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "description": "minute",
+                      "maximum": 59,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "description": "second",
+                      "maximum": 59,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "description": "nanosecond",
+                      "maximum": 999999999,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "description": "UTC offset hours",
+                      "maximum": 25,
+                      "minimum": -25,
+                      "type": "integer"
+                    },
+                    {
+                      "description": "UTC offset minutes",
+                      "maximum": 59,
+                      "minimum": -59,
+                      "type": "integer"
+                    },
+                    {
+                      "description": "UTC offset seconds",
+                      "maximum": 59,
+                      "minimum": -59,
+                      "type": "integer"
+                    }
+                  ],
+                  "type": "array"
+                },
+                "decided_by": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "scope": {
+                  "$ref": "#/$defs/ApprovalScope"
+                },
+                "source": {
+                  "$ref": "#/$defs/ApprovalDecisionSource"
+                }
+              },
+              "required": [
+                "decided_at",
+                "decided_by",
+                "scope",
+                "source"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "Denied"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ApprovalDecisionSource": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "human",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "policy",
+              "type": "string"
+            },
+            "rule": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "rule"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "runtime",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ApprovalRequestSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "arguments_hash": {
+          "type": "string"
+        },
+        "call_id": {
+          "type": "string"
+        },
+        "initiator": {
+          "$ref": "#/$defs/ToolOperationInitiator",
+          "default": "agent"
+        },
+        "policy_rule": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "redacted_arguments_preview": true,
+        "registry_schema_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_fingerprint": {
+          "type": "string"
+        },
+        "requested_at": {
+          "description": "Timestamp in the `time` crate's default serde representation: [year, day_of_year, hour, minute, second, nanosecond, offset_hour, offset_minute, offset_second].",
+          "items": false,
+          "maxItems": 9,
+          "minItems": 9,
+          "prefixItems": [
+            {
+              "description": "calendar year",
+              "maximum": 9999,
+              "minimum": -9999,
+              "type": "integer"
+            },
+            {
+              "description": "ordinal day of the year",
+              "maximum": 366,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "description": "hour",
+              "maximum": 23,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "minute",
+              "maximum": 59,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "second",
+              "maximum": 59,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "nanosecond",
+              "maximum": 999999999,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset hours",
+              "maximum": 25,
+              "minimum": -25,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset minutes",
+              "maximum": 59,
+              "minimum": -59,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset seconds",
+              "maximum": 59,
+              "minimum": -59,
+              "type": "integer"
+            }
+          ],
+          "type": "array"
+        },
+        "requirement": {
+          "$ref": "#/$defs/ApprovalRequirement"
+        },
+        "session_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "surface": {
+          "type": "string"
+        },
+        "tool_metadata": {
+          "$ref": "#/$defs/ToolMetadata"
+        },
+        "tool_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "call_id",
+        "tool_name",
+        "request_fingerprint",
+        "arguments_hash",
+        "requirement",
+        "tool_metadata",
+        "surface",
+        "requested_at"
+      ],
+      "type": "object"
+    },
+    "ApprovalRequirement": {
+      "oneOf": [
+        {
+          "enum": [
+            "Always",
+            "FirstUsePerSession",
+            "Never"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Conditional": {
+              "additionalProperties": false,
+              "properties": {
+                "description": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "description"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "Conditional"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ApprovalResolution": {
+      "additionalProperties": false,
+      "properties": {
+        "decision": {
+          "$ref": "#/$defs/ApprovalDecision"
+        },
+        "request_fingerprint": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "request_fingerprint",
+        "decision"
+      ],
+      "type": "object"
+    },
+    "ApprovalScope": {
+      "enum": [
+        "Once",
+        "Session",
+        "Always"
+      ],
+      "type": "string"
+    },
+    "ArtifactRef": {
+      "additionalProperties": false,
+      "properties": {
+        "content_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "model_visible": {
+          "default": false,
+          "type": "boolean"
+        },
+        "preview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "producer_event_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "producer_tool_call_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uri": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "BudgetConfig": {
+      "additionalProperties": false,
+      "description": "Session-level autonomy limits. These are runtime-owned controls, not\nprovider thinking-budget hints.",
+      "properties": {
+        "max_cost_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_turns": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_wall_clock_seconds": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "CompletionDelta": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "AppendText": {
+              "additionalProperties": false,
+              "properties": {
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "text"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "AppendText"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "AppendReasoning": {
+              "additionalProperties": false,
+              "properties": {
+                "opaque_replay": true,
+                "redacted": {
+                  "type": "boolean"
+                },
+                "text": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "redacted"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "AppendReasoning"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "OpenToolCall": {
+              "additionalProperties": false,
+              "properties": {
+                "arguments": true,
+                "call_id": {
+                  "type": "string"
+                },
+                "tool_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "call_id",
+                "tool_name"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "OpenToolCall"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "AppendToolCallArguments": {
+              "additionalProperties": false,
+              "properties": {
+                "call_id": {
+                  "type": "string"
+                },
+                "partial_json": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "call_id",
+                "partial_json"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "AppendToolCallArguments"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "CloseToolCall": {
+              "additionalProperties": false,
+              "properties": {
+                "call_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "call_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "CloseToolCall"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "AppendRefusal": {
+              "additionalProperties": false,
+              "properties": {
+                "opaque_metadata": true,
+                "provider_reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "text": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "AppendRefusal"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "SetStructuredOutput": {
+              "additionalProperties": false,
+              "properties": {
+                "schema_name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "value": true
+              },
+              "required": [
+                "value"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "SetStructuredOutput"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ContextAttachment": {
+      "additionalProperties": false,
+      "properties": {
+        "attachment_type": {
+          "$ref": "#/$defs/ContextAttachmentType"
+        },
+        "digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "placement": {
+          "$ref": "#/$defs/ContextPromptPlacement",
+          "default": "not_placed"
+        },
+        "producer": {
+          "$ref": "#/$defs/ContextAttachmentProducer"
+        },
+        "source_event_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_tool_call_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_uri": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "token_estimate": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "truncation": {
+          "$ref": "#/$defs/ContextTruncationStatus",
+          "default": "none"
+        },
+        "visibility": {
+          "$ref": "#/$defs/ContextAttachmentVisibility",
+          "default": {
+            "exportable": false,
+            "model_visible": false,
+            "operator_visible": false
+          }
+        }
+      },
+      "required": [
+        "id",
+        "attachment_type",
+        "producer"
+      ],
+      "type": "object"
+    },
+    "ContextAttachmentProducer": {
+      "enum": [
+        "runtime",
+        "operator",
+        "tool",
+        "memory_provider",
+        "external_server"
+      ],
+      "type": "string"
+    },
+    "ContextAttachmentType": {
+      "enum": [
+        "generated",
+        "compaction",
+        "memory",
+        "signal",
+        "resource"
+      ],
+      "type": "string"
+    },
+    "ContextAttachmentVisibility": {
+      "additionalProperties": false,
+      "properties": {
+        "exportable": {
+          "default": false,
+          "type": "boolean"
+        },
+        "model_visible": {
+          "default": false,
+          "type": "boolean"
+        },
+        "operator_visible": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "ContextCompactionPhase": {
+      "enum": [
+        "manual",
+        "pre_turn"
+      ],
+      "type": "string"
+    },
+    "ContextCompactionStatus": {
+      "enum": [
+        "completed",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "ContextCompactionTrigger": {
+      "enum": [
+        "forced",
+        "token_budget"
+      ],
+      "type": "string"
+    },
+    "ContextManifest": {
+      "additionalProperties": false,
+      "description": "Durable manifest of the context that was made visible to one provider call.\n\nThe manifest intentionally stores references and counts, not full message or\nprompt bodies. Full message content and instruction provenance already live\nin canonical session events; this shape makes the model-visible boundary\nreplayable without duplicating large payloads in every completion event.",
+      "properties": {
+        "attachments": {
+          "items": {
+            "$ref": "#/$defs/ContextAttachment"
+          },
+          "type": "array"
+        },
+        "branch_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "compacted": {
+          "type": "boolean"
+        },
+        "context_boundary_seq_id": {
+          "description": "Store-local sequence ref; transport-only, removed from canonical\n(hashed) bytes and from `session.bt` bundle event records.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "llm_call_ordinal": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "messages": {
+          "items": {
+            "$ref": "#/$defs/ContextMessageRef"
+          },
+          "type": "array"
+        },
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "settings_revision_id": {
+          "default": 1,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "system_prompt": {
+          "$ref": "#/$defs/ContextSystemPromptRef"
+        },
+        "thinking": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThinkingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/$defs/ContextToolRef"
+          },
+          "type": "array"
+        },
+        "turn_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "turn_id",
+        "branch_id",
+        "llm_call_ordinal",
+        "provider",
+        "model",
+        "system_prompt",
+        "messages",
+        "tools",
+        "compacted"
+      ],
+      "type": "object"
+    },
+    "ContextMessageRef": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "part_count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "role": {
+          "$ref": "#/$defs/Role"
+        },
+        "source_branch_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_seq_id": {
+          "description": "Store-local sequence ref; transport-only, removed from canonical\n(hashed) bytes and from `session.bt` bundle event records.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "visible_text_chars": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "message_id",
+        "role",
+        "part_count",
+        "visible_text_chars"
+      ],
+      "type": "object"
+    },
+    "ContextPromptPlacement": {
+      "enum": [
+        "not_placed",
+        "system_prompt",
+        "message_history",
+        "tool_context",
+        "attachment_block"
+      ],
+      "type": "string"
+    },
+    "ContextSystemPromptRef": {
+      "additionalProperties": false,
+      "properties": {
+        "char_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "present": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "present",
+        "char_count"
+      ],
+      "type": "object"
+    },
+    "ContextToolRef": {
+      "additionalProperties": false,
+      "properties": {
+        "execution_mode": {
+          "$ref": "#/$defs/ToolExecutionMode"
+        },
+        "is_read_only": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "risk_class": {
+          "$ref": "#/$defs/ToolRiskClass"
+        },
+        "should_defer": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "risk_class",
+        "is_read_only",
+        "execution_mode",
+        "should_defer"
+      ],
+      "type": "object"
+    },
+    "ContextTruncationStatus": {
+      "enum": [
+        "none",
+        "truncated",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "CostBreakdown": {
+      "additionalProperties": false,
+      "properties": {
+        "cache_read_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "cache_write_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "completion_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "prompt_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "reasoning_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "total_usd": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "prompt_usd",
+        "completion_usd",
+        "total_usd"
+      ],
+      "type": "object"
+    },
+    "ErrorClass": {
+      "enum": [
+        "config",
+        "auth",
+        "provider",
+        "tool",
+        "protocol",
+        "storage",
+        "not_found",
+        "runtime",
+        "unsupported"
+      ],
+      "type": "string"
+    },
+    "EventPayload": {
+      "description": "Externally tagged canonical event payload union: exactly one key naming\nthe variant (for example `{\"SessionStarted\": {...}}`). The serialized\nevent kind strings (`session.started`, ...) are derived labels, not the\nserde tag.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "SessionStarted": {
+              "additionalProperties": false,
+              "properties": {
+                "connection_id": {
+                  "type": "string"
+                },
+                "project_root": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "project_root",
+                "connection_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "SessionStarted"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "SessionSpawnRequested": {
+              "additionalProperties": false,
+              "properties": {
+                "child_session_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "connection_id": {
+                  "type": "string"
+                },
+                "model_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "objective": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "child_session_id",
+                "objective",
+                "connection_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "SessionSpawnRequested"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "SessionSpawned": {
+              "additionalProperties": false,
+              "properties": {
+                "child_branch_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "child_session_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "objective": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "child_session_id",
+                "child_branch_id",
+                "objective"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "SessionSpawned"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "SessionHandoffRecorded": {
+              "additionalProperties": false,
+              "properties": {
+                "objective": {
+                  "type": "string"
+                },
+                "parent_branch_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "parent_session_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "parent_turn_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "summary": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "parent_session_id",
+                "parent_branch_id",
+                "objective",
+                "summary"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "SessionHandoffRecorded"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "SessionResultImported": {
+              "additionalProperties": false,
+              "properties": {
+                "child_session_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "summary": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "child_session_id",
+                "status",
+                "summary"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "SessionResultImported"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "SessionResultRejected": {
+              "additionalProperties": false,
+              "properties": {
+                "child_session_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "child_session_id",
+                "reason"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "SessionResultRejected"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "RelatedSessionMessageRecorded": {
+              "additionalProperties": false,
+              "properties": {
+                "counterpart_event_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "direction": {
+                  "$ref": "#/$defs/RelatedSessionMessageDirection"
+                },
+                "message": {
+                  "$ref": "#/$defs/RelatedSessionMessage"
+                }
+              },
+              "required": [
+                "direction",
+                "counterpart_event_id",
+                "message"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "RelatedSessionMessageRecorded"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "RelatedSessionMessageResolved": {
+              "additionalProperties": false,
+              "properties": {
+                "message_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "resulting_turn_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "$ref": "#/$defs/RelatedSessionMessageStatus"
+                }
+              },
+              "required": [
+                "message_id",
+                "status"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "RelatedSessionMessageResolved"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "SessionSettingsUpdated": {
+              "additionalProperties": false,
+              "properties": {
+                "connection_id": {
+                  "type": "string"
+                },
+                "model_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "settings_revision_id": {
+                  "default": 1,
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "tool_mode": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "connection_id",
+                "tool_mode"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "SessionSettingsUpdated"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "SessionEnded": {
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "reason"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "SessionEnded"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "BranchCreated": {
+              "additionalProperties": false,
+              "properties": {
+                "parent_branch_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "parent_event_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "BranchCreated"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "BranchActivated": {
+              "additionalProperties": false,
+              "properties": {
+                "branch_id": {
+                  "format": "uuid",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "branch_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "BranchActivated"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "BranchSummarized": {
+              "additionalProperties": false,
+              "properties": {
+                "branch_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "files_modified": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "files_read": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "summary": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "branch_id",
+                "summary",
+                "files_read",
+                "files_modified"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "BranchSummarized"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "MessageAppended": {
+              "additionalProperties": false,
+              "properties": {
+                "message": {
+                  "$ref": "#/$defs/Message"
+                }
+              },
+              "required": [
+                "message"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "MessageAppended"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "TurnStarted": {
+              "additionalProperties": false,
+              "properties": {
+                "message_count": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "model": {
+                  "type": "string"
+                },
+                "provider": {
+                  "type": "string"
+                },
+                "resumed_from_call_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "settings_revision_id": {
+                  "default": 1,
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "source": {
+                  "$ref": "#/$defs/TurnStartSource",
+                  "default": "UserMessage"
+                },
+                "turn_id": {
+                  "format": "uuid",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "turn_id",
+                "provider",
+                "model",
+                "message_count"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "TurnStarted"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "TurnInstructionProvenanceRecorded": {
+              "additionalProperties": false,
+              "properties": {
+                "provenance": {
+                  "$ref": "#/$defs/TurnInstructionProvenance"
+                }
+              },
+              "required": [
+                "provenance"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "TurnInstructionProvenanceRecorded"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "TurnContextManifestRecorded": {
+              "additionalProperties": false,
+              "properties": {
+                "manifest": {
+                  "$ref": "#/$defs/ContextManifest"
+                }
+              },
+              "required": [
+                "manifest"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "TurnContextManifestRecorded"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "CompletionRequested": {
+              "additionalProperties": false,
+              "properties": {
+                "llm_call_ordinal": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "message_count": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "model": {
+                  "type": "string"
+                },
+                "provider": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "llm_call_ordinal",
+                "provider",
+                "model",
+                "message_count"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "CompletionRequested"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Live/store shape. In `session.bt` bundle event records the\nstore-local `raw_chunk_index` is replaced by a portable\n`raw_chunk_content_ref` string (`sha256:<hex>`).",
+          "properties": {
+            "CompletionChunk": {
+              "additionalProperties": false,
+              "properties": {
+                "deltas": {
+                  "items": {
+                    "$ref": "#/$defs/CompletionDelta"
+                  },
+                  "type": "array"
+                },
+                "llm_call_ordinal": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "raw_chunk_index": {
+                  "description": "Store-local raw chunk row id; transport-only. Removed from\ncanonical (hashed) bytes and replaced by\n`raw_chunk_content_ref` in bundles.",
+                  "format": "int64",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "deltas"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "CompletionChunk"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "CompletionFinished": {
+              "additionalProperties": false,
+              "properties": {
+                "cost": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/CostBreakdown"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "finish_reason": {
+                  "type": "string"
+                },
+                "latency_ms": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "llm_call_ordinal": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "model": {
+                  "type": "string"
+                },
+                "provider": {
+                  "type": "string"
+                },
+                "usage": {
+                  "$ref": "#/$defs/TokenUsage"
+                }
+              },
+              "required": [
+                "llm_call_ordinal",
+                "provider",
+                "model",
+                "usage",
+                "finish_reason",
+                "latency_ms"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "CompletionFinished"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "SessionError": {
+              "additionalProperties": false,
+              "properties": {
+                "class": {
+                  "$ref": "#/$defs/ErrorClass"
+                },
+                "code": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "retryable": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "class",
+                "code",
+                "message",
+                "retryable"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "SessionError"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "TurnFinished": {
+              "additionalProperties": false,
+              "properties": {
+                "finish_reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "latency_ms": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "model": {
+                  "type": "string"
+                },
+                "provider": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "turn_id": {
+                  "format": "uuid",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "turn_id",
+                "provider",
+                "model",
+                "status",
+                "latency_ms"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "TurnFinished"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "ToolCallRequested": {
+              "additionalProperties": false,
+              "properties": {
+                "arguments": true,
+                "call_id": {
+                  "type": "string"
+                },
+                "tool_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "call_id",
+                "tool_name",
+                "arguments"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "ToolCallRequested"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "ToolOperationRecorded": {
+              "additionalProperties": false,
+              "properties": {
+                "call_id": {
+                  "type": "string"
+                },
+                "operation": {
+                  "$ref": "#/$defs/ToolOperationContext",
+                  "default": {
+                    "initiator": "agent"
+                  }
+                },
+                "tool_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "call_id",
+                "tool_name"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "ToolOperationRecorded"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "ToolApprovalRequested": {
+              "additionalProperties": false,
+              "properties": {
+                "call_id": {
+                  "type": "string"
+                },
+                "snapshot": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/ApprovalRequestSnapshot"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "tool_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "call_id",
+                "tool_name"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "ToolApprovalRequested"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "ToolApprovalResolved": {
+              "additionalProperties": false,
+              "properties": {
+                "call_id": {
+                  "type": "string"
+                },
+                "decision": {
+                  "$ref": "#/$defs/ApprovalDecision"
+                },
+                "request_fingerprint": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "resolution": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/ApprovalResolution"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "tool_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "call_id",
+                "tool_name",
+                "decision"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "ToolApprovalResolved"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "ToolExecutionFinished": {
+              "additionalProperties": false,
+              "properties": {
+                "call_id": {
+                  "type": "string"
+                },
+                "result": {
+                  "$ref": "#/$defs/ToolResultEnvelope"
+                },
+                "tool_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "call_id",
+                "tool_name",
+                "result"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "ToolExecutionFinished"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "PlanUpdated": {
+              "additionalProperties": false,
+              "properties": {
+                "items": {
+                  "items": {
+                    "$ref": "#/$defs/PlanItem"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "items"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "PlanUpdated"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "BudgetConfigured": {
+              "additionalProperties": false,
+              "properties": {
+                "budget": {
+                  "$ref": "#/$defs/BudgetConfig"
+                }
+              },
+              "required": [
+                "budget"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "BudgetConfigured"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "ContextCompacted": {
+              "additionalProperties": false,
+              "properties": {
+                "compaction_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "context_boundary_seq_id": {
+                  "description": "Store-local sequence ref; transport-only, removed from canonical\n(hashed) bytes and from `session.bt` bundle event records.",
+                  "format": "int64",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "files_modified": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "files_read": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "first_kept_branch_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "first_kept_message_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "first_kept_seq_id": {
+                  "description": "Store-local sequence ref; transport-only, removed from canonical\n(hashed) bytes and from `session.bt` bundle event records.",
+                  "format": "int64",
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "latency_ms": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "messages_after": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "messages_before": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "model": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "phase": {
+                  "$ref": "#/$defs/ContextCompactionPhase",
+                  "default": "pre_turn"
+                },
+                "provider": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "$ref": "#/$defs/ContextCompactionStatus",
+                  "default": "completed"
+                },
+                "summary": {
+                  "default": "",
+                  "type": "string"
+                },
+                "summary_message_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "tokens_after": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "tokens_before": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "trigger": {
+                  "$ref": "#/$defs/ContextCompactionTrigger",
+                  "default": "token_budget"
+                }
+              },
+              "required": [
+                "messages_before",
+                "messages_after",
+                "tokens_before",
+                "tokens_after",
+                "files_read",
+                "files_modified"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "ContextCompacted"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "BudgetCheckpoint": {
+              "additionalProperties": false,
+              "properties": {
+                "cost_used_usd": {
+                  "format": "double",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "elapsed_seconds": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "tokens_used": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "turns_used": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "tokens_used",
+                "turns_used",
+                "elapsed_seconds"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "BudgetCheckpoint"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "SessionQueuedMessageEnqueued": {
+              "additionalProperties": false,
+              "properties": {
+                "message": {
+                  "$ref": "#/$defs/Message"
+                },
+                "settings_revision_id": {
+                  "default": 1,
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "message"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "SessionQueuedMessageEnqueued"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "SessionQueuedMessageResolved": {
+              "additionalProperties": false,
+              "properties": {
+                "outcome": {
+                  "$ref": "#/$defs/QueuedMessageResolutionOutcome"
+                },
+                "queue_event_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "queue_event_id",
+                "outcome"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "SessionQueuedMessageResolved"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "SessionCancelled": {
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "reason"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "SessionCancelled"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "SessionCancelCleared": {
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "reason"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "SessionCancelCleared"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "SessionSteered": {
+              "additionalProperties": false,
+              "properties": {
+                "message": {
+                  "type": "string"
+                },
+                "settings_revision_id": {
+                  "default": 1,
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "message"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "SessionSteered"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "SessionSteersResolved": {
+              "additionalProperties": false,
+              "properties": {
+                "combined_message": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "outcome": {
+                  "$ref": "#/$defs/SteerResolutionOutcome"
+                },
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "steer_event_ids": {
+                  "items": {
+                    "format": "uuid",
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "steer_event_ids",
+                "outcome"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "SessionSteersResolved"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "OperatorCommandRecorded": {
+              "additionalProperties": false,
+              "properties": {
+                "command_type": {
+                  "type": "string"
+                },
+                "output": {
+                  "type": "string"
+                },
+                "raw_input": {
+                  "type": "string"
+                },
+                "success": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "command_type",
+                "raw_input",
+                "output",
+                "success"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "OperatorCommandRecorded"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Live/store shape. In `session.bt` bundle event records the\nstore-local `chunk_index` is replaced by a portable\n`raw_chunk_content_ref` string (`sha256:<hex>`).",
+          "properties": {
+            "RawChunkPersisted": {
+              "additionalProperties": false,
+              "properties": {
+                "chunk_index": {
+                  "description": "Store-local raw chunk row id; transport-only. Removed from\ncanonical (hashed) bytes and replaced by\n`raw_chunk_content_ref` in bundles.",
+                  "format": "int64",
+                  "type": "integer"
+                },
+                "llm_call_ordinal": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "provider": {
+                  "type": "string"
+                },
+                "stream": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "provider",
+                "chunk_index",
+                "stream"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "RawChunkPersisted"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "InstructionDocument": {
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "title",
+        "body"
+      ],
+      "type": "object"
+    },
+    "Message": {
+      "additionalProperties": false,
+      "properties": {
+        "created_at": {
+          "description": "Timestamp in the `time` crate's default serde representation: [year, day_of_year, hour, minute, second, nanosecond, offset_hour, offset_minute, offset_second].",
+          "items": false,
+          "maxItems": 9,
+          "minItems": 9,
+          "prefixItems": [
+            {
+              "description": "calendar year",
+              "maximum": 9999,
+              "minimum": -9999,
+              "type": "integer"
+            },
+            {
+              "description": "ordinal day of the year",
+              "maximum": 366,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "description": "hour",
+              "maximum": 23,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "minute",
+              "maximum": 59,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "second",
+              "maximum": 59,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "nanosecond",
+              "maximum": 999999999,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset hours",
+              "maximum": 25,
+              "minimum": -25,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset minutes",
+              "maximum": 59,
+              "minimum": -59,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset seconds",
+              "maximum": 59,
+              "minimum": -59,
+              "type": "integer"
+            }
+          ],
+          "type": "array"
+        },
+        "message_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "parts": {
+          "items": {
+            "$ref": "#/$defs/MessagePart"
+          },
+          "type": "array"
+        },
+        "role": {
+          "$ref": "#/$defs/Role"
+        }
+      },
+      "required": [
+        "message_id",
+        "role",
+        "parts",
+        "created_at"
+      ],
+      "type": "object"
+    },
+    "MessagePart": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Text": {
+              "additionalProperties": false,
+              "properties": {
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "text"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "Text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Reasoning": {
+              "additionalProperties": false,
+              "properties": {
+                "opaque_replay": true,
+                "redacted": {
+                  "type": "boolean"
+                },
+                "text": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "redacted"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "Reasoning"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "ToolCall": {
+              "additionalProperties": false,
+              "properties": {
+                "call": {
+                  "$ref": "#/$defs/ToolCall"
+                }
+              },
+              "required": [
+                "call"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "ToolCall"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "ToolResult": {
+              "additionalProperties": false,
+              "properties": {
+                "result": {
+                  "$ref": "#/$defs/ToolResultEnvelope"
+                }
+              },
+              "required": [
+                "result"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "ToolResult"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Refusal": {
+              "additionalProperties": false,
+              "properties": {
+                "opaque_metadata": true,
+                "provider_reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "text": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "Refusal"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Structured": {
+              "additionalProperties": false,
+              "properties": {
+                "schema_name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "value": true
+              },
+              "required": [
+                "value"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "Structured"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PlanItem": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/PlanStatus"
+        }
+      },
+      "required": [
+        "id",
+        "content",
+        "status"
+      ],
+      "type": "object"
+    },
+    "PlanStatus": {
+      "enum": [
+        "pending",
+        "in_progress",
+        "completed",
+        "blocked"
+      ],
+      "type": "string"
+    },
+    "QueuedMessageResolutionOutcome": {
+      "enum": [
+        "Dispatched",
+        "Dropped"
+      ],
+      "type": "string"
+    },
+    "RelatedSessionDeliveryMode": {
+      "enum": [
+        "notify",
+        "wake"
+      ],
+      "type": "string"
+    },
+    "RelatedSessionMessage": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_refs": {
+          "items": {
+            "$ref": "#/$defs/ArtifactRef"
+          },
+          "type": "array"
+        },
+        "caused_by_turn_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_message_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "created_at": {
+          "description": "Timestamp in the `time` crate's default serde representation: [year, day_of_year, hour, minute, second, nanosecond, offset_hour, offset_minute, offset_second].",
+          "items": false,
+          "maxItems": 9,
+          "minItems": 9,
+          "prefixItems": [
+            {
+              "description": "calendar year",
+              "maximum": 9999,
+              "minimum": -9999,
+              "type": "integer"
+            },
+            {
+              "description": "ordinal day of the year",
+              "maximum": 366,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "description": "hour",
+              "maximum": 23,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "minute",
+              "maximum": 59,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "second",
+              "maximum": 59,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "nanosecond",
+              "maximum": 999999999,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset hours",
+              "maximum": 25,
+              "minimum": -25,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset minutes",
+              "maximum": 59,
+              "minimum": -59,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset seconds",
+              "maximum": 59,
+              "minimum": -59,
+              "type": "integer"
+            }
+          ],
+          "type": "array"
+        },
+        "delivery_mode": {
+          "$ref": "#/$defs/RelatedSessionDeliveryMode"
+        },
+        "destination_branch_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "destination_session_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "in_reply_to": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/RelatedSessionMessageKind"
+        },
+        "message_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "source_branch_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "source_session_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "message_id",
+        "context_message_id",
+        "source_session_id",
+        "source_branch_id",
+        "destination_session_id",
+        "destination_branch_id",
+        "kind",
+        "delivery_mode",
+        "text",
+        "created_at"
+      ],
+      "type": "object"
+    },
+    "RelatedSessionMessageDirection": {
+      "enum": [
+        "sent",
+        "received"
+      ],
+      "type": "string"
+    },
+    "RelatedSessionMessageKind": {
+      "enum": [
+        "instruction",
+        "question",
+        "answer",
+        "progress",
+        "result",
+        "error"
+      ],
+      "type": "string"
+    },
+    "RelatedSessionMessageStatus": {
+      "enum": [
+        "delivered",
+        "pending",
+        "claimed",
+        "dropped"
+      ],
+      "type": "string"
+    },
+    "Role": {
+      "enum": [
+        "System",
+        "User",
+        "Assistant",
+        "Tool"
+      ],
+      "type": "string"
+    },
+    "SpanKind": {
+      "enum": [
+        "Session",
+        "Agent",
+        "Llm",
+        "Tool",
+        "Chain"
+      ],
+      "type": "string"
+    },
+    "SteerResolutionOutcome": {
+      "enum": [
+        "Applied",
+        "Dropped"
+      ],
+      "type": "string"
+    },
+    "ThinkingConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "budget_tokens": {
+          "description": "This caps model-side reasoning effort inside one completion request.\nIt is distinct from session autonomy budgets such as wall-clock,\nturn-count, or total-cost limits.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThinkingEffort"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "include_summaries": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "include_summaries"
+      ],
+      "type": "object"
+    },
+    "ThinkingEffort": {
+      "enum": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "type": "string"
+    },
+    "TokenUsage": {
+      "additionalProperties": false,
+      "properties": {
+        "cache_read_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cache_write_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "completion_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "prompt_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reasoning_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "total_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens"
+      ],
+      "type": "object"
+    },
+    "ToolCall": {
+      "additionalProperties": false,
+      "properties": {
+        "arguments": true,
+        "call_id": {
+          "type": "string"
+        },
+        "tool_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool_name",
+        "call_id",
+        "arguments"
+      ],
+      "type": "object"
+    },
+    "ToolDisplayGroup": {
+      "enum": [
+        "codebase",
+        "execution",
+        "web",
+        "planning",
+        "interaction",
+        "inspection",
+        "workflow",
+        "external"
+      ],
+      "type": "string"
+    },
+    "ToolExecutionMode": {
+      "enum": [
+        "immediate",
+        "user_input"
+      ],
+      "type": "string"
+    },
+    "ToolInterruptBehavior": {
+      "enum": [
+        "immediate",
+        "wait_for_completion",
+        "terminate_process"
+      ],
+      "type": "string"
+    },
+    "ToolMetadata": {
+      "additionalProperties": false,
+      "properties": {
+        "catalogue_tags": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "display_group": {
+          "$ref": "#/$defs/ToolDisplayGroup"
+        },
+        "execution_mode": {
+          "$ref": "#/$defs/ToolExecutionMode"
+        },
+        "interrupt_behavior": {
+          "$ref": "#/$defs/ToolInterruptBehavior"
+        },
+        "is_concurrency_safe": {
+          "type": "boolean"
+        },
+        "is_read_only": {
+          "type": "boolean"
+        },
+        "risk_class": {
+          "$ref": "#/$defs/ToolRiskClass"
+        },
+        "should_defer": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "risk_class",
+        "is_read_only",
+        "is_concurrency_safe",
+        "interrupt_behavior",
+        "execution_mode",
+        "should_defer",
+        "catalogue_tags",
+        "display_group"
+      ],
+      "type": "object"
+    },
+    "ToolOperationContext": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_refs": {
+          "items": {
+            "$ref": "#/$defs/ArtifactRef"
+          },
+          "type": "array"
+        },
+        "execution_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolExecutionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "initiator": {
+          "$ref": "#/$defs/ToolOperationInitiator",
+          "default": "agent"
+        },
+        "is_read_only": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "risk_class": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolRiskClass"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ToolOperationInitiator": {
+      "enum": [
+        "agent",
+        "human",
+        "runtime",
+        "mcp"
+      ],
+      "type": "string"
+    },
+    "ToolResultEnvelope": {
+      "additionalProperties": false,
+      "properties": {
+        "call_id": {
+          "type": "string"
+        },
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "is_error": {
+          "type": "boolean"
+        },
+        "output": true,
+        "tool_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id",
+        "tool_name",
+        "is_error",
+        "output"
+      ],
+      "type": "object"
+    },
+    "ToolRiskClass": {
+      "enum": [
+        "safe",
+        "moderate",
+        "high"
+      ],
+      "type": "string"
+    },
+    "TurnInstructionProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "core_prompt": {
+          "$ref": "#/$defs/InstructionDocument"
+        },
+        "instructions": {
+          "items": {
+            "$ref": "#/$defs/InstructionDocument"
+          },
+          "type": "array"
+        },
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "provider_overlay": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InstructionDocument"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rendered_system_prompt": {
+          "type": "string"
+        },
+        "settings_revision_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "turn_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "turn_id",
+        "provider",
+        "model",
+        "settings_revision_id",
+        "core_prompt",
+        "instructions",
+        "rendered_system_prompt"
+      ],
+      "type": "object"
+    },
+    "TurnStartSource": {
+      "enum": [
+        "UserMessage",
+        "ApprovalResume",
+        "InputResume",
+        "SteerFollowUp",
+        "QueuedFollowUp",
+        "RelatedSessionMessage"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://belltower.dev/schemas/belltower-event/v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Canonical Belltower session event envelope, exactly as serialized from bt_core::EventEnvelope. This shape is served verbatim by the live event API (GET /sessions/{session_id}/events, with the store-assigned seq_id populated) and is the input to session.bt bundle canonicalization. Bundle event records (the `event` field of each events.jsonl line) hold the canonical form of this envelope: transport-only fields are removed (the envelope's `seq_id` and the payload fields `context_boundary_seq_id`, `source_seq_id`, and `first_kept_seq_id`), and store-local raw chunk row ids (`CompletionChunk.raw_chunk_index`, `RawChunkPersisted.chunk_index`) are removed and replaced by a portable `raw_chunk_content_ref` string (`sha256:<64 lowercase hex>`). `event_hash` covers exactly those canonical bytes (compact serde_json encoding of the canonical form, keys sorted). Every other field is semantic and identical on both surfaces.",
+  "properties": {
+    "attributes": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "branch_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "event_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "occurred_at": {
+      "description": "Timestamp in the `time` crate's default serde representation: [year, day_of_year, hour, minute, second, nanosecond, offset_hour, offset_minute, offset_second].",
+      "items": false,
+      "maxItems": 9,
+      "minItems": 9,
+      "prefixItems": [
+        {
+          "description": "calendar year",
+          "maximum": 9999,
+          "minimum": -9999,
+          "type": "integer"
+        },
+        {
+          "description": "ordinal day of the year",
+          "maximum": 366,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "description": "hour",
+          "maximum": 23,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "description": "minute",
+          "maximum": 59,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "description": "second",
+          "maximum": 59,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "description": "nanosecond",
+          "maximum": 999999999,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "description": "UTC offset hours",
+          "maximum": 25,
+          "minimum": -25,
+          "type": "integer"
+        },
+        {
+          "description": "UTC offset minutes",
+          "maximum": 59,
+          "minimum": -59,
+          "type": "integer"
+        },
+        {
+          "description": "UTC offset seconds",
+          "maximum": 59,
+          "minimum": -59,
+          "type": "integer"
+        }
+      ],
+      "type": "array"
+    },
+    "parent_span_id": {
+      "format": "uuid",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "payload": {
+      "$ref": "#/$defs/EventPayload"
+    },
+    "seq_id": {
+      "description": "Store sequence id; transport-only. Present (possibly `null`) on the\nlive event API, absent from `session.bt` bundle event records, and\nexcluded from the canonical bytes that `event_hash` covers.",
+      "format": "int64",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "session_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "span_id": {
+      "format": "uuid",
+      "type": "string"
+    },
+    "span_kind": {
+      "$ref": "#/$defs/SpanKind"
+    },
+    "turn_id": {
+      "format": "uuid",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "event_id",
+    "session_id",
+    "branch_id",
+    "span_id",
+    "span_kind",
+    "occurred_at",
+    "payload",
+    "attributes"
+  ],
+  "title": "Belltower canonical event envelope v1",
+  "type": "object"
+}

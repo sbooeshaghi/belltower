@@ -9,6 +9,7 @@ mod ids;
 mod messages;
 pub mod model_capability;
 mod related_sessions;
+pub mod schema_support;
 mod startup_trace;
 pub mod traits;
 mod types;

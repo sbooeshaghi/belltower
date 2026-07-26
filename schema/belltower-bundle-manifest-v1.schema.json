@@ -1,0 +1,520 @@
+{
+  "$defs": {
+    "BranchManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "branch_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "head": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionNodeRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "is_default": {
+          "type": "boolean"
+        },
+        "parent_branch_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent_event_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "branch_id",
+        "is_default"
+      ],
+      "type": "object"
+    },
+    "BundleArtifactRef": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "content": {
+          "$ref": "#/$defs/ContentRef"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "source_node": {
+          "$ref": "#/$defs/SessionNodeRef"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "kind",
+        "source_node",
+        "content"
+      ],
+      "type": "object"
+    },
+    "ContentRef": {
+      "additionalProperties": false,
+      "properties": {
+        "hash": {
+          "$ref": "#/$defs/PortableHash"
+        },
+        "media_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "hash",
+        "size_bytes"
+      ],
+      "type": "object"
+    },
+    "EventRange": {
+      "additionalProperties": false,
+      "properties": {
+        "branch_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "exported_store_seq_end": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "exported_store_seq_start": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "first_event_hash": {
+          "$ref": "#/$defs/PortableHash"
+        },
+        "last_event_hash": {
+          "$ref": "#/$defs/PortableHash"
+        },
+        "ordinal_end": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ordinal_start": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "branch_id",
+        "ordinal_start",
+        "ordinal_end",
+        "first_event_hash",
+        "last_event_hash"
+      ],
+      "type": "object"
+    },
+    "PortableHash": {
+      "description": "Portable content hash: `sha256:` followed by 64 lowercase hex characters.",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "ProducerInfo": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "type": "object"
+    },
+    "RedactionPolicy": {
+      "enum": [
+        "none"
+      ],
+      "type": "string"
+    },
+    "SessionBundleArtifactMode": {
+      "enum": [
+        "trace_only",
+        "trace_plus_patches",
+        "trace_plus_artifacts"
+      ],
+      "type": "string"
+    },
+    "SessionNodeRef": {
+      "additionalProperties": false,
+      "properties": {
+        "branch_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "bundle_event_ordinal": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "bundle_hash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PortableHash"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "event_hash": {
+          "$ref": "#/$defs/PortableHash"
+        },
+        "event_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "session_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "store_seq_id": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "session_id",
+        "branch_id",
+        "bundle_event_ordinal",
+        "event_id",
+        "event_hash"
+      ],
+      "type": "object"
+    },
+    "SessionRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "connection_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "description": "Timestamp in the `time` crate's default serde representation: [year, day_of_year, hour, minute, second, nanosecond, offset_hour, offset_minute, offset_second].",
+          "items": false,
+          "maxItems": 9,
+          "minItems": 9,
+          "prefixItems": [
+            {
+              "description": "calendar year",
+              "maximum": 9999,
+              "minimum": -9999,
+              "type": "integer"
+            },
+            {
+              "description": "ordinal day of the year",
+              "maximum": 366,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "description": "hour",
+              "maximum": 23,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "minute",
+              "maximum": 59,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "second",
+              "maximum": 59,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "nanosecond",
+              "maximum": 999999999,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset hours",
+              "maximum": 25,
+              "minimum": -25,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset minutes",
+              "maximum": 59,
+              "minimum": -59,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset seconds",
+              "maximum": 59,
+              "minimum": -59,
+              "type": "integer"
+            }
+          ],
+          "type": "array"
+        },
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "objective": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent_branch_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent_session_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent_turn_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project_root": {
+          "description": "UTF-8 project root path, serialized as a plain string.",
+          "type": "string"
+        },
+        "session_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "settings_revision_id": {
+          "default": 1,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/$defs/SessionStatus"
+        },
+        "tool_mode": {
+          "$ref": "#/$defs/SessionToolMode"
+        },
+        "updated_at": {
+          "description": "Timestamp in the `time` crate's default serde representation: [year, day_of_year, hour, minute, second, nanosecond, offset_hour, offset_minute, offset_second].",
+          "items": false,
+          "maxItems": 9,
+          "minItems": 9,
+          "prefixItems": [
+            {
+              "description": "calendar year",
+              "maximum": 9999,
+              "minimum": -9999,
+              "type": "integer"
+            },
+            {
+              "description": "ordinal day of the year",
+              "maximum": 366,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "description": "hour",
+              "maximum": 23,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "minute",
+              "maximum": 59,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "second",
+              "maximum": 59,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "nanosecond",
+              "maximum": 999999999,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset hours",
+              "maximum": 25,
+              "minimum": -25,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset minutes",
+              "maximum": 59,
+              "minimum": -59,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset seconds",
+              "maximum": 59,
+              "minimum": -59,
+              "type": "integer"
+            }
+          ],
+          "type": "array"
+        }
+      },
+      "required": [
+        "session_id",
+        "project_root",
+        "connection_id",
+        "tool_mode",
+        "created_at",
+        "updated_at",
+        "status"
+      ],
+      "type": "object"
+    },
+    "SessionStatus": {
+      "enum": [
+        "Active",
+        "Completed",
+        "Failed",
+        "Abandoned"
+      ],
+      "type": "string"
+    },
+    "SessionToolMode": {
+      "enum": [
+        "standard",
+        "extended"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://belltower.dev/schemas/belltower-bundle-manifest/v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Belltower session.bt bundle manifest (manifest.json at the bundle root), exactly as serialized from bt_core::SessionBundleManifest at schema_version 1. `bundle_hash` is the sha256 of the bundle's checksums.json bytes; branch heads and artifact source nodes are SessionNodeRef values that address canonical events by bundle ordinal and event_hash.",
+  "properties": {
+    "artifact_mode": {
+      "$ref": "#/$defs/SessionBundleArtifactMode"
+    },
+    "artifacts": {
+      "items": {
+        "$ref": "#/$defs/BundleArtifactRef"
+      },
+      "type": "array"
+    },
+    "branches": {
+      "items": {
+        "$ref": "#/$defs/BranchManifest"
+      },
+      "type": "array"
+    },
+    "bundle_hash": {
+      "$ref": "#/$defs/PortableHash"
+    },
+    "contents": {
+      "items": {
+        "$ref": "#/$defs/ContentRef"
+      },
+      "type": "array"
+    },
+    "event_ranges": {
+      "items": {
+        "$ref": "#/$defs/EventRange"
+      },
+      "type": "array"
+    },
+    "producer": {
+      "$ref": "#/$defs/ProducerInfo"
+    },
+    "redaction": {
+      "$ref": "#/$defs/RedactionPolicy"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "session": {
+      "$ref": "#/$defs/SessionRecord"
+    }
+  },
+  "required": [
+    "schema_version",
+    "bundle_hash",
+    "session",
+    "branches",
+    "event_ranges",
+    "producer",
+    "redaction",
+    "artifact_mode",
+    "contents",
+    "artifacts"
+  ],
+  "title": "Belltower session bundle manifest v1",
+  "type": "object"
+}

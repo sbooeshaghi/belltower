@@ -36,7 +36,7 @@ pub mod oi_attrs {
     pub const LLM_COST_TOTAL: &str = "llm.cost.total";
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum SpanKind {
     Session,
     Agent,
@@ -45,19 +45,19 @@ pub enum SpanKind {
     Chain,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum QueuedMessageResolutionOutcome {
     Dispatched,
     Dropped,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum SteerResolutionOutcome {
     Applied,
     Dropped,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum TurnStartSource {
     UserMessage,
     ApprovalResume,
@@ -71,7 +71,12 @@ fn default_turn_start_source() -> TurnStartSource {
     TurnStartSource::UserMessage
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// Externally tagged canonical event payload union: exactly one key naming
+/// the variant (for example `{"SessionStarted": {...}}`). The serialized
+/// event kind strings (`session.started`, ...) are derived labels, not the
+/// serde tag.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub enum EventPayload {
     SessionStarted {
         project_root: String,
@@ -164,9 +169,15 @@ pub enum EventPayload {
         model: String,
         message_count: u32,
     },
+    /// Live/store shape. In `session.bt` bundle event records the
+    /// store-local `raw_chunk_index` is replaced by a portable
+    /// `raw_chunk_content_ref` string (`sha256:<hex>`).
     CompletionChunk {
         llm_call_ordinal: Option<u32>,
         deltas: Vec<CompletionDelta>,
+        /// Store-local raw chunk row id; transport-only. Removed from
+        /// canonical (hashed) bytes and replaced by
+        /// `raw_chunk_content_ref` in bundles.
         raw_chunk_index: Option<i64>,
     },
     CompletionFinished {
@@ -230,6 +241,7 @@ pub enum EventPayload {
     },
     ContextCompacted {
         #[serde(default)]
+        #[schemars(skip_serializing_if = "crate::schema_support::omit_nondeterministic_default")]
         compaction_id: CompactionId,
         #[serde(default)]
         trigger: ContextCompactionTrigger,
@@ -243,6 +255,8 @@ pub enum EventPayload {
         provider: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// Store-local sequence ref; transport-only, removed from canonical
+        /// (hashed) bytes and from `session.bt` bundle event records.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_boundary_seq_id: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -251,6 +265,8 @@ pub enum EventPayload {
         first_kept_message_id: Option<MessageId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         first_kept_branch_id: Option<BranchId>,
+        /// Store-local sequence ref; transport-only, removed from canonical
+        /// (hashed) bytes and from `session.bt` bundle event records.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         first_kept_seq_id: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -303,8 +319,14 @@ pub enum EventPayload {
         output: String,
         success: bool,
     },
+    /// Live/store shape. In `session.bt` bundle event records the
+    /// store-local `chunk_index` is replaced by a portable
+    /// `raw_chunk_content_ref` string (`sha256:<hex>`).
     RawChunkPersisted {
         provider: String,
+        /// Store-local raw chunk row id; transport-only. Removed from
+        /// canonical (hashed) bytes and replaced by
+        /// `raw_chunk_content_ref` in bundles.
         chunk_index: i64,
         stream: String,
         llm_call_ordinal: Option<u32>,
@@ -358,8 +380,12 @@ impl EventPayload {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct EventEnvelope {
+    /// Store sequence id; transport-only. Present (possibly `null`) on the
+    /// live event API, absent from `session.bt` bundle event records, and
+    /// excluded from the canonical bytes that `event_hash` covers.
     pub seq_id: Option<i64>,
     pub event_id: EventId,
     pub session_id: SessionId,
@@ -368,6 +394,7 @@ pub struct EventEnvelope {
     pub span_id: SpanId,
     pub parent_span_id: Option<SpanId>,
     pub span_kind: SpanKind,
+    #[schemars(schema_with = "crate::schema_support::offset_date_time_schema")]
     pub occurred_at: OffsetDateTime,
     pub payload: EventPayload,
     pub attributes: BTreeMap<String, Value>,

@@ -7,7 +7,17 @@ use uuid::Uuid;
 macro_rules! uuid_id {
     ($name:ident) => {
         #[derive(
-            Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+            Clone,
+            Copy,
+            Debug,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            Serialize,
+            Deserialize,
+            schemars::JsonSchema,
         )]
         #[serde(transparent)]
         pub struct $name(pub Uuid);
@@ -57,7 +67,9 @@ uuid_id!(MessageId);
 uuid_id!(CompactionId);
 uuid_id!(RelatedSessionMessageId);
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct ConnectionId(pub String);
 
@@ -82,7 +94,9 @@ impl FromStr for ConnectionId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct ToolCallId(pub String);
 

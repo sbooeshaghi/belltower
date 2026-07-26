@@ -3,6 +3,7 @@
 mod export;
 mod migration;
 mod reprojection;
+pub mod schema_gate;
 mod store;
 mod sync;
 mod turn_projection;

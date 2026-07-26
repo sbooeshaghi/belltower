@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum Role {
     System,
     User,
@@ -11,14 +11,16 @@ pub enum Role {
     Tool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ToolCall {
     pub tool_name: String,
     pub call_id: String,
     pub arguments: Value,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub enum MessagePart {
     Text {
         text: String,
@@ -45,11 +47,13 @@ pub enum MessagePart {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct Message {
     pub message_id: MessageId,
     pub role: Role,
     pub parts: Vec<MessagePart>,
+    #[schemars(schema_with = "crate::schema_support::offset_date_time_schema")]
     pub created_at: OffsetDateTime,
 }
 
