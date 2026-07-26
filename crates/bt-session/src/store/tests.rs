@@ -6161,3 +6161,766 @@ fn reopening_without_rebuild_marker_recovers_turn_projection() {
         .expect("rebuilt projection");
     assert_eq!(rebuilt, baseline);
 }
+
+// ---------------------------------------------------------------------------
+// Continuous export / hosted-registry invariants.
+//
+// A future hosted registry receives the SAME session exported and pushed
+// repeatedly as it grows: events 1..N at t1, events 1..M (M > N) at t2, and
+// so on, from many users, with pulls/imports/continuations on the other side.
+// These tests pin the data-shape guarantees that scenario depends on:
+// prefix-stable deterministic exports, append-only remote sync, content-
+// derived identity, and compaction events behaving as ordinary appended
+// evidence. Helpers and tests are prefixed continuous_export_.
+// ---------------------------------------------------------------------------
+
+fn continuous_export_append_turn(
+    store: &mut SqliteSessionStore,
+    session: &SessionRecord,
+    branch: &BranchRecord,
+    user_text: &str,
+    llm_call_ordinal: u32,
+    raw_bytes: &[u8],
+) {
+    store
+        .append_event(&EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Agent,
+            EventPayload::MessageAppended {
+                message: Message::text(Role::User, user_text),
+            },
+        ))
+        .expect("append user message");
+    let turn_id = TurnId::new();
+    store
+        .append_event(&turn_started_event(session, branch, turn_id))
+        .expect("start turn");
+    store
+        .append_raw_chunk_with_event(
+            session.session_id,
+            branch.branch_id,
+            Some(turn_id),
+            Some(llm_call_ordinal),
+            "openai-compatible",
+            "completion",
+            raw_bytes,
+            |chunk_id| {
+                Ok(EventEnvelope::new(
+                    session.session_id,
+                    branch.branch_id,
+                    SpanKind::Llm,
+                    EventPayload::CompletionChunk {
+                        llm_call_ordinal: Some(llm_call_ordinal),
+                        deltas: Vec::new(),
+                        raw_chunk_index: Some(chunk_id),
+                    },
+                )
+                .with_turn_id(turn_id))
+            },
+        )
+        .expect("append raw completion chunk");
+    store
+        .append_event(&turn_finished_event(session, branch, turn_id))
+        .expect("finish turn");
+}
+
+/// A durable store containing one full turn (message, turn started,
+/// completion chunk with raw provider bytes, turn finished): the state at t1.
+fn continuous_export_growing_store() -> (NamedTempFile, SessionRecord, BranchRecord) {
+    let file = NamedTempFile::new().expect("tempfile");
+    let mut store = SqliteSessionStore::open(file.path()).expect("open store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    continuous_export_append_turn(
+        &mut store,
+        &session,
+        &branch,
+        "first question",
+        1,
+        b"raw-turn-1",
+    );
+    drop(store);
+    (file, session, branch)
+}
+
+fn continuous_export_bundle(
+    store_path: &std::path::Path,
+    session_id: bt_core::SessionId,
+) -> tempfile::TempDir {
+    let store = SqliteSessionStore::open(store_path).expect("reopen store for export");
+    let bundle_dir = tempdir().expect("bundle dir");
+    store
+        .export_session_bundle_directory(session_id, bundle_dir.path())
+        .expect("export bundle");
+    bundle_dir
+}
+
+/// Relative path -> bytes for every regular file under `root`.
+fn continuous_export_dir_bytes(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        files: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) {
+        for entry in fs::read_dir(dir).expect("read dir") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, files);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("path under root")
+                    .to_str()
+                    .expect("utf-8 bundle path")
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                files.insert(relative, fs::read(&path).expect("file bytes"));
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    walk(root, root, &mut files);
+    files
+}
+
+fn continuous_export_write_dir(
+    root: &std::path::Path,
+    files: &std::collections::BTreeMap<String, Vec<u8>>,
+) {
+    for (path, bytes) in files {
+        let dest = root.join(path);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).expect("create parent dir");
+        }
+        fs::write(dest, bytes).expect("write file");
+    }
+}
+
+fn continuous_export_bundle_records(bundle_dir: &std::path::Path) -> Vec<SessionBundleEventRecord> {
+    fs::read_to_string(bundle_dir.join(SESSION_BT_EVENTS))
+        .expect("events jsonl")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("event record"))
+        .collect()
+}
+
+fn continuous_export_manifest(bundle_dir: &std::path::Path) -> SessionBundleManifest {
+    serde_json::from_slice(&fs::read(bundle_dir.join(SESSION_BT_MANIFEST)).expect("manifest bytes"))
+        .expect("manifest json")
+}
+
+fn continuous_export_default_head_hash(bundle_dir: &std::path::Path) -> PortableHash {
+    continuous_export_manifest(bundle_dir)
+        .branches
+        .iter()
+        .find(|branch| branch.is_default)
+        .and_then(|branch| branch.head.as_ref())
+        .expect("default branch head")
+        .event_hash
+        .clone()
+}
+
+#[test]
+fn continuous_export_prefix_stability_across_grown_exports() {
+    let (file, session, branch) = continuous_export_growing_store();
+    let bundle_a = continuous_export_bundle(file.path(), session.session_id);
+
+    let mut store = SqliteSessionStore::open(file.path()).expect("reopen for growth");
+    continuous_export_append_turn(
+        &mut store,
+        &session,
+        &branch,
+        "second question",
+        2,
+        b"raw-turn-2",
+    );
+    drop(store);
+    let bundle_b = continuous_export_bundle(file.path(), session.session_id);
+
+    // THE registry invariant: a later export of the same grown session must
+    // extend the earlier export byte-for-byte (line-prefix property), so line
+    // citations, incremental sync, and dedup stay valid across exports.
+    let events_a = fs::read(bundle_a.path().join(SESSION_BT_EVENTS)).expect("events A");
+    let events_b = fs::read(bundle_b.path().join(SESSION_BT_EVENTS)).expect("events B");
+    assert!(
+        events_b.starts_with(&events_a),
+        "events.jsonl of the grown export must begin with the earlier export byte-for-byte"
+    );
+    assert!(events_b.len() > events_a.len());
+
+    let raw_refs_a = fs::read(bundle_a.path().join(SESSION_BT_RAW_CHUNK_REFS)).expect("raw refs A");
+    let raw_refs_b = fs::read(bundle_b.path().join(SESSION_BT_RAW_CHUNK_REFS)).expect("raw refs B");
+    assert!(
+        raw_refs_b.starts_with(&raw_refs_a),
+        "raw_chunk_refs.jsonl must also be prefix-stable"
+    );
+
+    // Every event of A appears in B unchanged, at the same bundle-local
+    // ordinal, with the same content-derived event_hash.
+    let records_a = continuous_export_bundle_records(bundle_a.path());
+    let records_b = continuous_export_bundle_records(bundle_b.path());
+    assert_eq!(records_a.len(), 4);
+    assert_eq!(records_b.len(), 8);
+    for (index, record_a) in records_a.iter().enumerate() {
+        let record_b = &records_b[index];
+        assert_eq!(record_a.bundle_event_ordinal, index as u64);
+        assert_eq!(record_b.bundle_event_ordinal, index as u64);
+        assert_eq!(record_a.event_hash, record_b.event_hash);
+        assert_eq!(record_a.event, record_b.event);
+    }
+
+    // Content-addressed blobs of A are a byte-identical subset of B.
+    let files_a = continuous_export_dir_bytes(bundle_a.path());
+    let files_b = continuous_export_dir_bytes(bundle_b.path());
+    let content_files_a = files_a
+        .iter()
+        .filter(|(path, _)| path.starts_with("raw_chunks/") || path.starts_with("payloads/"))
+        .collect::<Vec<_>>();
+    assert!(!content_files_a.is_empty());
+    for (path, bytes) in content_files_a {
+        assert_eq!(
+            files_b.get(path),
+            Some(bytes),
+            "content blob {path} must survive re-export unchanged"
+        );
+    }
+
+    // The manifest range for the shared prefix keeps stable anchors. Note:
+    // only ordinal_start/first_event_hash are stable; ordinal_end and
+    // last_event_hash advance with growth, so EventRange is a boundary
+    // descriptor, not a stable incremental-sync unit (see audit report).
+    let manifest_a = continuous_export_manifest(bundle_a.path());
+    let manifest_b = continuous_export_manifest(bundle_b.path());
+    assert_eq!(manifest_a.event_ranges.len(), 1);
+    assert_eq!(manifest_b.event_ranges.len(), 1);
+    assert_eq!(
+        manifest_a.event_ranges[0].ordinal_start,
+        manifest_b.event_ranges[0].ordinal_start
+    );
+    assert_eq!(
+        manifest_a.event_ranges[0].first_event_hash,
+        manifest_b.event_ranges[0].first_event_hash
+    );
+
+    let diff = diff_session_bundle_directories(bundle_a.path(), bundle_b.path()).expect("diff");
+    assert_eq!(
+        diff.relationship,
+        SessionBundleDiffRelationship::SameLineageUpdate
+    );
+    assert_eq!(diff.common_event_count, 4);
+    assert_eq!(diff.left_only_event_count, 0);
+    assert_eq!(diff.right_only_event_count, 4);
+}
+
+#[test]
+fn continuous_export_incremental_push_advances_remote_and_pull_round_trips() {
+    let (file, session, branch) = continuous_export_growing_store();
+    let bundle_a = continuous_export_bundle(file.path(), session.session_id);
+    let head_a = continuous_export_default_head_hash(bundle_a.path());
+    let remote_dir = tempdir().expect("remote");
+
+    let first_push =
+        crate::push_session_bundle_directory(bundle_a.path(), remote_dir.path(), None, None)
+            .expect("first push");
+    assert!(first_push.copied_bundle);
+    assert_eq!(first_push.previous_head, None);
+    assert_eq!(first_push.new_head, head_a);
+
+    let remote_session_dir = remote_dir
+        .path()
+        .join("sessions")
+        .join(session.session_id.to_string());
+    let remote_bundle_a = remote_session_dir
+        .join("bundles")
+        .join(first_push.bundle_hash.sha256_hex());
+    let remote_bundle_a_before = continuous_export_dir_bytes(&remote_bundle_a);
+
+    let mut store = SqliteSessionStore::open(file.path()).expect("reopen for growth");
+    continuous_export_append_turn(
+        &mut store,
+        &session,
+        &branch,
+        "second question",
+        2,
+        b"raw-turn-2",
+    );
+    drop(store);
+    let bundle_b = continuous_export_bundle(file.path(), session.session_id);
+    let head_b = continuous_export_default_head_hash(bundle_b.path());
+
+    // Growing the session and pushing again with the current remote head as
+    // the expected head must advance the remote coherently.
+    let second_push = crate::push_session_bundle_directory(
+        bundle_b.path(),
+        remote_dir.path(),
+        Some(branch.branch_id),
+        Some(&head_a),
+    )
+    .expect("second push with matching expected head");
+    assert!(second_push.copied_bundle);
+    assert!(second_push.changed_remote_head);
+    assert_eq!(second_push.previous_head, Some(head_a.clone()));
+    assert_eq!(second_push.new_head, head_b);
+    assert_ne!(second_push.bundle_hash, first_push.bundle_hash);
+
+    // The previously pushed bundle is immutable: not rewritten, not deleted.
+    assert_eq!(
+        continuous_export_dir_bytes(&remote_bundle_a),
+        remote_bundle_a_before,
+        "an already-pushed bundle must never be rewritten by a later push"
+    );
+    validate_session_bundle_directory(&remote_bundle_a).expect("old remote bundle still validates");
+    let remote_bundle_b = remote_session_dir
+        .join("bundles")
+        .join(second_push.bundle_hash.sha256_hex());
+    validate_session_bundle_directory(&remote_bundle_b).expect("new remote bundle validates");
+
+    // Pull reproduces the grown head bundle; it validates and imports.
+    let pulled_dir = tempdir().expect("pull dir");
+    let pulled = crate::pull_session_bundle_directory(
+        remote_dir.path(),
+        session.session_id,
+        pulled_dir.path(),
+        None,
+    )
+    .expect("pull");
+    assert_eq!(pulled.head_event_hash, head_b);
+    assert_eq!(pulled.bundle_hash, second_push.bundle_hash);
+    validate_session_bundle_directory(pulled_dir.path()).expect("pulled bundle validates");
+    let mut imported = SqliteSessionStore::open_in_memory().expect("import store");
+    imported
+        .import_session_bundle_directory(pulled_dir.path())
+        .expect("pulled bundle imports");
+    assert_eq!(
+        imported
+            .load_all_events(session.session_id)
+            .expect("imported events")
+            .len(),
+        8
+    );
+}
+
+#[test]
+fn continuous_export_idempotent_repush_of_same_bundle_is_a_noop() {
+    // A periodic "push what I have" loop re-pushes unchanged sessions; that
+    // must be a clean no-op, not an error and not a rewrite.
+    let (file, session, _branch) = continuous_export_growing_store();
+    let bundle_a = continuous_export_bundle(file.path(), session.session_id);
+    let head_a = continuous_export_default_head_hash(bundle_a.path());
+    let remote_dir = tempdir().expect("remote");
+
+    let first =
+        crate::push_session_bundle_directory(bundle_a.path(), remote_dir.path(), None, None)
+            .expect("first push");
+    let second =
+        crate::push_session_bundle_directory(bundle_a.path(), remote_dir.path(), None, None)
+            .expect("idempotent re-push");
+    assert!(!second.copied_bundle);
+    assert!(!second.changed_remote_head);
+    assert_eq!(second.previous_head, Some(head_a.clone()));
+    assert_eq!(second.new_head, head_a);
+    assert_eq!(second.bundle_hash, first.bundle_hash);
+}
+
+#[test]
+fn continuous_export_repush_of_grown_session_requires_expected_head() {
+    // Every push after the first must present the current remote head; a
+    // grown re-push without it is refused and the head does not move.
+    let (file, session, branch) = continuous_export_growing_store();
+    let bundle_a = continuous_export_bundle(file.path(), session.session_id);
+    let head_a = continuous_export_default_head_hash(bundle_a.path());
+    let remote_dir = tempdir().expect("remote");
+    let first =
+        crate::push_session_bundle_directory(bundle_a.path(), remote_dir.path(), None, None)
+            .expect("first push");
+
+    let mut store = SqliteSessionStore::open(file.path()).expect("reopen for growth");
+    continuous_export_append_turn(
+        &mut store,
+        &session,
+        &branch,
+        "second question",
+        2,
+        b"raw-turn-2",
+    );
+    drop(store);
+    let bundle_b = continuous_export_bundle(file.path(), session.session_id);
+
+    let error =
+        crate::push_session_bundle_directory(bundle_b.path(), remote_dir.path(), None, None)
+            .expect_err("grown re-push without expected head must be refused");
+    assert!(
+        error.to_string().contains("pass --expected-head"),
+        "unexpected error: {error}"
+    );
+
+    // The head did not move: pull still returns the first bundle.
+    let pulled_dir = tempdir().expect("pull dir");
+    let pulled = crate::pull_session_bundle_directory(
+        remote_dir.path(),
+        session.session_id,
+        pulled_dir.path(),
+        None,
+    )
+    .expect("pull after failed push");
+    assert_eq!(pulled.bundle_hash, first.bundle_hash);
+    assert_eq!(pulled.head_event_hash, head_a);
+
+    // The bundle copy happens only after every integrity check passes, so a
+    // rejected push leaves no orphaned bundle directory on the remote.
+    let orphan = remote_dir
+        .path()
+        .join("sessions")
+        .join(session.session_id.to_string())
+        .join("bundles")
+        .join(
+            continuous_export_manifest(bundle_b.path())
+                .bundle_hash
+                .sha256_hex(),
+        );
+    assert!(!orphan.is_dir(), "rejected push must not land bundle bytes");
+}
+
+#[test]
+fn continuous_export_push_rejects_tampered_prefix_bundle() {
+    // Simulated divergence-by-mutation: take an exported bundle, tamper one
+    // mid-file event line's payload, and try to push the copy. The checksum
+    // tree and per-event content hashes make this unpushable.
+    let (file, session, _branch) = continuous_export_growing_store();
+    let bundle_a = continuous_export_bundle(file.path(), session.session_id);
+    let remote_dir = tempdir().expect("remote");
+    let first =
+        crate::push_session_bundle_directory(bundle_a.path(), remote_dir.path(), None, None)
+            .expect("first push");
+
+    let tampered_dir = tempdir().expect("tampered bundle dir");
+    continuous_export_write_dir(
+        tampered_dir.path(),
+        &continuous_export_dir_bytes(bundle_a.path()),
+    );
+    let events_path = tampered_dir.path().join(SESSION_BT_EVENTS);
+    let contents = fs::read_to_string(&events_path).expect("events jsonl");
+    let mutated = contents.replace("first question", "poisoned question");
+    assert_ne!(contents, mutated, "tamper target must exist");
+    fs::write(&events_path, mutated).expect("write tampered events");
+
+    let error =
+        crate::push_session_bundle_directory(tampered_dir.path(), remote_dir.path(), None, None)
+            .expect_err("tampered bundle must fail validation before any remote write");
+    assert!(
+        error.to_string().contains("mismatch"),
+        "unexpected error: {error}"
+    );
+
+    // Validation failed before the remote was touched: head unchanged.
+    let pulled_dir = tempdir().expect("pull dir");
+    let pulled = crate::pull_session_bundle_directory(
+        remote_dir.path(),
+        session.session_id,
+        pulled_dir.path(),
+        None,
+    )
+    .expect("pull after rejected push");
+    assert_eq!(pulled.bundle_hash, first.bundle_hash);
+}
+
+#[test]
+fn continuous_export_push_rejects_divergent_history_rebinding_head() {
+    // User 1 publishes session S.
+    let (file, session, branch) = continuous_export_growing_store();
+    let bundle_a = continuous_export_bundle(file.path(), session.session_id);
+    let head_a = continuous_export_default_head_hash(bundle_a.path());
+    let remote_dir = tempdir().expect("remote");
+    crate::push_session_bundle_directory(bundle_a.path(), remote_dir.path(), None, None)
+        .expect("first push");
+
+    // A second store fabricates a DIFFERENT history under the same
+    // session/branch ids. Its bundle is internally valid but shares no
+    // event with the published prefix.
+    let divergent_file = NamedTempFile::new().expect("tempfile");
+    let mut divergent =
+        SqliteSessionStore::open(divergent_file.path()).expect("open divergent store");
+    divergent
+        .create_session(&session, &branch)
+        .expect("create divergent session");
+    continuous_export_append_turn(
+        &mut divergent,
+        &session,
+        &branch,
+        "rewritten history",
+        1,
+        b"raw-divergent",
+    );
+    drop(divergent);
+    let bundle_d = continuous_export_bundle(divergent_file.path(), session.session_id);
+    assert_ne!(continuous_export_default_head_hash(bundle_d.path()), head_a);
+    let diff = diff_session_bundle_directories(bundle_a.path(), bundle_d.path()).expect("diff");
+    assert_eq!(
+        diff.relationship,
+        SessionBundleDiffRelationship::DifferentLineage
+    );
+
+    // Registry integrity guarantee: replacing an already-published history
+    // must be rejected even when the pusher echoes the current head.
+    let result = crate::push_session_bundle_directory(
+        bundle_d.path(),
+        remote_dir.path(),
+        Some(branch.branch_id),
+        Some(&head_a),
+    );
+    assert!(
+        result.is_err(),
+        "divergent re-push must be rejected, got {result:?}"
+    );
+}
+
+#[test]
+#[ignore = "pins gap: push transports the whole grown bundle into a new content-addressed directory; the remote stores the shared prefix (events and raw chunk blobs) once per pushed bundle, so continuous push costs O(session size) per push instead of O(delta) and nothing dedups content across bundles"]
+fn continuous_export_push_transports_only_new_content() {
+    let (file, session, branch) = continuous_export_growing_store();
+    let bundle_a = continuous_export_bundle(file.path(), session.session_id);
+    let head_a = continuous_export_default_head_hash(bundle_a.path());
+    let remote_dir = tempdir().expect("remote");
+    crate::push_session_bundle_directory(bundle_a.path(), remote_dir.path(), None, None)
+        .expect("first push");
+
+    let mut store = SqliteSessionStore::open(file.path()).expect("reopen for growth");
+    continuous_export_append_turn(
+        &mut store,
+        &session,
+        &branch,
+        "second question",
+        2,
+        b"raw-turn-2",
+    );
+    drop(store);
+    let bundle_b = continuous_export_bundle(file.path(), session.session_id);
+    crate::push_session_bundle_directory(
+        bundle_b.path(),
+        remote_dir.path(),
+        Some(branch.branch_id),
+        Some(&head_a),
+    )
+    .expect("second push");
+
+    // The turn-1 raw chunk was already pushed at t1; an append-only remote
+    // should store that content exactly once.
+    let chunk_file_name = format!("{}.bin", test_hash_bytes(b"raw-turn-1").sha256_hex());
+    let remote_files = continuous_export_dir_bytes(remote_dir.path());
+    let occurrences = remote_files
+        .keys()
+        .filter(|path| path.ends_with(&chunk_file_name))
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "already-pushed content must not be stored again by later pushes"
+    );
+}
+
+#[test]
+fn continuous_export_import_rejects_cross_session_event_id_reuse_atomically() {
+    // Two different users' sessions reuse the same event_id with different
+    // content (event bytes always differ across sessions because the
+    // envelope embeds session_id). The portable distinguisher is event_hash;
+    // event_id is only guaranteed unique inside one store, where the
+    // events.event_id UNIQUE constraint makes the second import fail
+    // atomically instead of silently coexisting or overwriting.
+    let shared_event_id = EventId::new();
+
+    let file_one = NamedTempFile::new().expect("tempfile one");
+    let mut store_one = SqliteSessionStore::open(file_one.path()).expect("store one");
+    let (session_one, branch_one) = sample_session();
+    store_one
+        .create_session(&session_one, &branch_one)
+        .expect("create session one");
+    let mut event_one = EventEnvelope::new(
+        session_one.session_id,
+        branch_one.branch_id,
+        SpanKind::Agent,
+        EventPayload::MessageAppended {
+            message: Message::text(Role::User, "user one says hello"),
+        },
+    );
+    event_one.event_id = shared_event_id;
+    store_one
+        .append_event(&event_one)
+        .expect("append event one");
+    drop(store_one);
+    let bundle_one = continuous_export_bundle(file_one.path(), session_one.session_id);
+
+    let file_two = NamedTempFile::new().expect("tempfile two");
+    let mut store_two = SqliteSessionStore::open(file_two.path()).expect("store two");
+    let (session_two, branch_two) = sample_session();
+    store_two
+        .create_session(&session_two, &branch_two)
+        .expect("create session two");
+    let mut event_two = EventEnvelope::new(
+        session_two.session_id,
+        branch_two.branch_id,
+        SpanKind::Agent,
+        EventPayload::MessageAppended {
+            message: Message::text(Role::User, "user two says something else"),
+        },
+    );
+    event_two.event_id = shared_event_id;
+    store_two
+        .append_event(&event_two)
+        .expect("append event two");
+    drop(store_two);
+    let bundle_two = continuous_export_bundle(file_two.path(), session_two.session_id);
+
+    // Same event_id, different bytes: the content-derived hashes differ.
+    let hashes_one = bundle_event_hashes(bundle_one.path());
+    let hashes_two = bundle_event_hashes(bundle_two.path());
+    assert_eq!(hashes_one.len(), 1);
+    assert_eq!(hashes_two.len(), 1);
+    assert_ne!(
+        hashes_one[0], hashes_two[0],
+        "reused event_id must still be distinguishable by event_hash"
+    );
+
+    let mut destination = SqliteSessionStore::open_in_memory().expect("destination store");
+    destination
+        .import_session_bundle_directory(bundle_one.path())
+        .expect("first import");
+    destination
+        .import_session_bundle_directory(bundle_two.path())
+        .expect_err("second import reusing the event_id must be rejected");
+
+    // Atomicity: the failed import leaves no partial session behind.
+    assert!(
+        destination
+            .load_session(session_two.session_id)
+            .expect("load session two")
+            .is_none(),
+        "failed import must not leave a partial session record"
+    );
+    assert!(
+        destination
+            .load_all_events(session_two.session_id)
+            .expect("session two events")
+            .is_empty(),
+        "failed import must not leave partial events"
+    );
+    // Session one's evidence is untouched.
+    assert_eq!(
+        destination
+            .load_all_events(session_one.session_id)
+            .expect("session one events")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn continuous_export_prefix_stability_with_context_compacted_event() {
+    // Compaction will soon append context.compacted events mid-stream. For
+    // continuous export they must behave as ordinary appended evidence: the
+    // already-exported prefix stays byte-identical, and the compaction
+    // event itself round-trips with its store-local seq refs stripped.
+    let (file, session, branch) = continuous_export_growing_store();
+    let bundle_a = continuous_export_bundle(file.path(), session.session_id);
+
+    let mut store = SqliteSessionStore::open(file.path()).expect("reopen for compaction");
+    store
+        .append_event(&EventEnvelope::new(
+            session.session_id,
+            branch.branch_id,
+            SpanKind::Chain,
+            EventPayload::ContextCompacted {
+                compaction_id: bt_core::CompactionId::new(),
+                trigger: bt_core::ContextCompactionTrigger::TokenBudget,
+                phase: bt_core::ContextCompactionPhase::PreTurn,
+                status: bt_core::ContextCompactionStatus::Completed,
+                reason: Some("token budget exceeded".to_owned()),
+                provider: Some("test".to_owned()),
+                model: Some("test-model".to_owned()),
+                context_boundary_seq_id: Some(3),
+                summary_message_id: None,
+                first_kept_message_id: None,
+                first_kept_branch_id: Some(branch.branch_id),
+                first_kept_seq_id: Some(2),
+                latency_ms: Some(5),
+                summary: "compacted early turns".to_owned(),
+                messages_before: 4,
+                messages_after: 2,
+                tokens_before: 900,
+                tokens_after: 300,
+                files_read: Vec::new(),
+                files_modified: Vec::new(),
+            },
+        ))
+        .expect("append compaction event");
+    continuous_export_append_turn(
+        &mut store,
+        &session,
+        &branch,
+        "post-compaction question",
+        2,
+        b"raw-turn-2",
+    );
+    drop(store);
+    let bundle_b = continuous_export_bundle(file.path(), session.session_id);
+
+    let events_a = fs::read(bundle_a.path().join(SESSION_BT_EVENTS)).expect("events A");
+    let events_b = fs::read(bundle_b.path().join(SESSION_BT_EVENTS)).expect("events B");
+    assert!(
+        events_b.starts_with(&events_a),
+        "a mid-stream context.compacted event must not disturb the exported prefix"
+    );
+
+    let records_b = continuous_export_bundle_records(bundle_b.path());
+    assert_eq!(records_b.len(), 9);
+    let compacted = &records_b[4];
+    assert_eq!(compacted.event_kind, "context.compacted");
+    let payload = compacted
+        .event
+        .get("payload")
+        .and_then(|payload| payload.get("ContextCompacted"))
+        .expect("compacted payload");
+    assert!(
+        payload.get("context_boundary_seq_id").is_none(),
+        "store-local seq refs must be stripped from portable records"
+    );
+    assert!(payload.get("first_kept_seq_id").is_none());
+    assert_eq!(
+        payload.get("summary").and_then(|value| value.as_str()),
+        Some("compacted early turns")
+    );
+
+    validate_session_bundle_directory(bundle_b.path()).expect("compacted bundle validates");
+    let mut imported = SqliteSessionStore::open_in_memory().expect("import store");
+    imported
+        .import_session_bundle_directory(bundle_b.path())
+        .expect("compacted bundle imports");
+    let imported_events = imported
+        .load_all_events(session.session_id)
+        .expect("imported events");
+    let imported_compacted = imported_events
+        .iter()
+        .find_map(|event| match &event.payload {
+            EventPayload::ContextCompacted {
+                context_boundary_seq_id,
+                first_kept_seq_id,
+                summary,
+                ..
+            } => Some((
+                *context_boundary_seq_id,
+                *first_kept_seq_id,
+                summary.clone(),
+            )),
+            _ => None,
+        })
+        .expect("imported compaction event");
+    // Store-local seq refs are transport-only and intentionally dropped on
+    // export; after import they are None. Portable compaction boundaries
+    // must therefore ride in message-id/branch-id fields, never seq ids.
+    assert_eq!(imported_compacted.0, None);
+    assert_eq!(imported_compacted.1, None);
+    assert_eq!(imported_compacted.2, "compacted early turns");
+}

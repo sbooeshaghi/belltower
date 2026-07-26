@@ -630,3 +630,37 @@ For multiplayer:
 - pull imports without mutating the current session unless explicitly continued
 - derived projections can be regenerated from the bundle and are not required
   for validation
+
+## Hosted Registry Coherence Rules (audited 2026-07-25)
+
+A continuous-export registry (users repeatedly pushing growing sessions) is
+supported by the shapes today, verified by the `continuous_export_*` tests:
+exports are prefix-stable byte-for-byte as sessions grow (line citations and
+dedup are safe), pushes are idempotent and CAS-guarded, advancing an
+existing branch head additionally requires the pushed bundle to extend the
+stored head's `events.jsonl` as a byte prefix (divergent histories fork,
+they never rebind heads), rejected pushes leave no remote garbage, and
+`context.compacted` is ordinary appended evidence.
+
+Rules a hosted implementation must add on top of these shapes:
+
+- **Storage is keyed by content hash, never by `event_id`** — event ids are
+  store-local uniqueness; only `event_hash` is global identity.
+- **Tenancy**: namespace remotes by publisher identity and bind a session id
+  to its first publisher; the current directory remote is global
+  first-pusher-wins and is suitable for trusted/local use only.
+- **Redaction is lineage identity**: a redacted publication diverges by
+  construction; the registry must treat redaction policy as part of head
+  identity so redacted and unredacted histories can never rebind each other.
+  (RedactionPolicy currently has only `None`; this rule binds when it grows.)
+- **Privacy normalization before hosted publication**: manifests carry
+  `project_root` (an absolute local path) and `connection_id` verbatim;
+  a hosted flow must normalize or redact these.
+- **Known efficiency gap (pinned by an ignored test)**: push transports the
+  whole bundle per push, O(session) not O(delta), and prefix content is
+  stored once per bundle. The fix direction is a remote-level
+  content-addressed blob store plus a per-branch rolling chain hash in the
+  manifest so servers verify extension in O(delta).
+- **Compaction writers must populate message-id refs** (`summary_message_id`
+  etc.), not only seq ids — seq ids are stripped from portable records, so a
+  seq-only compaction boundary is unreconstructable after import.

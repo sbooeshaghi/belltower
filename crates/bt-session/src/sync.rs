@@ -90,7 +90,6 @@ fn push_session_bundle_directory_inner(
     let bundles_dir = session_dir.join(SESSION_BT_REMOTE_BUNDLES_DIR);
     fs::create_dir_all(&bundles_dir)?;
     let _lock = acquire_remote_state_lock(&session_dir)?;
-    let copied_bundle = copy_bundle_to_remote(bundle_dir, &bundles_dir, &validation.bundle_hash)?;
 
     let mut state = read_remote_state(&session_dir, manifest.session.session_id)?;
     let existing_index = state
@@ -108,6 +107,16 @@ fn push_session_bundle_directory_inner(
     )?;
 
     let changed_remote_head = previous_head.as_ref() != Some(&head.event_hash);
+    if changed_remote_head && let Some(index) = existing_index {
+        ensure_pushed_bundle_extends_remote_head(
+            bundle_dir,
+            &bundles_dir,
+            &state.branch_heads[index],
+        )?;
+    }
+    // Copy only after every integrity check has passed, so a rejected push
+    // cannot leave an orphaned bundle directory on the remote.
+    let copied_bundle = copy_bundle_to_remote(bundle_dir, &bundles_dir, &validation.bundle_hash)?;
     if changed_remote_head {
         let remote_head = SessionBundleRemoteHead {
             branch_id: branch.branch_id,
@@ -210,6 +219,37 @@ fn select_pull_head(
     Err(invalid_sync(
         "remote has multiple heads; pass --branch to select one",
     ))
+}
+
+/// Append-only registry integrity: advancing an existing branch head is only
+/// legal when the pushed bundle extends the stored head bundle's history —
+/// its `events.jsonl` must begin byte-for-byte with the stored one (prefix
+/// stability makes this exact). Head-equality CAS alone would let a
+/// fabricated divergent lineage echo the current head and silently rebind
+/// it; divergent histories must fork, never rewrite.
+fn ensure_pushed_bundle_extends_remote_head(
+    bundle_dir: &Path,
+    bundles_dir: &Path,
+    previous: &SessionBundleRemoteHead,
+) -> Result<()> {
+    let previous_events = bundles_dir
+        .join(previous.bundle_hash.sha256_hex())
+        .join(crate::SESSION_BT_EVENTS);
+    if !previous_events.is_file() {
+        return Err(invalid_sync(format!(
+            "remote head bundle {} is missing; refusing to advance an unverifiable head",
+            previous.bundle_hash
+        )));
+    }
+    let previous_bytes = fs::read(&previous_events)?;
+    let pushed_bytes = fs::read(bundle_dir.join(crate::SESSION_BT_EVENTS))?;
+    if !pushed_bytes.starts_with(&previous_bytes) {
+        return Err(invalid_sync(
+            "pushed bundle does not extend the remote head's history; append-only registries fork divergent histories instead of rebinding heads"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn enforce_cas(
@@ -409,7 +449,7 @@ mod tests {
 
     #[test]
     fn session_bundle_push_and_pull_round_trip_remote_head() {
-        let (bundle_dir, session_id, branch_id, head) = export_bundle_fixture();
+        let (_store_file, bundle_dir, session_id, branch_id, head) = export_bundle_fixture();
         let remote_dir = tempdir().expect("remote");
         let pushed =
             push_session_bundle_directory(bundle_dir.path(), remote_dir.path(), None, None)
@@ -432,13 +472,13 @@ mod tests {
 
     #[test]
     fn session_bundle_push_rejects_stale_expected_head() {
-        let (first_bundle, session_id, branch_id, first_head) = export_bundle_fixture();
+        let (store_file, first_bundle, session_id, branch_id, first_head) = export_bundle_fixture();
         let remote_dir = tempdir().expect("remote");
         push_session_bundle_directory(first_bundle.path(), remote_dir.path(), None, None)
             .expect("initial push");
 
         let (second_bundle, _, _, second_head) =
-            export_bundle_with_extra_message(session_id, branch_id);
+            export_bundle_with_extra_message(&store_file, session_id, branch_id);
         assert_ne!(first_head, second_head);
         let stale = PortableHash::new(
             "sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -467,7 +507,7 @@ mod tests {
 
     #[test]
     fn session_bundle_push_rejects_held_remote_state_lock() {
-        let (bundle_dir, session_id, _, _) = export_bundle_fixture();
+        let (_store_file, bundle_dir, session_id, _, _) = export_bundle_fixture();
         let remote_dir = tempdir().expect("remote");
         let session_dir = remote_session_dir(remote_dir.path(), session_id);
         fs::create_dir_all(&session_dir).expect("session dir");
@@ -478,7 +518,13 @@ mod tests {
         assert!(error.to_string().contains("remote state lock"));
     }
 
-    fn export_bundle_fixture() -> (tempfile::TempDir, SessionId, BranchId, PortableHash) {
+    fn export_bundle_fixture() -> (
+        NamedTempFile,
+        tempfile::TempDir,
+        SessionId,
+        BranchId,
+        PortableHash,
+    ) {
         let file = NamedTempFile::new().expect("tempfile");
         let mut store = SqliteSessionStore::open(file.path()).expect("open store");
         let session = SessionRecord {
@@ -535,59 +581,31 @@ mod tests {
             .expect("head")
             .event_hash
             .clone();
-        (bundle_dir, session.session_id, branch.branch_id, head)
+        (file, bundle_dir, session.session_id, branch.branch_id, head)
     }
 
+    /// Grows the SAME backing store by one message and re-exports, so the
+    /// second bundle is a true descendant of the first (the push descendancy
+    /// check rejects rebuilt same-id histories by design).
     fn export_bundle_with_extra_message(
+        store_file: &NamedTempFile,
         session_id: SessionId,
         branch_id: BranchId,
     ) -> (tempfile::TempDir, SessionId, BranchId, PortableHash) {
-        let file = NamedTempFile::new().expect("tempfile");
-        let mut store = SqliteSessionStore::open(file.path()).expect("open store");
-        let session = SessionRecord {
-            session_id,
-            project_root: "/tmp/belltower-sync".into(),
-            connection_id: ConnectionId::new("local"),
-            model_id: None,
-            display_name: Some("sync fixture".to_owned()),
-            objective: None,
-            status: SessionStatus::Active,
-            settings_revision_id: default_settings_revision_id(),
-            tool_mode: SessionToolMode::Standard,
-            parent_session_id: None,
-            parent_branch_id: None,
-            parent_turn_id: None,
-            created_at: time::OffsetDateTime::now_utc(),
-            updated_at: time::OffsetDateTime::now_utc(),
-        };
-        let branch = bt_core::BranchRecord {
-            branch_id,
-            session_id,
-            parent_branch_id: None,
-            parent_event_id: None,
-            head_event_id: None,
-            summary: None,
-            created_at: time::OffsetDateTime::now_utc(),
-            is_default: true,
-        };
+        let mut store = SqliteSessionStore::open(store_file.path()).expect("open store");
         store
-            .create_session(&session, &branch)
-            .expect("create session");
-        for text in ["hello", "again"] {
-            store
-                .append_event(&EventEnvelope::new(
-                    session_id,
-                    branch_id,
-                    SpanKind::Agent,
-                    EventPayload::MessageAppended {
-                        message: Message::text(Role::User, text),
-                    },
-                ))
-                .expect("append message");
-        }
+            .append_event(&EventEnvelope::new(
+                session_id,
+                branch_id,
+                SpanKind::Agent,
+                EventPayload::MessageAppended {
+                    message: Message::text(Role::User, "again"),
+                },
+            ))
+            .expect("append message");
         drop(store);
 
-        let reopened = SqliteSessionStore::open(file.path()).expect("reopen store");
+        let reopened = SqliteSessionStore::open(store_file.path()).expect("reopen store");
         let bundle_dir = tempdir().expect("bundle");
         let manifest = reopened
             .export_session_bundle_directory(session_id, bundle_dir.path())
