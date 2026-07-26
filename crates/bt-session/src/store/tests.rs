@@ -3666,6 +3666,68 @@ fn export_legacy_bundle_contains_session_branches_messages_events_and_raw_chunks
 }
 
 #[test]
+fn portable_bundle_round_trips_completion_chunk_with_null_raw_chunk_index() {
+    // serde serializes raw_chunk_index: None as an explicit JSON null; the
+    // exporter must treat that as "no raw chunk linkage", not a malformed
+    // record (real sessions were unexportable before this fix).
+    let file = NamedTempFile::new().expect("tempfile");
+    let mut store = SqliteSessionStore::open(file.path()).expect("open store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    let turn_id = TurnId::new();
+    store
+        .append_event(&turn_started_event(&session, &branch, turn_id))
+        .expect("start turn");
+    store
+        .append_event(
+            &EventEnvelope::new(
+                session.session_id,
+                branch.branch_id,
+                SpanKind::Llm,
+                EventPayload::CompletionChunk {
+                    llm_call_ordinal: Some(1),
+                    deltas: Vec::new(),
+                    raw_chunk_index: None,
+                },
+            )
+            .with_turn_id(turn_id),
+        )
+        .expect("append rawless completion chunk");
+    store
+        .append_event(&turn_finished_event(&session, &branch, turn_id))
+        .expect("finish turn");
+    drop(store);
+
+    let reopened = SqliteSessionStore::open(file.path()).expect("reopen store");
+    let bundle_dir = tempdir().expect("bundle dir");
+    reopened
+        .export_session_bundle_directory(session.session_id, bundle_dir.path())
+        .expect("export must tolerate null raw_chunk_index");
+
+    let report = validate_session_bundle_directory(bundle_dir.path()).expect("validate bundle");
+    assert_eq!(report.session_id, session.session_id);
+    assert_eq!(report.raw_chunk_count, 0);
+
+    let import_file = NamedTempFile::new().expect("import tempfile");
+    let mut import_store = SqliteSessionStore::open(import_file.path()).expect("import store");
+    import_store
+        .import_session_bundle_directory(bundle_dir.path())
+        .expect("import round-trip");
+    let imported_events = import_store
+        .load_all_events(session.session_id)
+        .expect("imported events");
+    assert!(imported_events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::CompletionChunk {
+            raw_chunk_index: None,
+            ..
+        }
+    )));
+}
+
+#[test]
 fn portable_session_bundle_exports_and_validates_offline() {
     let (bundle_dir, session_id) = export_portable_bundle_fixture();
 

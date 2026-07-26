@@ -1483,6 +1483,12 @@ fn collect_raw_chunk_local_id(
     let Some(value) = object.get(field) else {
         return Ok(());
     };
+    // serde serializes Option::None as an explicit null: a null linkage field
+    // (CompletionChunk without a raw provider payload) means "no raw chunk",
+    // not a malformed record.
+    if value.is_null() {
+        return Ok(());
+    }
     let Some(local_id) = value.as_i64() else {
         return Err(invalid_bundle(format!("{variant} {field} is not an i64")));
     };
