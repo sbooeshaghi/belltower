@@ -275,7 +275,7 @@ fn runtime_rejects_unconfigured_connection_before_session_creation() {
     assert!(matches!(
         error,
         BelltowerError::Config(message)
-            if message == "connection `missing` is not configured"
+            if message.starts_with("connection `missing` is not configured")
     ));
     assert!(
         runtime
@@ -1195,7 +1195,7 @@ fn runtime_rejects_unconfigured_connection_before_settings_update() {
     assert!(matches!(
         error,
         BelltowerError::Config(message)
-            if message == "connection `missing` is not configured"
+            if message.starts_with("connection `missing` is not configured")
     ));
     let unchanged = runtime
         .load_session(session.session_id)

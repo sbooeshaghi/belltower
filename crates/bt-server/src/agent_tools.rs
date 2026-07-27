@@ -61,9 +61,31 @@ struct SpawnAgentTool {
 
 impl ToolExecutor for SpawnAgentTool {
     fn spec(&self) -> ToolSpec {
+        // The registry is rebuilt per turn, so the spec can advertise the
+        // LIVE connection inventory — models cannot guess ids like "ollama"
+        // when the real id is "local".
+        let mut connections = self
+            .state
+            .runtime
+            .connections()
+            .into_iter()
+            .map(|connection| (connection.id.to_string(), connection.default_model))
+            .collect::<Vec<_>>();
+        connections.sort();
+        let connection_ids = connections
+            .iter()
+            .map(|(id, _)| Value::String(id.clone()))
+            .collect::<Vec<_>>();
+        let inventory = connections
+            .iter()
+            .map(|(id, default_model)| format!("{id} (default model: {default_model})"))
+            .collect::<Vec<_>>()
+            .join("; ");
         ToolSpec {
             name: "spawn_agent".to_owned(),
-            description: "Spawn a child agent session for a bounded objective. The child may use a different configured connection and model. Children currently share the parent's project root, so allow_shared_workspace must be explicitly true and human approval is always required.".to_owned(),
+            description: format!(
+                "Spawn a child agent session for a bounded objective. The child may use a different configured connection and model. Children currently share the parent's project root, so allow_shared_workspace must be explicitly true and human approval is always required. Configured connections: {inventory}."
+            ),
             parameters_schema: json!({
                 "type": "object",
                 "required": ["objective", "allow_shared_workspace", "call_id"],
@@ -76,6 +98,7 @@ impl ToolExecutor for SpawnAgentTool {
                     "display_name": {"type": "string"},
                     "connection_id": {
                         "type": "string",
+                        "enum": connection_ids,
                         "description": "Configured Belltower connection id. Omit to inherit the parent connection."
                     },
                     "model_id": {

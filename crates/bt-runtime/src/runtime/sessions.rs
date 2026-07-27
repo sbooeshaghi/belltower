@@ -577,8 +577,17 @@ impl BelltowerRuntime {
 
     fn ensure_connection_configured(&self, connection_id: &ConnectionId) -> Result<()> {
         if self.connection(connection_id).is_none() {
+            // Callers are often models guessing an id; naming the valid
+            // options makes a wrong guess self-correcting.
+            let mut configured = self
+                .connections()
+                .into_iter()
+                .map(|connection| connection.id.to_string())
+                .collect::<Vec<_>>();
+            configured.sort();
             return Err(bt_core::BelltowerError::Config(format!(
-                "connection `{connection_id}` is not configured"
+                "connection `{connection_id}` is not configured (configured connections: {})",
+                configured.join(", ")
             )));
         }
         Ok(())
