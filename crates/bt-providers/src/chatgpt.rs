@@ -16,7 +16,7 @@ use url::Url;
 // ChatGPT's Codex backend gates model visibility on a Codex compatibility
 // version. That is a backend contract and must not follow Belltower's package
 // version, which would hide newer models from discovery.
-const CHATGPT_CODEX_CLIENT_VERSION: &str = "0.124.0";
+const CHATGPT_CODEX_CLIENT_VERSION: &str = "0.146.0";
 const DEFAULT_CHATGPT_INSTRUCTIONS: &str = "You are Belltower.";
 
 #[derive(Clone)]
@@ -934,8 +934,9 @@ pub fn chatgpt_account_id(metadata: &CredentialMetadata) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OpenAiChatGptProvider, chatgpt_account_id, completion_chunks_from_responses_event,
-        parse_chatgpt_model_ids, request_input_items, request_instructions,
+        CHATGPT_CODEX_CLIENT_VERSION, OpenAiChatGptProvider, chatgpt_account_id,
+        completion_chunks_from_responses_event, parse_chatgpt_model_ids, request_input_items,
+        request_instructions,
     };
     use bt_core::{
         CompletionDelta, CompletionRequest, ConnectionId, CredentialMetadata, Message, MessagePart,
@@ -1163,7 +1164,9 @@ mod tests {
         let url = provider.models_url().expect("models url");
         assert_eq!(
             url.as_str(),
-            "https://chatgpt.com/backend-api/codex/models?client_version=0.124.0"
+            format!(
+                "https://chatgpt.com/backend-api/codex/models?client_version={CHATGPT_CODEX_CLIENT_VERSION}"
+            )
         );
     }
 

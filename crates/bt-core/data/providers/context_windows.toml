@@ -30,3 +30,8 @@ provider = "openai-compatible"
 model_pattern = "qwen3"
 context_window_tokens = 32768
 
+
+[[window]]
+provider = "openai-chatgpt"
+model_pattern = "gpt-5"
+context_window_tokens = 272000
