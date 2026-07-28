@@ -1,4 +1,5 @@
 use super::*;
+use crate::TurnRunStopReason;
 use std::collections::HashSet;
 
 impl BelltowerRuntime {
@@ -191,6 +192,223 @@ impl BelltowerRuntime {
             .lock()
             .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?
             .load_all_pending_related_session_messages()
+    }
+
+    pub fn all_unsettled_related_session_obligations(
+        &self,
+    ) -> Result<Vec<RelatedSessionMessageRecord>> {
+        self.store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?
+            .load_all_unsettled_related_session_obligations()
+    }
+
+    pub fn record_related_turn_outcome(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        turn_id: TurnId,
+        stop_reason: TurnRunStopReason,
+    ) -> Result<usize> {
+        let (kind, text) = match stop_reason {
+            TurnRunStopReason::Complete => (
+                RelatedSessionMessageKind::Result,
+                self.store
+                    .lock()
+                    .map_err(|_| {
+                        bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned())
+                    })?
+                    .load_messages_for_turn(session_id, branch_id, turn_id)?
+                    .into_iter()
+                    .rev()
+                    .find(|message| message.role == Role::Assistant)
+                    .map(|message| message.text_parts().collect::<Vec<_>>().join("\n"))
+                    .filter(|text| !text.trim().is_empty())
+                    .unwrap_or_else(|| "Related-session turn completed.".to_owned()),
+            ),
+            TurnRunStopReason::AwaitingApproval => (
+                RelatedSessionMessageKind::Progress,
+                "Related-session turn is waiting for tool approval.".to_owned(),
+            ),
+            TurnRunStopReason::AwaitingInput => (
+                RelatedSessionMessageKind::Progress,
+                "Related-session turn is waiting for operator input.".to_owned(),
+            ),
+            TurnRunStopReason::BudgetExhausted => (
+                RelatedSessionMessageKind::Error,
+                "Related-session turn stopped because its budget was exhausted.".to_owned(),
+            ),
+            TurnRunStopReason::Cancelled => (
+                RelatedSessionMessageKind::Error,
+                "Related-session turn was cancelled.".to_owned(),
+            ),
+        };
+        self.record_related_reply_obligations(session_id, branch_id, turn_id, kind, text)
+    }
+
+    pub fn record_related_turn_failure(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        turn_id: TurnId,
+        error: &bt_core::BelltowerError,
+    ) -> Result<usize> {
+        self.record_related_reply_obligations(
+            session_id,
+            branch_id,
+            turn_id,
+            RelatedSessionMessageKind::Error,
+            format!("Related-session turn failed: {error}"),
+        )
+    }
+
+    pub fn fail_admitted_related_turn(
+        &self,
+        admitted: &AdmittedTurn,
+        error: &bt_core::BelltowerError,
+    ) -> Result<()> {
+        let (connection, model) =
+            self.resolve_turn_settings(admitted.session_id(), admitted.settings_revision_id())?;
+        self.record_turn_failure_transition(
+            admitted.session_id(),
+            admitted.branch_id(),
+            &connection.provider,
+            &model,
+            admitted.turn_id(),
+            Vec::new(),
+            error,
+            0,
+        )?;
+
+        if self
+            .record_related_turn_failure(
+                admitted.session_id(),
+                admitted.branch_id(),
+                admitted.turn_id(),
+                error,
+            )
+            .is_err()
+        {
+            // The turn is already terminal. Reconcile the idempotent atomic
+            // reply-pair settlement once in-process; startup recovery remains
+            // the backstop for a persistent storage failure.
+            self.record_related_turn_failure(
+                admitted.session_id(),
+                admitted.branch_id(),
+                admitted.turn_id(),
+                error,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn record_related_reply_obligations(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        turn_id: TurnId,
+        kind: RelatedSessionMessageKind,
+        text: String,
+    ) -> Result<usize> {
+        let records = self.related_session_messages(session_id)?;
+        let obligations = records
+            .iter()
+            .filter(|record| {
+                record.direction == RelatedSessionMessageDirection::Received
+                    && record.status == RelatedSessionMessageStatus::Claimed
+                    && record.settlement.is_none()
+                    && record.message.destination_branch_id == branch_id
+                    && matches!(
+                        record.message.kind,
+                        RelatedSessionMessageKind::Instruction
+                            | RelatedSessionMessageKind::Question
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let terminal = matches!(
+            kind,
+            RelatedSessionMessageKind::Result | RelatedSessionMessageKind::Error
+        );
+        let mut recorded = 0usize;
+        for obligation in obligations {
+            if !terminal {
+                let duplicate = records.iter().any(|candidate| {
+                    candidate.direction == RelatedSessionMessageDirection::Sent
+                        && candidate.message.in_reply_to == Some(obligation.message.message_id)
+                        && candidate.message.kind == kind
+                        && candidate.message.text == text
+                });
+                if !duplicate {
+                    self.send_related_session_message(
+                        session_id,
+                        branch_id,
+                        Some(turn_id),
+                        obligation.message.source_session_id,
+                        obligation.message.source_branch_id,
+                        kind,
+                        RelatedSessionDeliveryMode::Notify,
+                        Some(obligation.message.message_id),
+                        text.clone(),
+                        Vec::new(),
+                    )?;
+                    recorded = recorded.saturating_add(1);
+                }
+                continue;
+            }
+
+            let (_, sent, received) = Self::related_session_message_events(
+                session_id,
+                branch_id,
+                Some(turn_id),
+                obligation.message.source_session_id,
+                obligation.message.source_branch_id,
+                kind,
+                RelatedSessionDeliveryMode::Wake,
+                Some(obligation.message.message_id),
+                text.clone(),
+                Vec::new(),
+            )?;
+            let reply_message_id = match &sent.payload {
+                EventPayload::RelatedSessionMessageRecorded { message, .. } => message.message_id,
+                _ => unreachable!("related-session event constructor returns a message event"),
+            };
+            let settlement_event = EventEnvelope::new(
+                session_id,
+                branch_id,
+                SpanKind::Chain,
+                EventPayload::RelatedSessionMessageSettled {
+                    message_id: obligation.message.message_id,
+                    reply_message_id,
+                    reply_kind: kind,
+                    settling_turn_id: turn_id,
+                },
+            )
+            .with_turn_id(turn_id);
+            self.take_store_append_fault_for_test()?;
+            let receipt = self
+                .store
+                .lock()
+                .map_err(|_| {
+                    bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned())
+                })?
+                .settle_related_session_message(
+                    obligation.message.message_id,
+                    &sent,
+                    &received,
+                    &settlement_event,
+                )?;
+            if receipt.newly_committed {
+                self.publish_committed_event(sent, receipt.reply.sent_seq_id);
+                self.publish_committed_event(received, receipt.reply.received_seq_id);
+                self.publish_committed_event(
+                    settlement_event,
+                    receipt.settlement.settlement_seq_id,
+                );
+                recorded = recorded.saturating_add(1);
+            }
+        }
+        Ok(recorded)
     }
 
     pub fn claim_related_messages_for_active_turn(

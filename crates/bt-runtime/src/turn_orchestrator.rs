@@ -578,6 +578,12 @@ impl TurnOrchestrator<'_> {
                             settings_revision_id,
                             &error,
                         )?;
+                        self.runtime.record_related_turn_failure(
+                            request.session.session_id,
+                            current_branch.branch_id,
+                            turn_id,
+                            &error,
+                        )?;
                         return Err(error);
                     }
                 };
@@ -700,6 +706,12 @@ impl TurnOrchestrator<'_> {
                                 &error,
                                 latency_ms,
                             )?;
+                            self.runtime.record_related_turn_failure(
+                                turn_session.session_id,
+                                current_branch.branch_id,
+                                turn_id,
+                                &error,
+                            )?;
                             return Err(error);
                         }
                     };
@@ -723,38 +735,57 @@ impl TurnOrchestrator<'_> {
                     )?;
 
                     if budget_outcome == BudgetEnforcementOutcome::Exhausted {
+                        self.runtime.record_related_turn_outcome(
+                            turn_session.session_id,
+                            current_branch.branch_id,
+                            turn_id,
+                            TurnRunStopReason::BudgetExhausted,
+                        )?;
                         return Ok((
                             PostTurnControlAction::Stop,
                             TurnRunStopReason::BudgetExhausted,
                         ));
                     }
                     if persisted.persistence.awaits_operator() {
-                        return Ok((
-                            PostTurnControlAction::Stop,
-                            match persisted.persistence {
-                                TurnResultPersistenceStatus::AwaitingApproval => {
-                                    TurnRunStopReason::AwaitingApproval
-                                }
-                                TurnResultPersistenceStatus::AwaitingInput => {
-                                    TurnRunStopReason::AwaitingInput
-                                }
-                                TurnResultPersistenceStatus::Completed => {
-                                    TurnRunStopReason::Complete
-                                }
-                            },
-                        ));
+                        let stop_reason = match persisted.persistence {
+                            TurnResultPersistenceStatus::AwaitingApproval => {
+                                TurnRunStopReason::AwaitingApproval
+                            }
+                            TurnResultPersistenceStatus::AwaitingInput => {
+                                TurnRunStopReason::AwaitingInput
+                            }
+                            TurnResultPersistenceStatus::Completed => TurnRunStopReason::Complete,
+                        };
+                        if let Err(error) = self.runtime.record_related_turn_outcome(
+                            turn_session.session_id,
+                            current_branch.branch_id,
+                            turn_id,
+                            stop_reason,
+                        ) {
+                            tracing::warn!(
+                                session_id = %turn_session.session_id,
+                                %turn_id,
+                                %error,
+                                "failed to record nonterminal related-session progress"
+                            );
+                        }
+                        return Ok((PostTurnControlAction::Stop, stop_reason));
                     }
                     let was_cancelled = self.runtime.is_cancelled(turn_session.session_id)?;
+                    let stop_reason = if was_cancelled {
+                        TurnRunStopReason::Cancelled
+                    } else {
+                        TurnRunStopReason::Complete
+                    };
+                    self.runtime.record_related_turn_outcome(
+                        turn_session.session_id,
+                        current_branch.branch_id,
+                        turn_id,
+                        stop_reason,
+                    )?;
                     self.runtime
                         .consume_post_turn_controls(&turn_session, &current_branch)
-                        .map(|action| {
-                            let stop_reason = if was_cancelled {
-                                TurnRunStopReason::Cancelled
-                            } else {
-                                TurnRunStopReason::Complete
-                            };
-                            (action, stop_reason)
-                        })
+                        .map(|action| (action, stop_reason))
                 }
                 .instrument(turn_span)
                 .await?;

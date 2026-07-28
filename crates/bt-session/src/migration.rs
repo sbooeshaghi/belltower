@@ -263,6 +263,12 @@ CREATE TABLE IF NOT EXISTS related_session_message_projection (
     resulting_turn_id      TEXT,
     created_at             TEXT NOT NULL,
     resolved_at            TEXT,
+    settlement_event_id    TEXT,
+    settlement_reply_message_id TEXT,
+    settlement_reply_kind  TEXT,
+    settling_turn_id       TEXT,
+    settlement_seq         INTEGER,
+    settled_at             TEXT,
     PRIMARY KEY (session_id, message_id, direction)
 );
 CREATE INDEX IF NOT EXISTS idx_related_session_message_pending
@@ -347,6 +353,42 @@ pub fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
         "unpriced_completion_count",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_column(
+        connection,
+        "related_session_message_projection",
+        "settlement_event_id",
+        "TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "related_session_message_projection",
+        "settlement_reply_message_id",
+        "TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "related_session_message_projection",
+        "settlement_reply_kind",
+        "TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "related_session_message_projection",
+        "settling_turn_id",
+        "TEXT",
+    )?;
+    ensure_column(
+        connection,
+        "related_session_message_projection",
+        "settlement_seq",
+        "INTEGER",
+    )?;
+    ensure_column(
+        connection,
+        "related_session_message_projection",
+        "settled_at",
+        "TEXT",
+    )?;
     connection.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_message_projection_session_branch ON message_projection(session_id, branch_id);
          CREATE INDEX IF NOT EXISTS idx_events_session_kind ON events(session_id, event_kind, seq_id);
@@ -366,7 +408,9 @@ pub fn apply_migrations(connection: &Connection) -> rusqlite::Result<()> {
              destination_branch_id TEXT NOT NULL, kind TEXT NOT NULL,
              delivery_mode TEXT NOT NULL, in_reply_to TEXT, message_json TEXT NOT NULL,
              status TEXT NOT NULL, source_seq INTEGER NOT NULL, resulting_turn_id TEXT,
-             created_at TEXT NOT NULL, resolved_at TEXT,
+             created_at TEXT NOT NULL, resolved_at TEXT, settlement_event_id TEXT,
+             settlement_reply_message_id TEXT, settlement_reply_kind TEXT,
+             settling_turn_id TEXT, settlement_seq INTEGER, settled_at TEXT,
              PRIMARY KEY (session_id, message_id, direction)
          );
          CREATE INDEX IF NOT EXISTS idx_related_session_message_pending

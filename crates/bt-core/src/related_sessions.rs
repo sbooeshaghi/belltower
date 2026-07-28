@@ -71,6 +71,26 @@ pub struct RelatedSessionMessageReceipt {
     pub status: RelatedSessionMessageStatus,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct RelatedSessionMessageSettlement {
+    pub obligation_message_id: RelatedSessionMessageId,
+    pub reply_message_id: RelatedSessionMessageId,
+    pub reply_kind: RelatedSessionMessageKind,
+    pub settling_turn_id: TurnId,
+    pub settlement_event_id: EventId,
+    pub settlement_seq_id: i64,
+    #[schemars(schema_with = "crate::schema_support::offset_date_time_schema")]
+    pub settled_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelatedSessionSettlementReceipt {
+    pub settlement: RelatedSessionMessageSettlement,
+    pub reply: RelatedSessionMessageReceipt,
+    pub newly_committed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelatedSessionMessageRecord {
     pub message: RelatedSessionMessage,
@@ -81,4 +101,5 @@ pub struct RelatedSessionMessageRecord {
     pub seq_id: i64,
     pub resulting_turn_id: Option<TurnId>,
     pub resolved_at: Option<OffsetDateTime>,
+    pub settlement: Option<RelatedSessionMessageSettlement>,
 }

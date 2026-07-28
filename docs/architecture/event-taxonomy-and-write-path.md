@@ -255,14 +255,19 @@ The control-plane rule is now explicit:
   child start/handoff, and parent spawn completion commit as one store
   transition. A historical parent turn is causal lineage, not permission to
   append new live events to that already-finished turn
-- related-session communication uses `session.related_message.recorded` and
-  `session.related_message.resolved`, not transcript text or a process-local
+- related-session communication uses `session.related_message.recorded`,
+  `session.related_message.resolved`, and
+  `session.related_message.settled`, not transcript text or a process-local
   mailbox. One logical message commits matching `Sent` and `Received` copies to
   the source and destination sessions atomically. The source session,
   destination session, and message id form the delivery identity: an exact
   retry returns the existing receipt, while conflicting content under that
   identity fails. Resolution projection updates use that same exact endpoint
-  pair and cannot mutate an unrelated lineage that happens to reuse an id
+  pair and cannot mutate an unrelated lineage that happens to reuse an id.
+  A terminal `Result` or `Error` reply and the recipient-local settlement event
+  commit in one transaction. The settlement names the exact obligation, reply,
+  outcome kind, and settling turn, so retries and startup repair cannot produce
+  a second terminal reply
 - `wake` messages remain pending while the destination is busy. An idle claim
   consumes the oldest pending message and atomically appends its `Claimed`
   resolution plus `turn.started { source: related_session_message }` using the
@@ -270,8 +275,9 @@ The control-plane rule is now explicit:
   context but do not start work
 - a claimed cross-session turn is not retried automatically after restart,
   because tools may already have produced side effects. Recovery terminalizes
-  the interrupted turn and sends one typed durable error to the originating
-  session instead
+  the interrupted turn and atomically settles its obligation with one typed
+  durable error. If a terminal turn committed before its reply settlement,
+  startup derives and records the missing terminal `Result` or `Error` once
 - `context.compacted` records a stable `compaction_id`, the window chain
   (`window_number`, `previous_compaction_id`, `first_compaction_id` linking
   successive compactions on a branch), trigger, phase, status,

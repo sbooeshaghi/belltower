@@ -527,10 +527,16 @@ this crate.
 Recovery is deliberately conservative. Server startup claims one pending wake
 per idle destination through the ordinary related-message admission path. If
 the process restarts after a related message was claimed, runtime terminalizes
-the interrupted turn and emits one typed error notification to the sender
-instead of retrying possible tool side effects. Runtime reopening also repairs
-that notification when the interruption terminal event committed before the
-paired reply; an existing typed error reply suppresses duplication.
+the interrupted turn and settles the exact claimed obligation with one typed
+error instead of retrying possible tool side effects. Normal terminal
+`Result`/`Error` settlement is runtime-owned and happens at the turn boundary
+before queued continuation. The reply's paired session events and the
+recipient-local `session.related_message.settled` event commit atomically.
+Runtime reopening repairs a missing settlement after either a completed or
+failed terminal turn, and repeated recovery is idempotent. This applies to any
+valid same-lineage sender/recipient topology, not only direct parent-child
+messages. Nonterminal progress remains advisory and does not settle the
+obligation.
 
 ## Runtime Non-Goals
 

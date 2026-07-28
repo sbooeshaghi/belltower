@@ -340,6 +340,36 @@ impl SqliteSessionStore {
                 )
                 .map_err(storage_error)?;
             }
+            EventPayload::RelatedSessionMessageSettled {
+                message_id,
+                reply_message_id,
+                reply_kind,
+                settling_turn_id,
+            } => {
+                tx.execute(
+                    "UPDATE related_session_message_projection
+                     SET settlement_event_id = ?1,
+                         settlement_reply_message_id = ?2,
+                         settlement_reply_kind = ?3,
+                         settling_turn_id = ?4,
+                         settlement_seq = ?5,
+                         settled_at = ?6
+                     WHERE session_id = ?7
+                       AND message_id = ?8
+                       AND direction = 'received'",
+                    params![
+                        event.event_id.to_string(),
+                        reply_message_id.to_string(),
+                        serde_json::to_string(reply_kind)?,
+                        settling_turn_id.to_string(),
+                        seq_id,
+                        format_time(event.occurred_at)?,
+                        event.session_id.to_string(),
+                        message_id.to_string(),
+                    ],
+                )
+                .map_err(storage_error)?;
+            }
             EventPayload::TurnStarted { turn_id, .. } => {
                 tx.execute(
                     "INSERT INTO active_turn_projection (

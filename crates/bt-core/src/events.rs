@@ -120,6 +120,12 @@ pub enum EventPayload {
         resulting_turn_id: Option<TurnId>,
         reason: Option<String>,
     },
+    RelatedSessionMessageSettled {
+        message_id: RelatedSessionMessageId,
+        reply_message_id: RelatedSessionMessageId,
+        reply_kind: crate::RelatedSessionMessageKind,
+        settling_turn_id: TurnId,
+    },
     SessionSettingsUpdated {
         #[serde(default = "default_settings_revision_id")]
         settings_revision_id: u64,
@@ -357,6 +363,7 @@ impl EventPayload {
             Self::SessionResultRejected { .. } => "session.result.rejected",
             Self::RelatedSessionMessageRecorded { .. } => "session.related_message.recorded",
             Self::RelatedSessionMessageResolved { .. } => "session.related_message.resolved",
+            Self::RelatedSessionMessageSettled { .. } => "session.related_message.settled",
             Self::SessionSettingsUpdated { .. } => "session.settings.updated",
             Self::SessionEnded { .. } => "session.ended",
             Self::BranchCreated { .. } => "branch.created",

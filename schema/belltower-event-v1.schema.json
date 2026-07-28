@@ -1347,6 +1347,42 @@
         {
           "additionalProperties": false,
           "properties": {
+            "RelatedSessionMessageSettled": {
+              "additionalProperties": false,
+              "properties": {
+                "message_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "reply_kind": {
+                  "$ref": "#/$defs/RelatedSessionMessageKind"
+                },
+                "reply_message_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "settling_turn_id": {
+                  "format": "uuid",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "message_id",
+                "reply_message_id",
+                "reply_kind",
+                "settling_turn_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "RelatedSessionMessageSettled"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
             "SessionSettingsUpdated": {
               "additionalProperties": false,
               "properties": {

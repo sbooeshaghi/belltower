@@ -324,6 +324,21 @@ pub(crate) fn mirrored_event_fields(event: &EventEnvelope) -> MirroredEventField
             ));
             fields.output_preview = reason.as_ref().map(|reason| truncate_string(reason));
         }
+        EventPayload::RelatedSessionMessageSettled {
+            message_id,
+            reply_message_id,
+            reply_kind,
+            settling_turn_id,
+        } => {
+            fields.status = Some("Settled".to_owned());
+            fields.related_message_id = Some(message_id.to_string());
+            fields.related_message_kind = Some(format!("{reply_kind:?}"));
+            fields.related_message_status = Some("Settled".to_owned());
+            fields.related_message_resulting_turn_id = Some(settling_turn_id.to_string());
+            fields.finish_reason = Some(format!(
+                "message={message_id} reply={reply_message_id} outcome={reply_kind:?} settling_turn={settling_turn_id}"
+            ));
+        }
         EventPayload::SessionSettingsUpdated {
             settings_revision_id,
             connection_id,

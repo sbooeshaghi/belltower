@@ -161,6 +161,41 @@ impl SqliteSessionStore {
             .map_err(storage_error)
     }
 
+    pub fn load_messages_for_turn(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        turn_id: bt_core::TurnId,
+    ) -> Result<Vec<Message>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT mp.content_json
+                 FROM message_projection mp
+                 JOIN events e ON e.event_id = mp.event_id
+                 WHERE mp.session_id = ?1
+                   AND mp.branch_id = ?2
+                   AND json_extract(e.event_json, '$.turn_id') = ?3
+                 ORDER BY e.seq_id ASC",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    session_id.to_string(),
+                    branch_id.to_string(),
+                    turn_id.to_string(),
+                ],
+                |row| {
+                    let raw: String = row.get(0)?;
+                    serde_json::from_str(&raw).map_err(to_sql_conversion)
+                },
+            )
+            .map_err(storage_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_error)
+    }
+
     pub(super) fn load_context_messages_for_exact_branch(
         &self,
         session_id: SessionId,

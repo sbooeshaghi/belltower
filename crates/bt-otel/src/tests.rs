@@ -488,6 +488,43 @@ fn mirrored_fields_capture_related_session_delivery_and_resolution() {
     let resolution_summary = resolved_fields.finish_reason.expect("resolution summary");
     assert!(resolution_summary.contains(&message_id.to_string()));
     assert!(resolution_summary.contains(&resulting_turn_id.to_string()));
+
+    let reply_message_id = RelatedSessionMessageId::new();
+    let settled = EventEnvelope::new(
+        child_session_id,
+        child_branch_id,
+        SpanKind::Chain,
+        EventPayload::RelatedSessionMessageSettled {
+            message_id,
+            reply_message_id,
+            reply_kind: RelatedSessionMessageKind::Result,
+            settling_turn_id: resulting_turn_id,
+        },
+    )
+    .with_turn_id(resulting_turn_id);
+    let settled_fields = mirrored_event_fields(&settled);
+    assert_eq!(settled_fields.event_kind, "session.related_message.settled");
+    assert_eq!(settled_fields.status.as_deref(), Some("Settled"));
+    assert_eq!(
+        settled_fields.related_message_id.as_deref(),
+        Some(message_id.to_string().as_str())
+    );
+    assert_eq!(
+        settled_fields.related_message_kind.as_deref(),
+        Some("Result")
+    );
+    assert_eq!(
+        settled_fields.related_message_status.as_deref(),
+        Some("Settled")
+    );
+    assert_eq!(
+        settled_fields.related_message_resulting_turn_id.as_deref(),
+        Some(resulting_turn_id.to_string().as_str())
+    );
+    let settlement_summary = settled_fields.finish_reason.expect("settlement summary");
+    assert!(settlement_summary.contains(&message_id.to_string()));
+    assert!(settlement_summary.contains(&reply_message_id.to_string()));
+    assert!(settlement_summary.contains(&resulting_turn_id.to_string()));
 }
 
 #[test]

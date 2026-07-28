@@ -3,10 +3,11 @@ use bt_core::{
     ApprovalScope, BelltowerError, BranchHead, BranchId, BranchRecord, BudgetConfig, ConnectionId,
     EventEnvelope, EventPayload, MAX_RELATED_SESSION_DEPTH, MAX_RELATED_SESSION_DESCENDANTS,
     Message, RelatedSessionDeliveryMode, RelatedSessionMessage, RelatedSessionMessageDirection,
-    RelatedSessionMessageId, RelatedSessionMessageReceipt, RelatedSessionMessageRecord,
-    RelatedSessionMessageStatus, Result, Role, SessionId, SessionRecord, SessionSettingsSnapshot,
-    SessionToolMode, SpanKind, ToolCallId, ToolOperationContext, TurnId, TurnInspection,
-    TurnStartSource,
+    RelatedSessionMessageId, RelatedSessionMessageKind, RelatedSessionMessageReceipt,
+    RelatedSessionMessageRecord, RelatedSessionMessageSettlement, RelatedSessionMessageStatus,
+    RelatedSessionSettlementReceipt, Result, Role, SessionId, SessionRecord,
+    SessionSettingsSnapshot, SessionToolMode, SpanKind, ToolCallId, ToolOperationContext, TurnId,
+    TurnInspection, TurnStartSource,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::{HashMap, HashSet};
@@ -38,6 +39,46 @@ fn parse_related_message_record(
     let counterpart_event_id: String = row.get(4)?;
     let resulting_turn_id: Option<String> = row.get(6)?;
     let resolved_at: Option<String> = row.get(7)?;
+    let settlement_event_id: Option<String> = row.get(8)?;
+    let settlement_reply_message_id: Option<String> = row.get(9)?;
+    let settlement_reply_kind: Option<String> = row.get(10)?;
+    let settling_turn_id: Option<String> = row.get(11)?;
+    let settlement_seq_id: Option<i64> = row.get(12)?;
+    let settled_at: Option<String> = row.get(13)?;
+    let settlement = match (
+        settlement_event_id,
+        settlement_reply_message_id,
+        settlement_reply_kind,
+        settling_turn_id,
+        settlement_seq_id,
+        settled_at,
+    ) {
+        (
+            Some(event_id),
+            Some(reply_message_id),
+            Some(reply_kind),
+            Some(turn_id),
+            Some(seq_id),
+            Some(settled_at),
+        ) => Some(RelatedSessionMessageSettlement {
+            obligation_message_id: serde_json::from_str::<RelatedSessionMessage>(&message_json)
+                .map_err(to_sql_conversion)?
+                .message_id,
+            reply_message_id: reply_message_id.parse().map_err(to_sql_conversion)?,
+            reply_kind: serde_json::from_str(&reply_kind).map_err(to_sql_conversion)?,
+            settling_turn_id: turn_id.parse().map_err(to_sql_conversion)?,
+            settlement_event_id: event_id.parse().map_err(to_sql_conversion)?,
+            settlement_seq_id: seq_id,
+            settled_at: parse_time(settled_at)?,
+        }),
+        (None, None, None, None, None, None) => None,
+        _ => {
+            return Err(to_sql_conversion(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "related-session settlement projection is incomplete",
+            )));
+        }
+    };
     Ok(RelatedSessionMessageRecord {
         message: serde_json::from_str(&message_json).map_err(to_sql_conversion)?,
         direction: match direction.as_str() {
@@ -58,6 +99,7 @@ fn parse_related_message_record(
             .map(|turn_id| turn_id.parse().map_err(to_sql_conversion))
             .transpose()?,
         resolved_at: resolved_at.map(parse_time).transpose()?,
+        settlement,
     })
 }
 
@@ -328,6 +370,149 @@ impl SqliteSessionStore {
         })
     }
 
+    pub fn settle_related_session_message(
+        &mut self,
+        obligation_message_id: RelatedSessionMessageId,
+        reply_sent: &EventEnvelope,
+        reply_received: &EventEnvelope,
+        settlement_event: &EventEnvelope,
+    ) -> Result<RelatedSessionSettlementReceipt> {
+        let reply = Self::validate_related_session_message_envelopes(reply_sent, reply_received)?;
+        let EventPayload::RelatedSessionMessageSettled {
+            message_id,
+            reply_message_id,
+            reply_kind,
+            settling_turn_id,
+        } = &settlement_event.payload
+        else {
+            return Err(BelltowerError::InvalidState(
+                "related-session settlement requires a settlement event".to_owned(),
+            ));
+        };
+        if *message_id != obligation_message_id
+            || *reply_message_id != reply.message_id
+            || *reply_kind != reply.kind
+            || settlement_event.session_id != reply.source_session_id
+            || settlement_event.branch_id != reply.source_branch_id
+            || settlement_event.turn_id != Some(*settling_turn_id)
+            || reply.caused_by_turn_id != Some(*settling_turn_id)
+            || reply.in_reply_to != Some(obligation_message_id)
+            || !matches!(
+                reply.kind,
+                RelatedSessionMessageKind::Result | RelatedSessionMessageKind::Error
+            )
+        {
+            return Err(BelltowerError::InvalidState(
+                "related-session settlement events do not describe one terminal reply".to_owned(),
+            ));
+        }
+
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let obligation = tx
+            .query_row(
+                "SELECT message_json, direction, status, event_id, counterpart_event_id,
+                        source_seq, resulting_turn_id, resolved_at, settlement_event_id,
+                        settlement_reply_message_id, settlement_reply_kind, settling_turn_id,
+                        settlement_seq, settled_at
+                 FROM related_session_message_projection
+                 WHERE session_id = ?1 AND message_id = ?2 AND direction = 'received'",
+                params![
+                    settlement_event.session_id.to_string(),
+                    obligation_message_id.to_string(),
+                ],
+                parse_related_message_record,
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| {
+                BelltowerError::InvalidState(format!(
+                    "related-session obligation {obligation_message_id} was not received by session {}",
+                    settlement_event.session_id
+                ))
+            })?;
+
+        if let Some(existing) = obligation.settlement {
+            let reply_receipt = Self::load_related_message_receipt_in_tx(
+                &tx,
+                obligation.message.destination_session_id,
+                obligation.message.source_session_id,
+                existing.reply_message_id,
+                None,
+            )?
+            .ok_or_else(|| {
+                BelltowerError::InvalidState(format!(
+                    "settlement for {obligation_message_id} references missing reply {}",
+                    existing.reply_message_id
+                ))
+            })?;
+            tx.commit().map_err(storage_error)?;
+            return Ok(RelatedSessionSettlementReceipt {
+                settlement: existing,
+                reply: reply_receipt,
+                newly_committed: false,
+            });
+        }
+
+        if obligation.status != RelatedSessionMessageStatus::Claimed
+            || obligation.resulting_turn_id.is_none()
+            || !matches!(
+                obligation.message.kind,
+                RelatedSessionMessageKind::Instruction | RelatedSessionMessageKind::Question
+            )
+            || reply.source_session_id != obligation.message.destination_session_id
+            || reply.source_branch_id != obligation.message.destination_branch_id
+            || reply.destination_session_id != obligation.message.source_session_id
+            || reply.destination_branch_id != obligation.message.source_branch_id
+        {
+            return Err(BelltowerError::InvalidState(format!(
+                "related-session message {obligation_message_id} is not a claimed reply obligation"
+            )));
+        }
+
+        Self::ensure_related_session_message_constraints_in_tx(&tx, reply)?;
+        let seq_ids = Self::append_events_in_tx(
+            &tx,
+            &[
+                reply_sent.clone(),
+                reply_received.clone(),
+                settlement_event.clone(),
+            ],
+        )?;
+        let [sent_seq_id, received_seq_id, settlement_seq_id] = seq_ids.as_slice() else {
+            unreachable!("three settlement events always produce three sequence ids");
+        };
+        let settlement = RelatedSessionMessageSettlement {
+            obligation_message_id,
+            reply_message_id: reply.message_id,
+            reply_kind: reply.kind,
+            settling_turn_id: *settling_turn_id,
+            settlement_event_id: settlement_event.event_id,
+            settlement_seq_id: *settlement_seq_id,
+            settled_at: settlement_event.occurred_at,
+        };
+        let reply_receipt = RelatedSessionMessageReceipt {
+            message_id: reply.message_id,
+            sent_event_id: reply_sent.event_id,
+            sent_seq_id: *sent_seq_id,
+            received_event_id: reply_received.event_id,
+            received_seq_id: *received_seq_id,
+            status: if reply.delivery_mode == RelatedSessionDeliveryMode::Wake {
+                RelatedSessionMessageStatus::Pending
+            } else {
+                RelatedSessionMessageStatus::Delivered
+            },
+        };
+        tx.commit().map_err(storage_error)?;
+        Ok(RelatedSessionSettlementReceipt {
+            settlement,
+            reply: reply_receipt,
+            newly_committed: true,
+        })
+    }
+
     fn validate_related_session_message_envelopes<'a>(
         sent: &'a EventEnvelope,
         received: &EventEnvelope,
@@ -407,10 +592,13 @@ impl SqliteSessionStore {
             message.destination_branch_id,
         )?;
         if let Some(turn_id) = message.caused_by_turn_id {
-            let owns_active_turn: i64 = tx
+            let owns_causal_turn: i64 = tx
                 .query_row(
                     "SELECT EXISTS(
                         SELECT 1 FROM active_turn_projection
+                        WHERE session_id = ?1 AND branch_id = ?2 AND turn_id = ?3
+                        UNION ALL
+                        SELECT 1 FROM turn_projection
                         WHERE session_id = ?1 AND branch_id = ?2 AND turn_id = ?3
                     )",
                     params![
@@ -421,10 +609,9 @@ impl SqliteSessionStore {
                     |row| row.get(0),
                 )
                 .map_err(storage_error)?;
-            if owns_active_turn == 0 {
+            if owns_causal_turn == 0 {
                 return Err(BelltowerError::Protocol(
-                    "related-session message causal turn is not the sender's active turn"
-                        .to_owned(),
+                    "related-session message causal turn does not belong to the sender".to_owned(),
                 ));
             }
         }
@@ -1956,7 +2143,9 @@ impl SqliteSessionStore {
             .connection
             .prepare(
                 "SELECT message_json, direction, status, event_id, counterpart_event_id,
-                        source_seq, resulting_turn_id, resolved_at
+                        source_seq, resulting_turn_id, resolved_at, settlement_event_id,
+                        settlement_reply_message_id, settlement_reply_kind, settling_turn_id,
+                        settlement_seq, settled_at
                  FROM related_session_message_projection
                  WHERE session_id = ?1 ORDER BY source_seq ASC",
             )
@@ -1979,7 +2168,9 @@ impl SqliteSessionStore {
             .connection
             .prepare(
                 "SELECT message_json, direction, status, event_id, counterpart_event_id,
-                        source_seq, resulting_turn_id, resolved_at
+                        source_seq, resulting_turn_id, resolved_at, settlement_event_id,
+                        settlement_reply_message_id, settlement_reply_kind, settling_turn_id,
+                        settlement_seq, settled_at
                  FROM related_session_message_projection
                  WHERE session_id = ?1 AND direction = 'received' AND status = 'pending'
                  ORDER BY source_seq ASC",
@@ -2002,9 +2193,35 @@ impl SqliteSessionStore {
             .connection
             .prepare(
                 "SELECT message_json, direction, status, event_id, counterpart_event_id,
-                        source_seq, resulting_turn_id, resolved_at
+                        source_seq, resulting_turn_id, resolved_at, settlement_event_id,
+                        settlement_reply_message_id, settlement_reply_kind, settling_turn_id,
+                        settlement_seq, settled_at
                  FROM related_session_message_projection
                  WHERE direction = 'received' AND status = 'pending'
+                 ORDER BY source_seq ASC",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], parse_related_message_record)
+            .map_err(storage_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_error)
+    }
+
+    pub fn load_all_unsettled_related_session_obligations(
+        &self,
+    ) -> Result<Vec<RelatedMessageProjection>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT message_json, direction, status, event_id, counterpart_event_id,
+                        source_seq, resulting_turn_id, resolved_at, settlement_event_id,
+                        settlement_reply_message_id, settlement_reply_kind, settling_turn_id,
+                        settlement_seq, settled_at
+                 FROM related_session_message_projection
+                 WHERE direction = 'received'
+                   AND status = 'claimed'
+                   AND settlement_event_id IS NULL
                  ORDER BY source_seq ASC",
             )
             .map_err(storage_error)?;

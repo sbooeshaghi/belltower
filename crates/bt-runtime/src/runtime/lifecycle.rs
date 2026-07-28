@@ -1,6 +1,7 @@
 // lifecycle.rs keeps one bounded runtime concern out of `runtime.rs`; cross-crate ownership remains unchanged.
 use super::support::*;
 use super::*;
+use crate::TurnRunStopReason;
 
 impl BelltowerRuntime {
     pub fn open(
@@ -88,72 +89,74 @@ impl BelltowerRuntime {
             )?;
         }
 
-        self.repair_interrupted_related_session_notifications()?;
+        self.repair_related_session_reply_settlements()?;
 
         Ok(())
     }
 
-    fn repair_interrupted_related_session_notifications(&self) -> Result<()> {
-        let sessions = self
-            .store
-            .lock()
-            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?
-            .list_sessions()?;
-        for session in sessions
+    fn repair_related_session_reply_settlements(&self) -> Result<()> {
+        for obligation in self
+            .all_unsettled_related_session_obligations()?
             .into_iter()
-            .filter(|session| session.parent_session_id.is_some())
+            .filter(|record| {
+                matches!(
+                    record.message.kind,
+                    RelatedSessionMessageKind::Instruction | RelatedSessionMessageKind::Question
+                )
+            })
         {
-            let messages = self.related_session_messages(session.session_id)?;
-            let claimed_records = messages
+            let original_turn_id = obligation.resulting_turn_id.ok_or_else(|| {
+                bt_core::BelltowerError::InvalidState(format!(
+                    "claimed related-session obligation {} has no resulting turn",
+                    obligation.message.message_id
+                ))
+            })?;
+            let turns = self.turn_history(obligation.message.destination_session_id)?;
+            let original_index = turns
                 .iter()
-                .filter(|record| {
-                    record.direction == RelatedSessionMessageDirection::Received
-                        && record.status == RelatedSessionMessageStatus::Claimed
-                        && record.resulting_turn_id.is_some()
-                })
-                .collect::<Vec<_>>();
-            if claimed_records.is_empty() {
-                continue;
-            }
-            // Only turn boundaries matter here; replaying whole child logs at
-            // every startup made launch time scale with total history.
-            let events = self.events_of_kind(session.session_id, "turn.finished", None)?;
-            for record in claimed_records {
-                let turn_id = record.resulting_turn_id.expect("filtered above");
-                let interrupted = events.iter().any(|event| {
-                    matches!(
-                        &event.payload,
-                        EventPayload::TurnFinished {
-                            turn_id: event_turn_id,
-                            status,
-                            finish_reason: Some(finish_reason),
-                            ..
-                        } if *event_turn_id == turn_id
-                            && status == "failed"
-                            && matches!(
-                                finish_reason.as_str(),
-                                "interrupted_after_restart" | "interrupted_after_resume"
-                            )
-                    )
-                });
-                let already_notified = messages.iter().any(|candidate| {
-                    candidate.direction == RelatedSessionMessageDirection::Sent
-                        && candidate.message.kind == RelatedSessionMessageKind::Error
-                        && candidate.message.in_reply_to == Some(record.message.message_id)
-                });
-                if interrupted && !already_notified {
-                    self.send_related_session_message(
-                        session.session_id,
-                        record.message.destination_branch_id,
-                        None,
-                        record.message.source_session_id,
-                        record.message.source_branch_id,
-                        RelatedSessionMessageKind::Error,
-                        RelatedSessionDeliveryMode::Notify,
-                        Some(record.message.message_id),
-                        "Subagent turn was interrupted by runtime restart. Its outcome is unknown and it was not retried automatically because side effects may have occurred."
-                            .to_owned(),
-                        Vec::new(),
+                .position(|turn| turn.turn_id == original_turn_id)
+                .ok_or_else(|| {
+                    bt_core::BelltowerError::InvalidState(format!(
+                        "claimed related-session obligation {} references missing turn {original_turn_id}",
+                        obligation.message.message_id
+                    ))
+                })?;
+
+            // A claimed obligation blocks unrelated admission on its branch.
+            // Any later projected turn on that branch is therefore a queued or
+            // approval/input continuation of the claimed work.
+            let terminal = turns[original_index..]
+                .iter()
+                .filter(|turn| turn.branch_id == obligation.message.destination_branch_id)
+                .next_back()
+                .expect("the original turn is on the obligation branch");
+            match terminal.status.as_deref() {
+                None | Some("awaiting_approval" | "awaiting_input") => {}
+                Some("completed") => {
+                    self.record_related_turn_outcome(
+                        obligation.message.destination_session_id,
+                        terminal.branch_id,
+                        terminal.turn_id,
+                        TurnRunStopReason::Complete,
+                    )?;
+                }
+                Some("cancelled") => {
+                    self.record_related_turn_outcome(
+                        obligation.message.destination_session_id,
+                        terminal.branch_id,
+                        terminal.turn_id,
+                        TurnRunStopReason::Cancelled,
+                    )?;
+                }
+                Some(status) => {
+                    let reason = terminal.finish_reason.as_deref().unwrap_or("unknown");
+                    self.record_related_turn_failure(
+                        obligation.message.destination_session_id,
+                        terminal.branch_id,
+                        terminal.turn_id,
+                        &bt_core::BelltowerError::Runtime(format!(
+                            "turn recovered with terminal status `{status}` ({reason}); it was not retried because side effects may have occurred"
+                        )),
                     )?;
                 }
             }

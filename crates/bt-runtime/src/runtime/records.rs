@@ -1188,18 +1188,41 @@ impl BelltowerRuntime {
             .store_append_fault
             .lock()
             .expect("store append fault lock") =
-            Some(bt_core::BelltowerError::Storage(message.into()));
+            Some((0, bt_core::BelltowerError::Storage(message.into())));
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Injects a one-shot storage failure after `successful_writes` guarded
+    /// runtime commits. This pins ordering across multi-commit transitions.
+    pub fn inject_store_append_error_after_successes_for_test(
+        &self,
+        successful_writes: usize,
+        message: impl Into<String>,
+    ) {
+        *self
+            .store_append_fault
+            .lock()
+            .expect("store append fault lock") = Some((
+            successful_writes,
+            bt_core::BelltowerError::Storage(message.into()),
+        ));
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn take_store_append_fault_for_test(&self) -> Result<()> {
-        match self
+        let mut fault = self
             .store_append_fault
             .lock()
-            .map_err(|_| bt_core::BelltowerError::InvalidState("fault lock poisoned".to_owned()))?
-            .take()
-        {
-            Some(error) => Err(error),
+            .map_err(|_| bt_core::BelltowerError::InvalidState("fault lock poisoned".to_owned()))?;
+        match fault.as_mut() {
+            Some((remaining, _)) if *remaining > 0 => {
+                *remaining -= 1;
+                Ok(())
+            }
+            Some(_) => {
+                let (_, error) = fault.take().expect("fault exists");
+                Err(error)
+            }
             None => Ok(()),
         }
     }

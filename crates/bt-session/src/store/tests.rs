@@ -215,6 +215,60 @@ fn related_message_events(
     (sent, received)
 }
 
+fn related_reply_events(
+    source: &SessionRecord,
+    source_branch: &BranchRecord,
+    destination: &SessionRecord,
+    destination_branch: &BranchRecord,
+    turn_id: TurnId,
+    in_reply_to: RelatedSessionMessageId,
+    kind: RelatedSessionMessageKind,
+    text: &str,
+) -> (RelatedSessionMessageId, EventEnvelope, EventEnvelope) {
+    let message_id = RelatedSessionMessageId::new();
+    let message = RelatedSessionMessage {
+        message_id,
+        context_message_id: bt_core::MessageId::new(),
+        source_session_id: source.session_id,
+        source_branch_id: source_branch.branch_id,
+        caused_by_turn_id: Some(turn_id),
+        destination_session_id: destination.session_id,
+        destination_branch_id: destination_branch.branch_id,
+        kind,
+        delivery_mode: RelatedSessionDeliveryMode::Wake,
+        in_reply_to: Some(in_reply_to),
+        text: text.to_owned(),
+        artifact_refs: Vec::new(),
+        created_at: OffsetDateTime::now_utc(),
+    };
+    let sent_event_id = EventId::new();
+    let received_event_id = EventId::new();
+    let mut sent = EventEnvelope::new(
+        source.session_id,
+        source_branch.branch_id,
+        SpanKind::Chain,
+        EventPayload::RelatedSessionMessageRecorded {
+            direction: RelatedSessionMessageDirection::Sent,
+            counterpart_event_id: received_event_id,
+            message: message.clone(),
+        },
+    )
+    .with_turn_id(turn_id);
+    sent.event_id = sent_event_id;
+    let mut received = EventEnvelope::new(
+        destination.session_id,
+        destination_branch.branch_id,
+        SpanKind::Chain,
+        EventPayload::RelatedSessionMessageRecorded {
+            direction: RelatedSessionMessageDirection::Received,
+            counterpart_event_id: sent_event_id,
+            message,
+        },
+    );
+    received.event_id = received_event_id;
+    (message_id, sent, received)
+}
+
 fn child_spawn_events(
     parent: &SessionRecord,
     parent_branch: &BranchRecord,
@@ -490,6 +544,215 @@ fn related_session_delivery_is_atomic_idempotent_and_lineage_scoped() {
     assert_eq!(
         sibling_receipt.status,
         RelatedSessionMessageStatus::Delivered
+    );
+}
+
+#[test]
+fn related_session_terminal_reply_settlement_is_atomic_and_idempotent() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (parent, parent_branch) = sample_session();
+    let (child, child_branch) = child_session(&parent, &parent_branch);
+    for (session, branch) in [(&parent, &parent_branch), (&child, &child_branch)] {
+        store
+            .create_session(session, branch)
+            .expect("create session");
+    }
+
+    let obligation_message_id = RelatedSessionMessageId::new();
+    let (obligation_sent, obligation_received) = related_message_events(
+        &parent,
+        &parent_branch,
+        &child,
+        &child_branch,
+        obligation_message_id,
+        "prove or disprove the claim",
+        RelatedSessionDeliveryMode::Wake,
+    );
+    store
+        .commit_related_session_message(&obligation_sent, &obligation_received)
+        .expect("commit obligation");
+
+    let turn_id = TurnId::new();
+    let claim_events = vec![
+        EventEnvelope::new(
+            child.session_id,
+            child_branch.branch_id,
+            SpanKind::Chain,
+            EventPayload::RelatedSessionMessageResolved {
+                message_id: obligation_message_id,
+                status: RelatedSessionMessageStatus::Claimed,
+                resulting_turn_id: Some(turn_id),
+                reason: None,
+            },
+        ),
+        turn_started_event_with_source(
+            &child,
+            &child_branch,
+            turn_id,
+            TurnStartSource::RelatedSessionMessage,
+        ),
+    ];
+    assert!(matches!(
+        store
+            .claim_related_message_continuation(
+                child.session_id,
+                obligation_message_id,
+                child.settings_revision_id,
+                &claim_events,
+            )
+            .expect("claim obligation"),
+        ContinuationClaim::Claimed { .. }
+    ));
+
+    let (reply_message_id, reply_sent, reply_received) = related_reply_events(
+        &child,
+        &child_branch,
+        &parent,
+        &parent_branch,
+        turn_id,
+        obligation_message_id,
+        RelatedSessionMessageKind::Result,
+        "the claim holds",
+    );
+    let settlement_event = EventEnvelope::new(
+        child.session_id,
+        child_branch.branch_id,
+        SpanKind::Chain,
+        EventPayload::RelatedSessionMessageSettled {
+            message_id: obligation_message_id,
+            reply_message_id,
+            reply_kind: RelatedSessionMessageKind::Result,
+            settling_turn_id: turn_id,
+        },
+    )
+    .with_turn_id(turn_id);
+    let before_child_events = store
+        .load_all_events(child.session_id)
+        .expect("child events before settlement")
+        .len();
+    let before_parent_events = store
+        .load_all_events(parent.session_id)
+        .expect("parent events before settlement")
+        .len();
+
+    let receipt = store
+        .settle_related_session_message(
+            obligation_message_id,
+            &reply_sent,
+            &reply_received,
+            &settlement_event,
+        )
+        .expect("settle obligation");
+    assert!(receipt.newly_committed);
+    assert_eq!(receipt.settlement.reply_message_id, reply_message_id);
+    assert_eq!(
+        store
+            .load_all_events(child.session_id)
+            .expect("child events after settlement")
+            .len(),
+        before_child_events + 2
+    );
+    assert_eq!(
+        store
+            .load_all_events(parent.session_id)
+            .expect("parent events after settlement")
+            .len(),
+        before_parent_events + 1
+    );
+
+    let child_obligation = store
+        .load_related_session_messages(child.session_id)
+        .expect("child mailbox")
+        .into_iter()
+        .find(|record| record.message.message_id == obligation_message_id)
+        .expect("child obligation");
+    assert_eq!(
+        child_obligation
+            .settlement
+            .as_ref()
+            .map(|settlement| settlement.reply_message_id),
+        Some(reply_message_id)
+    );
+    let parent_obligation = store
+        .load_related_session_messages(parent.session_id)
+        .expect("parent mailbox")
+        .into_iter()
+        .find(|record| record.message.message_id == obligation_message_id)
+        .expect("parent obligation");
+    assert!(parent_obligation.settlement.is_none());
+
+    let retried = store
+        .settle_related_session_message(
+            obligation_message_id,
+            &reply_sent,
+            &reply_received,
+            &settlement_event,
+        )
+        .expect("retry settlement");
+    assert!(!retried.newly_committed);
+    assert_eq!(retried.settlement, receipt.settlement);
+    assert_eq!(
+        store
+            .load_all_events(child.session_id)
+            .expect("child events after retry")
+            .len(),
+        before_child_events + 2
+    );
+    assert_eq!(
+        store
+            .load_all_events(parent.session_id)
+            .expect("parent events after retry")
+            .len(),
+        before_parent_events + 1
+    );
+
+    let (conflicting_reply_message_id, conflicting_reply_sent, conflicting_reply_received) =
+        related_reply_events(
+            &child,
+            &child_branch,
+            &parent,
+            &parent_branch,
+            turn_id,
+            obligation_message_id,
+            RelatedSessionMessageKind::Error,
+            "a later terminal reply must not replace the winner",
+        );
+    let conflicting_settlement_event = EventEnvelope::new(
+        child.session_id,
+        child_branch.branch_id,
+        SpanKind::Chain,
+        EventPayload::RelatedSessionMessageSettled {
+            message_id: obligation_message_id,
+            reply_message_id: conflicting_reply_message_id,
+            reply_kind: RelatedSessionMessageKind::Error,
+            settling_turn_id: turn_id,
+        },
+    )
+    .with_turn_id(turn_id);
+    let conflicting = store
+        .settle_related_session_message(
+            obligation_message_id,
+            &conflicting_reply_sent,
+            &conflicting_reply_received,
+            &conflicting_settlement_event,
+        )
+        .expect("first terminal settlement remains canonical");
+    assert!(!conflicting.newly_committed);
+    assert_eq!(conflicting.settlement, receipt.settlement);
+    assert_eq!(conflicting.reply.message_id, reply_message_id);
+    assert_eq!(
+        store
+            .load_all_events(child.session_id)
+            .expect("child events after conflicting settlement")
+            .len(),
+        before_child_events + 2
+    );
+    assert_eq!(
+        store
+            .load_all_events(parent.session_id)
+            .expect("parent events after conflicting settlement")
+            .len(),
+        before_parent_events + 1
     );
 }
 
@@ -4188,6 +4451,31 @@ fn portable_session_bundles_round_trip_related_session_mailboxes() {
             .expect("claim related message"),
         ContinuationClaim::Claimed { .. }
     ));
+    let (reply_message_id, reply_sent, reply_received) = related_reply_events(
+        &child,
+        &child_branch,
+        &parent,
+        &parent_branch,
+        turn_id,
+        message_id,
+        RelatedSessionMessageKind::Result,
+        "alternate model completed",
+    );
+    let settlement_event = EventEnvelope::new(
+        child.session_id,
+        child_branch.branch_id,
+        SpanKind::Chain,
+        EventPayload::RelatedSessionMessageSettled {
+            message_id,
+            reply_message_id,
+            reply_kind: RelatedSessionMessageKind::Result,
+            settling_turn_id: turn_id,
+        },
+    )
+    .with_turn_id(turn_id);
+    source
+        .settle_related_session_message(message_id, &reply_sent, &reply_received, &settlement_event)
+        .expect("settle related message before export");
 
     let parent_bundle = tempdir().expect("parent bundle");
     let child_bundle = tempdir().expect("child bundle");
@@ -4198,11 +4486,14 @@ fn portable_session_bundles_round_trip_related_session_mailboxes() {
         .export_session_bundle_directory(child.session_id, child_bundle.path())
         .expect("export child bundle");
 
-    for bundle in [&parent_bundle, &child_bundle] {
-        let events = fs::read_to_string(bundle.path().join(SESSION_BT_EVENTS))
-            .expect("related-session events");
-        assert!(events.contains("session.related_message.recorded"));
-    }
+    let parent_events =
+        fs::read_to_string(parent_bundle.path().join(SESSION_BT_EVENTS)).expect("parent events");
+    let child_events =
+        fs::read_to_string(child_bundle.path().join(SESSION_BT_EVENTS)).expect("child events");
+    assert!(parent_events.contains("session.related_message.recorded"));
+    assert!(!parent_events.contains("session.related_message.settled"));
+    assert!(child_events.contains("session.related_message.recorded"));
+    assert!(child_events.contains("session.related_message.settled"));
 
     let mut imported = SqliteSessionStore::open_in_memory().expect("import store");
     imported
@@ -4218,28 +4509,52 @@ fn portable_session_bundles_round_trip_related_session_mailboxes() {
     let child_messages = imported
         .load_related_session_messages(child.session_id)
         .expect("child mailbox");
-    assert_eq!(parent_messages.len(), 1);
-    assert_eq!(child_messages.len(), 1);
-    assert_eq!(parent_messages[0].message.message_id, message_id);
-    assert_eq!(child_messages[0].message.message_id, message_id);
+    assert_eq!(parent_messages.len(), 2);
+    assert_eq!(child_messages.len(), 2);
+    let parent_obligation = parent_messages
+        .iter()
+        .find(|record| record.message.message_id == message_id)
+        .expect("parent obligation");
+    let child_obligation = child_messages
+        .iter()
+        .find(|record| record.message.message_id == message_id)
+        .expect("child obligation");
     assert_eq!(
-        parent_messages[0].direction,
+        parent_obligation.direction,
         RelatedSessionMessageDirection::Sent
     );
     assert_eq!(
-        child_messages[0].direction,
+        child_obligation.direction,
         RelatedSessionMessageDirection::Received
     );
     assert_eq!(
-        parent_messages[0].status,
+        parent_obligation.status,
         RelatedSessionMessageStatus::Claimed
     );
     assert_eq!(
-        child_messages[0].status,
+        child_obligation.status,
         RelatedSessionMessageStatus::Claimed
     );
-    assert_eq!(parent_messages[0].resulting_turn_id, Some(turn_id));
-    assert_eq!(child_messages[0].resulting_turn_id, Some(turn_id));
+    assert_eq!(parent_obligation.resulting_turn_id, Some(turn_id));
+    assert_eq!(child_obligation.resulting_turn_id, Some(turn_id));
+    assert!(parent_obligation.settlement.is_none());
+    let settlement = child_obligation
+        .settlement
+        .as_ref()
+        .expect("portable settlement projection");
+    assert_eq!(settlement.reply_message_id, reply_message_id);
+    assert_eq!(settlement.reply_kind, RelatedSessionMessageKind::Result);
+    assert_eq!(settlement.settling_turn_id, turn_id);
+    assert!(parent_messages.iter().any(|record| {
+        record.direction == RelatedSessionMessageDirection::Received
+            && record.message.message_id == reply_message_id
+            && record.message.in_reply_to == Some(message_id)
+    }));
+    assert!(child_messages.iter().any(|record| {
+        record.direction == RelatedSessionMessageDirection::Sent
+            && record.message.message_id == reply_message_id
+            && record.message.in_reply_to == Some(message_id)
+    }));
 }
 
 #[test]

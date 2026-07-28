@@ -288,6 +288,12 @@ pub enum PortableEventPayload {
         resulting_turn_id: Option<TurnId>,
         reason: Option<String>,
     },
+    RelatedSessionMessageSettled {
+        message_id: RelatedSessionMessageId,
+        reply_message_id: RelatedSessionMessageId,
+        reply_kind: bt_core::RelatedSessionMessageKind,
+        settling_turn_id: TurnId,
+    },
     SessionSettingsUpdated {
         #[serde(default = "default_settings_revision_id")]
         settings_revision_id: u64,
@@ -1932,6 +1938,7 @@ impl PortableEventPayload {
             | EventPayload::SessionResultRejected { .. }
             | EventPayload::RelatedSessionMessageRecorded { .. }
             | EventPayload::RelatedSessionMessageResolved { .. }
+            | EventPayload::RelatedSessionMessageSettled { .. }
             | EventPayload::SessionSettingsUpdated { .. }
             | EventPayload::SessionEnded { .. }
             | EventPayload::BranchCreated { .. }
@@ -2066,6 +2073,7 @@ impl PortableEventPayload {
             | Self::SessionResultRejected { .. }
             | Self::RelatedSessionMessageRecorded { .. }
             | Self::RelatedSessionMessageResolved { .. }
+            | Self::RelatedSessionMessageSettled { .. }
             | Self::SessionSettingsUpdated { .. }
             | Self::SessionEnded { .. }
             | Self::BranchCreated { .. }
@@ -2108,6 +2116,7 @@ impl PortableEventPayload {
             Self::SessionResultRejected { .. } => "session.result.rejected",
             Self::RelatedSessionMessageRecorded { .. } => "session.related_message.recorded",
             Self::RelatedSessionMessageResolved { .. } => "session.related_message.resolved",
+            Self::RelatedSessionMessageSettled { .. } => "session.related_message.settled",
             Self::SessionSettingsUpdated { .. } => "session.settings.updated",
             Self::SessionEnded { .. } => "session.ended",
             Self::BranchCreated { .. } => "branch.created",

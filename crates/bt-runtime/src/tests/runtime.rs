@@ -4225,6 +4225,413 @@ fn related_session_wake_uses_child_settings_and_enters_model_context() {
 }
 
 #[test]
+fn related_session_reply_settlement_tracks_progress_and_terminal_outcome_once() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (parent, parent_branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("coordinator".to_owned()),
+            None,
+        )
+        .expect("parent session");
+    let (child, child_branch) = runtime
+        .spawn_child_session(
+            parent.session_id,
+            parent_branch.branch_id,
+            None,
+            "produce one durable answer".to_owned(),
+            Some("worker".to_owned()),
+            None,
+            None,
+        )
+        .expect("child session");
+    let other_branch = runtime
+        .create_branch(child.session_id, child_branch.branch_id, None, false, None)
+        .expect("unrelated child branch");
+    let objective = runtime
+        .send_related_session_message(
+            parent.session_id,
+            parent_branch.branch_id,
+            None,
+            child.session_id,
+            child_branch.branch_id,
+            RelatedSessionMessageKind::Instruction,
+            RelatedSessionDeliveryMode::Wake,
+            None,
+            "Return the exact result.".to_owned(),
+            Vec::new(),
+        )
+        .expect("send objective");
+    let admitted = runtime
+        .claim_next_related_session_message(child.session_id)
+        .expect("claim objective")
+        .expect("child turn");
+
+    assert_eq!(
+        runtime
+            .record_related_turn_outcome(
+                child.session_id,
+                child_branch.branch_id,
+                admitted.turn_id(),
+                crate::TurnRunStopReason::AwaitingInput,
+            )
+            .expect("record progress"),
+        1
+    );
+    assert!(
+        runtime
+            .related_session_messages(child.session_id)
+            .expect("child mailbox")
+            .into_iter()
+            .find(|record| {
+                record.direction == RelatedSessionMessageDirection::Received
+                    && record.message.message_id == objective.message_id
+            })
+            .expect("claimed objective")
+            .settlement
+            .is_none()
+    );
+    assert_eq!(
+        runtime
+            .record_related_turn_outcome(
+                child.session_id,
+                other_branch.branch_id,
+                admitted.turn_id(),
+                crate::TurnRunStopReason::Complete,
+            )
+            .expect("ignore unrelated branch"),
+        0
+    );
+    runtime
+        .append_raw_message(
+            &child,
+            &child_branch,
+            Message::text(Role::Assistant, "The exact result is 42."),
+            Some(admitted.turn_id()),
+        )
+        .expect("record assistant answer");
+    assert_eq!(
+        runtime
+            .record_related_turn_outcome(
+                child.session_id,
+                child_branch.branch_id,
+                admitted.turn_id(),
+                crate::TurnRunStopReason::Complete,
+            )
+            .expect("record terminal result"),
+        1
+    );
+    assert_eq!(
+        runtime
+            .record_related_turn_outcome(
+                child.session_id,
+                child_branch.branch_id,
+                admitted.turn_id(),
+                crate::TurnRunStopReason::Complete,
+            )
+            .expect("retry terminal result"),
+        0
+    );
+
+    let settlement = runtime
+        .related_session_messages(child.session_id)
+        .expect("child mailbox")
+        .into_iter()
+        .find(|record| {
+            record.direction == RelatedSessionMessageDirection::Received
+                && record.message.message_id == objective.message_id
+        })
+        .expect("claimed objective")
+        .settlement
+        .expect("terminal settlement");
+    assert_eq!(settlement.settling_turn_id, admitted.turn_id());
+    assert_eq!(settlement.reply_kind, RelatedSessionMessageKind::Result);
+    let parent_results = runtime
+        .related_session_messages(parent.session_id)
+        .expect("parent mailbox")
+        .into_iter()
+        .filter(|record| {
+            record.direction == RelatedSessionMessageDirection::Received
+                && record.message.in_reply_to == Some(objective.message_id)
+                && record.message.kind == RelatedSessionMessageKind::Result
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(parent_results.len(), 1);
+    assert_eq!(parent_results[0].message.text, "The exact result is 42.");
+}
+
+#[test]
+fn related_session_reply_settlement_supports_sibling_sessions() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (root, root_branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("coordinator".to_owned()),
+            None,
+        )
+        .expect("root session");
+    let (sender, sender_branch) = runtime
+        .spawn_child_session(
+            root.session_id,
+            root_branch.branch_id,
+            None,
+            "send a peer question".to_owned(),
+            Some("sender".to_owned()),
+            None,
+            None,
+        )
+        .expect("sender session");
+    let (recipient, recipient_branch) = runtime
+        .spawn_child_session(
+            root.session_id,
+            root_branch.branch_id,
+            None,
+            "answer a peer question".to_owned(),
+            Some("recipient".to_owned()),
+            None,
+            None,
+        )
+        .expect("recipient session");
+    runtime
+        .append_message(
+            &recipient,
+            &recipient_branch,
+            Role::Assistant,
+            "Stale answer from an earlier turn.",
+        )
+        .expect("record prior assistant history");
+    let question = runtime
+        .send_related_session_message(
+            sender.session_id,
+            sender_branch.branch_id,
+            None,
+            recipient.session_id,
+            recipient_branch.branch_id,
+            RelatedSessionMessageKind::Question,
+            RelatedSessionDeliveryMode::Wake,
+            None,
+            "What did you observe?".to_owned(),
+            Vec::new(),
+        )
+        .expect("send sibling question");
+    let admitted = runtime
+        .claim_next_related_session_message(recipient.session_id)
+        .expect("claim sibling question")
+        .expect("recipient turn");
+    assert_eq!(
+        runtime
+            .record_related_turn_outcome(
+                recipient.session_id,
+                recipient_branch.branch_id,
+                admitted.turn_id(),
+                crate::TurnRunStopReason::Complete,
+            )
+            .expect("settle sibling question"),
+        1
+    );
+    assert!(
+        runtime
+            .related_session_messages(sender.session_id)
+            .expect("sender mailbox")
+            .into_iter()
+            .any(|record| {
+                record.direction == RelatedSessionMessageDirection::Received
+                    && record.message.in_reply_to == Some(question.message_id)
+                    && record.message.kind == RelatedSessionMessageKind::Result
+                    && record.message.text == "Related-session turn completed."
+            })
+    );
+}
+
+#[test]
+fn related_session_dispatch_failure_does_not_settle_before_terminal_commit() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (parent, parent_branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("coordinator".to_owned()),
+            None,
+        )
+        .expect("parent session");
+    let (child, child_branch) = runtime
+        .spawn_child_session(
+            parent.session_id,
+            parent_branch.branch_id,
+            None,
+            "fail before durable terminal state".to_owned(),
+            Some("worker".to_owned()),
+            None,
+            None,
+        )
+        .expect("child session");
+    let objective = runtime
+        .send_related_session_message(
+            parent.session_id,
+            parent_branch.branch_id,
+            None,
+            child.session_id,
+            child_branch.branch_id,
+            RelatedSessionMessageKind::Instruction,
+            RelatedSessionDeliveryMode::Wake,
+            None,
+            "Report the dispatch failure.".to_owned(),
+            Vec::new(),
+        )
+        .expect("send objective");
+    let admitted = runtime
+        .claim_next_related_session_message(child.session_id)
+        .expect("claim objective")
+        .expect("child turn");
+
+    runtime.inject_next_store_append_error_for_test("terminal write failed");
+    runtime
+        .fail_admitted_related_turn(
+            &admitted,
+            &bt_core::BelltowerError::Runtime("dispatch failed".to_owned()),
+        )
+        .expect_err("terminal failure must remain visible");
+
+    assert!(
+        !runtime
+            .all_events(child.session_id)
+            .expect("child events")
+            .iter()
+            .any(|event| matches!(
+                event.payload,
+                EventPayload::TurnFinished { turn_id, .. } if turn_id == admitted.turn_id()
+            ))
+    );
+    assert!(
+        runtime
+            .related_session_messages(child.session_id)
+            .expect("child mailbox")
+            .into_iter()
+            .find(|record| {
+                record.direction == RelatedSessionMessageDirection::Received
+                    && record.message.message_id == objective.message_id
+            })
+            .expect("claimed objective")
+            .settlement
+            .is_none()
+    );
+    assert!(
+        !runtime
+            .related_session_messages(parent.session_id)
+            .expect("parent mailbox")
+            .into_iter()
+            .any(|record| record.message.in_reply_to == Some(objective.message_id))
+    );
+}
+
+#[test]
+fn related_session_dispatch_failure_reconciles_transient_settlement_error() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (parent, parent_branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("coordinator".to_owned()),
+            None,
+        )
+        .expect("parent session");
+    let (child, child_branch) = runtime
+        .spawn_child_session(
+            parent.session_id,
+            parent_branch.branch_id,
+            None,
+            "reconcile a transient settlement failure".to_owned(),
+            Some("worker".to_owned()),
+            None,
+            None,
+        )
+        .expect("child session");
+    let objective = runtime
+        .send_related_session_message(
+            parent.session_id,
+            parent_branch.branch_id,
+            None,
+            child.session_id,
+            child_branch.branch_id,
+            RelatedSessionMessageKind::Instruction,
+            RelatedSessionDeliveryMode::Wake,
+            None,
+            "Report the dispatch failure.".to_owned(),
+            Vec::new(),
+        )
+        .expect("send objective");
+    let admitted = runtime
+        .claim_next_related_session_message(child.session_id)
+        .expect("claim objective")
+        .expect("child turn");
+
+    runtime.inject_store_append_error_after_successes_for_test(1, "settlement write failed");
+    runtime
+        .fail_admitted_related_turn(
+            &admitted,
+            &bt_core::BelltowerError::Runtime("dispatch failed".to_owned()),
+        )
+        .expect("transient settlement failure is reconciled");
+
+    assert!(
+        runtime
+            .all_events(child.session_id)
+            .expect("child events")
+            .iter()
+            .any(|event| matches!(
+                &event.payload,
+                EventPayload::TurnFinished {
+                    turn_id,
+                    status,
+                    ..
+                } if *turn_id == admitted.turn_id() && status == "failed"
+            ))
+    );
+    let settlement = runtime
+        .related_session_messages(child.session_id)
+        .expect("child mailbox")
+        .into_iter()
+        .find(|record| {
+            record.direction == RelatedSessionMessageDirection::Received
+                && record.message.message_id == objective.message_id
+        })
+        .expect("claimed objective")
+        .settlement
+        .expect("reconciled settlement");
+    assert_eq!(settlement.reply_kind, RelatedSessionMessageKind::Error);
+    assert_eq!(settlement.settling_turn_id, admitted.turn_id());
+    let replies = runtime
+        .related_session_messages(parent.session_id)
+        .expect("parent mailbox")
+        .into_iter()
+        .filter(|record| {
+            record.direction == RelatedSessionMessageDirection::Received
+                && record.message.in_reply_to == Some(objective.message_id)
+                && record.message.kind == RelatedSessionMessageKind::Error
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(replies.len(), 1);
+}
+
+#[test]
 fn reopened_runtime_reports_interrupted_subagent_without_retrying_it() {
     let config = BelltowerConfig::from_embedded().expect("config");
     let file = NamedTempFile::new().expect("tempfile");
@@ -4299,8 +4706,21 @@ fn reopened_runtime_reports_interrupted_subagent_without_retrying_it() {
         interruption
             .message
             .text
-            .contains("not retried automatically")
+            .contains("not retried because side effects may have occurred")
     );
+    let settlement = reopened
+        .related_session_messages(child.session_id)
+        .expect("child mailbox")
+        .into_iter()
+        .find(|record| {
+            record.direction == RelatedSessionMessageDirection::Received
+                && record.message.message_id == objective.message_id
+        })
+        .expect("claimed objective")
+        .settlement
+        .expect("interrupted objective settlement");
+    assert_eq!(settlement.reply_kind, RelatedSessionMessageKind::Error);
+    assert_eq!(settlement.settling_turn_id, admitted.turn_id());
     drop(reopened);
 
     let reopened_again = BelltowerRuntime::open(config, file.path()).expect("second reopen");
@@ -4404,8 +4824,142 @@ fn reopened_runtime_repairs_interrupted_subagent_notification_after_terminal_com
         notifications[0]
             .message
             .text
-            .contains("not retried automatically")
+            .contains("not retried because side effects may have occurred")
     );
+    assert!(
+        reopened
+            .related_session_messages(child.session_id)
+            .expect("child mailbox")
+            .into_iter()
+            .find(|record| {
+                record.direction == RelatedSessionMessageDirection::Received
+                    && record.message.message_id == objective.message_id
+            })
+            .expect("claimed objective")
+            .settlement
+            .is_some()
+    );
+}
+
+#[test]
+fn reopened_runtime_repairs_completed_related_turn_settlement_once() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config.clone(), file.path()).expect("runtime");
+    let (parent, parent_branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("coordinator".to_owned()),
+            None,
+        )
+        .expect("parent session");
+    let (child, child_branch) = runtime
+        .spawn_child_session(
+            parent.session_id,
+            parent_branch.branch_id,
+            None,
+            "complete before the reply is delivered".to_owned(),
+            Some("worker".to_owned()),
+            None,
+            None,
+        )
+        .expect("child session");
+    let objective = runtime
+        .send_related_session_message(
+            parent.session_id,
+            parent_branch.branch_id,
+            None,
+            child.session_id,
+            child_branch.branch_id,
+            RelatedSessionMessageKind::Instruction,
+            RelatedSessionDeliveryMode::Wake,
+            None,
+            "Return the recovered result.".to_owned(),
+            Vec::new(),
+        )
+        .expect("send objective");
+    let admitted = runtime
+        .claim_next_related_session_message(child.session_id)
+        .expect("claim objective")
+        .expect("child turn");
+    runtime
+        .append_raw_message(
+            &child,
+            &child_branch,
+            Message::text(Role::Assistant, "Recovered result."),
+            Some(admitted.turn_id()),
+        )
+        .expect("record assistant result");
+    drop(runtime);
+
+    let mut store = SqliteSessionStore::open(file.path()).expect("store");
+    let terminal = EventEnvelope::new(
+        child.session_id,
+        child_branch.branch_id,
+        SpanKind::Agent,
+        EventPayload::TurnFinished {
+            turn_id: admitted.turn_id(),
+            provider: "openai-compatible".to_owned(),
+            model: "o4-mini".to_owned(),
+            status: "completed".to_owned(),
+            finish_reason: Some("stop".to_owned()),
+            latency_ms: 1,
+        },
+    )
+    .with_turn_id(admitted.turn_id());
+    store
+        .commit_turn_terminal_transition(
+            child.session_id,
+            child_branch.branch_id,
+            admitted.turn_id(),
+            &[terminal],
+        )
+        .expect("commit terminal turn without reply settlement");
+    drop(store);
+
+    let reopened = BelltowerRuntime::open(config.clone(), file.path()).expect("reopen runtime");
+    let results = reopened
+        .related_session_messages(parent.session_id)
+        .expect("parent mailbox")
+        .into_iter()
+        .filter(|record| {
+            record.direction == RelatedSessionMessageDirection::Received
+                && record.message.in_reply_to == Some(objective.message_id)
+                && record.message.kind == RelatedSessionMessageKind::Result
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].message.text, "Recovered result.");
+    assert!(
+        reopened
+            .related_session_messages(child.session_id)
+            .expect("child mailbox")
+            .into_iter()
+            .find(|record| {
+                record.direction == RelatedSessionMessageDirection::Received
+                    && record.message.message_id == objective.message_id
+            })
+            .expect("claimed objective")
+            .settlement
+            .is_some()
+    );
+    drop(reopened);
+
+    let reopened_again = BelltowerRuntime::open(config, file.path()).expect("second reopen");
+    let result_count = reopened_again
+        .related_session_messages(parent.session_id)
+        .expect("parent mailbox")
+        .into_iter()
+        .filter(|record| {
+            record.direction == RelatedSessionMessageDirection::Received
+                && record.message.in_reply_to == Some(objective.message_id)
+                && record.message.kind == RelatedSessionMessageKind::Result
+        })
+        .count();
+    assert_eq!(result_count, 1);
 }
 
 #[test]

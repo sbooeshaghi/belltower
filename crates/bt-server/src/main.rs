@@ -748,6 +748,19 @@ async fn approve_tool(
                         Some("tool_calls".to_owned()),
                         latency_ms,
                     )?;
+                    if let Err(error) = state.runtime.record_related_turn_outcome(
+                        turn_session.session_id,
+                        branch.branch_id,
+                        resumed.turn_id(),
+                        bt_runtime::TurnRunStopReason::AwaitingApproval,
+                    ) {
+                        tracing::warn!(
+                            session_id = %turn_session.session_id,
+                            turn_id = %resumed.turn_id(),
+                            %error,
+                            "failed to record nonterminal related-session progress"
+                        );
+                    }
                     return Ok(());
                 }
                 run_session_turn(&state, &turn_session, &branch, resumed).await?;
@@ -1538,7 +1551,7 @@ pub(crate) async fn run_session_turn(
     let adapters = ServerTurnAdapters {
         state: state.clone(),
     };
-    let outcome = state
+    state
         .runtime
         .turn_orchestrator()
         .run_session_turns(
@@ -1546,21 +1559,7 @@ pub(crate) async fn run_session_turn(
             TurnRunRequest::new(session.clone(), branch.clone(), admitted_turn)?,
         )
         .await
-        .map_err(ApiError::from);
-    // Every turn-run path (dispatch, send, approval/input resume) settles the
-    // session's reply obligations to related sessions here, so a child that
-    // pauses for approval still reports its eventual outcome to the parent.
-    if session.parent_session_id.is_some()
-        && let Err(error) =
-            crate::agent_tools::settle_child_reply_obligations(state, session, branch, &outcome)
-    {
-        tracing::warn!(
-            session_id = %session.session_id,
-            error = %error,
-            "failed to settle child reply obligations"
-        );
-    }
-    outcome
+        .map_err(ApiError::from)
 }
 
 /// Runs admitted-turn work on a detached task so a client disconnect can
@@ -1617,6 +1616,17 @@ pub(crate) fn detach_turn_work<F>(
                 %session_id,
                 %turn_id,
                 "turn failure already recorded or turn no longer active: {record_error}"
+            );
+        }
+        if let Err(settlement_error) = watchdog_state
+            .runtime
+            .record_related_turn_failure(session_id, branch_id, turn_id, &error)
+        {
+            tracing::error!(
+                %session_id,
+                %turn_id,
+                error = %settlement_error,
+                "failed to settle related-session obligations after detached turn failure"
             );
         }
     });

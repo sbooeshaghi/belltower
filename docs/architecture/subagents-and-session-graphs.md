@@ -208,6 +208,7 @@ Belltower now has explicit delegation events in the canonical taxonomy:
 - `session.result.rejected`
 - `session.related_message.recorded`
 - `session.related_message.resolved`
+- `session.related_message.settled`
 
 These should capture:
 
@@ -238,13 +239,15 @@ related_session_message }` before provider or tool execution. The destination's
 current settings revision is captured at claim time; a concurrent settings
 change retries admission instead of silently stranding the wake. When both
 session logs are present in one store, the derived sender and receiver mailbox
-rows expose the same claimed or dropped status. Mirrored projection updates are
-scoped by source session, destination session, and message id, so an unrelated
-lineage cannot inherit another delivery's resolution. Server startup claims
-pending idle-session wakes through ordinary admitted turns. A previously claimed
-interrupted turn is terminalized rather than retried, because tool side effects
-may already have occurred; runtime reopening repairs one durable typed error to
-the sender when the interruption terminal event committed before that reply.
+rows reconstruct delivery state from their own canonical copies. A terminal
+reply records one recipient-local `session.related_message.settled` event that
+names the exact obligation, reply, result kind, and settling turn. The reply
+pair and settlement commit atomically, and the first terminal settlement wins.
+This is the same path for parent, child, sibling, and deeper same-lineage
+communication. Server startup claims pending idle-session wakes through
+ordinary admitted turns. A previously claimed interrupted turn is terminalized
+rather than retried, because tool side effects may already have occurred;
+runtime reopening repairs a missing completed or failed settlement once.
 The wake pump also rechecks durable pending work after a turn finishes, session
 settings change, or a cancel request clears, so a wake deferred while the
 destination was busy or blocked is not stranded in process-local state.
