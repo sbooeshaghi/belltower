@@ -11,7 +11,8 @@
 
 use bt_session::schema_gate::{
     BELLTOWER_BUNDLE_MANIFEST_SCHEMA_FILE, BELLTOWER_EVENT_SCHEMA_FILE,
-    belltower_bundle_manifest_schema_json, belltower_event_schema_json,
+    BELLTOWER_PORTABLE_EVENT_SCHEMA_FILE, belltower_bundle_manifest_schema_json,
+    belltower_event_schema_json, belltower_portable_event_schema_json,
 };
 use std::path::PathBuf;
 
@@ -19,6 +20,10 @@ fn main() -> std::io::Result<()> {
     let schema_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schema");
     let outputs = [
         (BELLTOWER_EVENT_SCHEMA_FILE, belltower_event_schema_json()),
+        (
+            BELLTOWER_PORTABLE_EVENT_SCHEMA_FILE,
+            belltower_portable_event_schema_json(),
+        ),
         (
             BELLTOWER_BUNDLE_MANIFEST_SCHEMA_FILE,
             belltower_bundle_manifest_schema_json(),

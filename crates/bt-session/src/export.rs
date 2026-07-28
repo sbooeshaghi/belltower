@@ -1,12 +1,20 @@
 use crate::{RawChunkInsert, RawChunkRecord, SqliteSessionStore, StoredSessionEvent};
 use bt_core::{
-    BelltowerError, BranchId, BranchManifest, BranchRecord, BundleArtifactRef, ContentRef,
-    EventEnvelope, EventId, EventPayload, EventRange, Message, PortableHash, ProducerInfo,
-    RedactionPolicy, Result, SessionBundleArtifactMode, SessionBundleManifest, SessionId,
-    SessionNodeRef, SessionRecord, SpanKind,
+    ApprovalDecision, ApprovalRequestSnapshot, ApprovalResolution, BelltowerError, BranchId,
+    BranchManifest, BranchRecord, BudgetConfig, BundleArtifactRef, CompactionId, CompletionDelta,
+    ContentRef, ContextAttachment, ContextCompactionPhase, ContextCompactionStatus,
+    ContextCompactionTrigger, ContextManifest, ContextMessageRef, ContextSystemPromptRef,
+    ContextToolRef, CostBreakdown, ErrorClass, EventEnvelope, EventId, EventPayload, EventRange,
+    Message, MessageId, PlanItem, PortableHash, ProducerInfo, QueuedMessageResolutionOutcome,
+    RedactionPolicy, RelatedSessionMessage, RelatedSessionMessageDirection,
+    RelatedSessionMessageId, RelatedSessionMessageStatus, Result, SessionBundleArtifactMode,
+    SessionBundleManifest, SessionId, SessionNodeRef, SessionRecord, SpanId, SpanKind,
+    SteerResolutionOutcome, ThinkingConfig, TokenUsage, ToolCallId, ToolOperationContext,
+    ToolResultEnvelope, TurnId, TurnInstructionProvenance, TurnStartSource,
+    default_settings_revision_id,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -127,12 +135,384 @@ impl LegacySessionExporter for SqliteSessionStore {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PortableContextMessageRef {
+    pub message_id: MessageId,
+    pub role: bt_core::Role,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_branch_id: Option<BranchId>,
+    pub part_count: u32,
+    pub visible_text_chars: u64,
+}
+
+impl From<&ContextMessageRef> for PortableContextMessageRef {
+    fn from(value: &ContextMessageRef) -> Self {
+        Self {
+            message_id: value.message_id,
+            role: value.role.clone(),
+            source_branch_id: value.source_branch_id,
+            part_count: value.part_count,
+            visible_text_chars: value.visible_text_chars,
+        }
+    }
+}
+
+impl PortableContextMessageRef {
+    fn to_live(&self) -> ContextMessageRef {
+        ContextMessageRef {
+            message_id: self.message_id,
+            role: self.role.clone(),
+            source_branch_id: self.source_branch_id,
+            source_seq_id: None,
+            part_count: self.part_count,
+            visible_text_chars: self.visible_text_chars,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PortableContextManifest {
+    pub turn_id: TurnId,
+    pub branch_id: BranchId,
+    pub llm_call_ordinal: u32,
+    pub provider: String,
+    pub model: String,
+    #[serde(default = "default_settings_revision_id")]
+    pub settings_revision_id: u64,
+    pub system_prompt: ContextSystemPromptRef,
+    pub messages: Vec<PortableContextMessageRef>,
+    pub tools: Vec<ContextToolRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ContextAttachment>,
+    pub max_tokens: Option<u64>,
+    pub thinking: Option<ThinkingConfig>,
+    pub compacted: bool,
+}
+
+impl From<&ContextManifest> for PortableContextManifest {
+    fn from(value: &ContextManifest) -> Self {
+        Self {
+            turn_id: value.turn_id,
+            branch_id: value.branch_id,
+            llm_call_ordinal: value.llm_call_ordinal,
+            provider: value.provider.clone(),
+            model: value.model.clone(),
+            settings_revision_id: value.settings_revision_id,
+            system_prompt: value.system_prompt.clone(),
+            messages: value.messages.iter().map(Into::into).collect(),
+            tools: value.tools.clone(),
+            attachments: value.attachments.clone(),
+            max_tokens: value.max_tokens,
+            thinking: value.thinking.clone(),
+            compacted: value.compacted,
+        }
+    }
+}
+
+impl PortableContextManifest {
+    fn to_live(&self) -> ContextManifest {
+        ContextManifest {
+            turn_id: self.turn_id,
+            branch_id: self.branch_id,
+            llm_call_ordinal: self.llm_call_ordinal,
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            settings_revision_id: self.settings_revision_id,
+            context_boundary_seq_id: None,
+            system_prompt: self.system_prompt.clone(),
+            messages: self.messages.iter().map(Self::message_to_live).collect(),
+            tools: self.tools.clone(),
+            attachments: self.attachments.clone(),
+            max_tokens: self.max_tokens,
+            thinking: self.thinking.clone(),
+            compacted: self.compacted,
+        }
+    }
+
+    fn message_to_live(message: &PortableContextMessageRef) -> ContextMessageRef {
+        message.to_live()
+    }
+}
+
+fn default_portable_turn_start_source() -> TurnStartSource {
+    TurnStartSource::UserMessage
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub enum PortableEventPayload {
+    SessionStarted {
+        project_root: String,
+        connection_id: String,
+    },
+    SessionSpawnRequested {
+        child_session_id: SessionId,
+        objective: String,
+        connection_id: String,
+        model_id: Option<String>,
+    },
+    SessionSpawned {
+        child_session_id: SessionId,
+        child_branch_id: BranchId,
+        objective: String,
+    },
+    SessionHandoffRecorded {
+        parent_session_id: SessionId,
+        parent_branch_id: BranchId,
+        parent_turn_id: Option<TurnId>,
+        objective: String,
+        summary: String,
+    },
+    SessionResultImported {
+        child_session_id: SessionId,
+        status: String,
+        summary: String,
+    },
+    SessionResultRejected {
+        child_session_id: SessionId,
+        reason: String,
+    },
+    RelatedSessionMessageRecorded {
+        direction: RelatedSessionMessageDirection,
+        counterpart_event_id: EventId,
+        message: RelatedSessionMessage,
+    },
+    RelatedSessionMessageResolved {
+        message_id: RelatedSessionMessageId,
+        status: RelatedSessionMessageStatus,
+        resulting_turn_id: Option<TurnId>,
+        reason: Option<String>,
+    },
+    SessionSettingsUpdated {
+        #[serde(default = "default_settings_revision_id")]
+        settings_revision_id: u64,
+        connection_id: String,
+        model_id: Option<String>,
+        tool_mode: String,
+    },
+    SessionEnded {
+        reason: String,
+    },
+    BranchCreated {
+        parent_branch_id: Option<BranchId>,
+        parent_event_id: Option<EventId>,
+    },
+    BranchActivated {
+        branch_id: BranchId,
+    },
+    BranchSummarized {
+        branch_id: BranchId,
+        summary: String,
+        files_read: Vec<String>,
+        files_modified: Vec<String>,
+    },
+    MessageAppended {
+        message: Message,
+    },
+    TurnStarted {
+        turn_id: TurnId,
+        provider: String,
+        model: String,
+        message_count: u32,
+        #[serde(default = "default_settings_revision_id")]
+        settings_revision_id: u64,
+        #[serde(default = "default_portable_turn_start_source")]
+        source: TurnStartSource,
+        resumed_from_call_id: Option<ToolCallId>,
+    },
+    TurnInstructionProvenanceRecorded {
+        provenance: TurnInstructionProvenance,
+    },
+    TurnContextManifestRecorded {
+        manifest: PortableContextManifest,
+    },
+    CompletionRequested {
+        llm_call_ordinal: u32,
+        provider: String,
+        model: String,
+        message_count: u32,
+    },
+    CompletionChunk {
+        llm_call_ordinal: Option<u32>,
+        deltas: Vec<CompletionDelta>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_chunk_content_ref: Option<PortableHash>,
+    },
+    CompletionFinished {
+        llm_call_ordinal: u32,
+        provider: String,
+        model: String,
+        usage: TokenUsage,
+        cost: Option<CostBreakdown>,
+        finish_reason: String,
+        latency_ms: u64,
+    },
+    SessionError {
+        class: ErrorClass,
+        code: String,
+        message: String,
+        retryable: bool,
+    },
+    TurnFinished {
+        turn_id: TurnId,
+        provider: String,
+        model: String,
+        status: String,
+        finish_reason: Option<String>,
+        latency_ms: u64,
+    },
+    ToolCallRequested {
+        call_id: ToolCallId,
+        tool_name: String,
+        arguments: Value,
+    },
+    ToolOperationRecorded {
+        call_id: ToolCallId,
+        tool_name: String,
+        #[serde(default)]
+        operation: ToolOperationContext,
+    },
+    ToolApprovalRequested {
+        call_id: ToolCallId,
+        tool_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snapshot: Option<ApprovalRequestSnapshot>,
+    },
+    ToolApprovalResolved {
+        call_id: ToolCallId,
+        tool_name: String,
+        request_fingerprint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolution: Option<ApprovalResolution>,
+        decision: ApprovalDecision,
+    },
+    ToolExecutionFinished {
+        call_id: ToolCallId,
+        tool_name: String,
+        result: ToolResultEnvelope,
+    },
+    PlanUpdated {
+        items: Vec<PlanItem>,
+    },
+    BudgetConfigured {
+        budget: BudgetConfig,
+    },
+    ContextCompacted {
+        #[serde(default)]
+        #[schemars(skip_serializing_if = "bt_core::schema_support::omit_nondeterministic_default")]
+        compaction_id: CompactionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_number: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_compaction_id: Option<CompactionId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        first_compaction_id: Option<CompactionId>,
+        #[serde(default)]
+        trigger: ContextCompactionTrigger,
+        #[serde(default)]
+        phase: ContextCompactionPhase,
+        #[serde(default)]
+        status: ContextCompactionStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary_message_id: Option<MessageId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        first_kept_message_id: Option<MessageId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        first_kept_branch_id: Option<BranchId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        latency_ms: Option<u64>,
+        #[serde(default)]
+        summary: String,
+        messages_before: u32,
+        messages_after: u32,
+        tokens_before: u64,
+        tokens_after: u64,
+        files_read: Vec<String>,
+        files_modified: Vec<String>,
+    },
+    BudgetCheckpoint {
+        tokens_used: u64,
+        turns_used: u32,
+        elapsed_seconds: u64,
+        cost_used_usd: Option<f64>,
+    },
+    SessionQueuedMessageEnqueued {
+        message: Message,
+        #[serde(default = "default_settings_revision_id")]
+        settings_revision_id: u64,
+    },
+    SessionQueuedMessageResolved {
+        queue_event_id: EventId,
+        outcome: QueuedMessageResolutionOutcome,
+        reason: Option<String>,
+    },
+    SessionCancelled {
+        reason: String,
+    },
+    SessionCancelCleared {
+        reason: String,
+    },
+    SessionSteered {
+        message: String,
+        #[serde(default = "default_settings_revision_id")]
+        settings_revision_id: u64,
+    },
+    SessionSteersResolved {
+        steer_event_ids: Vec<EventId>,
+        outcome: SteerResolutionOutcome,
+        combined_message: Option<String>,
+        reason: Option<String>,
+    },
+    OperatorCommandRecorded {
+        command_type: String,
+        raw_input: String,
+        output: String,
+        success: bool,
+    },
+    RawChunkPersisted {
+        provider: String,
+        raw_chunk_content_ref: PortableHash,
+        stream: String,
+        llm_call_ordinal: Option<u32>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PortableEventEnvelope {
+    pub event_id: EventId,
+    pub session_id: SessionId,
+    pub branch_id: BranchId,
+    pub turn_id: Option<TurnId>,
+    pub span_id: SpanId,
+    pub parent_span_id: Option<SpanId>,
+    pub span_kind: SpanKind,
+    #[schemars(schema_with = "bt_core::schema_support::offset_date_time_schema")]
+    pub occurred_at: OffsetDateTime,
+    pub payload: PortableEventPayload,
+    pub attributes: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub struct SessionBundleEventRecord {
     pub bundle_event_ordinal: u64,
     pub event_kind: String,
     pub event_hash: PortableHash,
-    pub event: Value,
+    pub event: PortableEventEnvelope,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -166,7 +546,8 @@ pub struct SessionBundleValidationReport {
     pub bundle_hash: PortableHash,
     pub session_id: SessionId,
     pub event_count: usize,
-    pub raw_chunk_count: usize,
+    pub raw_chunk_reference_count: usize,
+    pub raw_chunk_content_count: usize,
     pub content_count: usize,
     pub artifact_count: usize,
 }
@@ -177,7 +558,8 @@ pub struct SessionBundleImportReport {
     pub session_id: SessionId,
     pub branch_count: usize,
     pub event_count: usize,
-    pub raw_chunk_count: usize,
+    pub raw_chunk_reference_count: usize,
+    pub raw_chunk_content_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +593,8 @@ pub struct SessionBundleDiffSide {
     pub session_id: SessionId,
     pub event_count: usize,
     pub branch_count: usize,
+    pub raw_chunk_reference_count: usize,
+    pub raw_chunk_content_count: usize,
     pub content_count: usize,
 }
 
@@ -475,7 +859,8 @@ pub fn validate_session_bundle_directory(
         bundle_hash,
         session_id: manifest.session.session_id,
         event_count: event_records.len(),
-        raw_chunk_count: raw_chunk_refs.len(),
+        raw_chunk_reference_count: raw_chunk_refs.len(),
+        raw_chunk_content_count: raw_chunk_content_hashes.len(),
         content_count: manifest_content_hashes.len(),
         artifact_count: manifest.artifacts.len(),
     })
@@ -613,7 +998,8 @@ fn import_session_bundle_directory(
         session_id: manifest.session.session_id,
         branch_count: branches.len(),
         event_count: seq_ids.len(),
-        raw_chunk_count: raw_chunk_refs.len(),
+        raw_chunk_reference_count: raw_chunk_refs.len(),
+        raw_chunk_content_count: report.raw_chunk_content_count,
     })
 }
 
@@ -716,11 +1102,11 @@ fn resolve_continuation_parent_node(
     };
     Ok(SessionNodeRef {
         bundle_hash: Some(bundle_hash.clone()),
-        session_id: portable_session_id(&record.event)?,
-        branch_id: portable_branch_id(&record.event)?,
+        session_id: record.event.session_id,
+        branch_id: record.event.branch_id,
         bundle_event_ordinal: record.bundle_event_ordinal,
         store_seq_id: None,
-        event_id: portable_event_id(&record.event)?,
+        event_id: record.event.event_id,
         event_hash: record.event_hash.clone(),
     })
 }
@@ -754,8 +1140,9 @@ fn assert_parent_node_imported(
             parent_node.event_id
         )));
     };
-    let portable_event = portable_event_value(&event)?;
-    let local_event_hash = canonical_event_hash(&portable_event, &raw_chunk_hashes_by_local_id)?;
+    let (portable_event, _) =
+        PortableEventEnvelope::from_live(&event, &raw_chunk_hashes_by_local_id)?;
+    let local_event_hash = canonical_event_hash(&portable_event)?;
     if local_event_hash != parent_node.event_hash {
         return Err(BelltowerError::InvalidState(format!(
             "local parent event {} hash {} does not match bundle parent hash {}",
@@ -814,6 +1201,8 @@ fn diff_session_bundle_directories_inner(
             session_id: left_report.session_id,
             event_count: left_report.event_count,
             branch_count: left.manifest.branches.len(),
+            raw_chunk_reference_count: left_report.raw_chunk_reference_count,
+            raw_chunk_content_count: left_report.raw_chunk_content_count,
             content_count: left_report.content_count,
         },
         right: SessionBundleDiffSide {
@@ -821,6 +1210,8 @@ fn diff_session_bundle_directories_inner(
             session_id: right_report.session_id,
             event_count: right_report.event_count,
             branch_count: right.manifest.branches.len(),
+            raw_chunk_reference_count: right_report.raw_chunk_reference_count,
+            raw_chunk_content_count: right_report.raw_chunk_content_count,
             content_count: right_report.content_count,
         },
         common_event_count,
@@ -1353,24 +1744,22 @@ fn build_event_records(
     let mut infos = Vec::with_capacity(stored_events.len());
 
     for (ordinal, stored) in stored_events.iter().enumerate() {
-        let portable_event = portable_event_value(&stored.event)?;
-        let raw_chunk_refs =
-            raw_chunk_refs_in_event(&portable_event, raw_chunk_hashes_by_local_id)?;
-        let event_value = canonical_event_value(&portable_event, raw_chunk_hashes_by_local_id)?;
-        let event_hash = hash_canonical_event_value(&event_value)?;
+        let (portable_event, raw_chunk_refs) =
+            PortableEventEnvelope::from_live(&stored.event, raw_chunk_hashes_by_local_id)?;
+        let event_hash = canonical_event_hash(&portable_event)?;
         let ordinal = ordinal as u64;
         records.push(SessionBundleEventRecord {
             bundle_event_ordinal: ordinal,
             event_kind: stored.event.kind().to_owned(),
             event_hash: event_hash.clone(),
-            event: event_value.clone(),
+            event: portable_event.clone(),
         });
         infos.push(EventRecordInfo {
             ordinal,
             event_id: stored.event.event_id,
             branch_id: stored.event.branch_id,
             event_hash,
-            raw_chunk_content_refs: raw_chunk_content_refs_in_event(&event_value)?,
+            raw_chunk_content_refs: portable_event.payload.raw_chunk_content_refs(),
             raw_chunk_refs,
         });
     }
@@ -1378,202 +1767,430 @@ fn build_event_records(
     Ok((records, infos))
 }
 
-fn portable_event_value(event: &EventEnvelope) -> Result<Value> {
-    let mut value = serde_json::to_value(event)?;
-    remove_seq_id(&mut value)?;
-    Ok(value)
-}
-
-fn remove_seq_id(value: &mut Value) -> Result<()> {
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| invalid_bundle("event envelope did not serialize as an object"))?;
-    object.remove("seq_id");
-    Ok(())
-}
-
-fn canonical_event_hash(
-    portable_event: &Value,
-    raw_chunk_hashes_by_local_id: &HashMap<i64, PortableHash>,
-) -> Result<PortableHash> {
-    let value = canonical_event_value(portable_event, raw_chunk_hashes_by_local_id)?;
-    hash_canonical_event_value(&value)
-}
-
-fn canonical_event_value(
-    portable_event: &Value,
-    raw_chunk_hashes_by_local_id: &HashMap<i64, PortableHash>,
-) -> Result<Value> {
-    let mut value = portable_event.clone();
-    normalize_raw_chunk_local_ids(&mut value, raw_chunk_hashes_by_local_id)?;
-    remove_local_sequence_fields(&mut value);
-    Ok(value)
-}
-
-fn remove_local_sequence_fields(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            object.remove("context_boundary_seq_id");
-            object.remove("source_seq_id");
-            object.remove("first_kept_seq_id");
-            object.remove("requested_seq_id");
-            object.remove("completed_seq_id");
-            for child in object.values_mut() {
-                remove_local_sequence_fields(child);
-            }
-        }
-        Value::Array(items) => {
-            for child in items {
-                remove_local_sequence_fields(child);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn raw_chunk_refs_in_event(
-    portable_event: &Value,
-    raw_chunk_hashes_by_local_id: &HashMap<i64, PortableHash>,
-) -> Result<BTreeSet<RawChunkEventRef>> {
-    let mut local_ids = BTreeSet::new();
-    let Some(payload) = portable_event
-        .as_object()
-        .and_then(|object| object.get("payload"))
-        .and_then(Value::as_object)
-    else {
-        return Ok(BTreeSet::new());
-    };
-
-    collect_raw_chunk_local_id(
-        payload,
-        "CompletionChunk",
-        "raw_chunk_index",
-        &mut local_ids,
-    )?;
-    collect_raw_chunk_local_id(payload, "RawChunkPersisted", "chunk_index", &mut local_ids)?;
-
-    local_ids
-        .into_iter()
-        .map(|local_chunk_id| {
-            let content_hash = raw_chunk_hashes_by_local_id
-                .get(&local_chunk_id)
-                .cloned()
-                .ok_or_else(|| {
-                    invalid_bundle(format!(
-                        "event references missing raw chunk {local_chunk_id}"
-                    ))
-                })?;
-            Ok(RawChunkEventRef {
-                local_chunk_id,
-                content_hash,
-            })
-        })
-        .collect()
-}
-
-fn collect_raw_chunk_local_id(
-    payload: &Map<String, Value>,
-    variant: &str,
-    field: &str,
-    local_ids: &mut BTreeSet<i64>,
-) -> Result<()> {
-    let Some(object) = payload.get(variant).and_then(Value::as_object) else {
-        return Ok(());
-    };
-    let Some(value) = object.get(field) else {
-        return Ok(());
-    };
-    // serde serializes Option::None as an explicit null: a null linkage field
-    // (CompletionChunk without a raw provider payload) means "no raw chunk",
-    // not a malformed record.
-    if value.is_null() {
-        return Ok(());
-    }
-    let Some(local_id) = value.as_i64() else {
-        return Err(invalid_bundle(format!("{variant} {field} is not an i64")));
-    };
-    local_ids.insert(local_id);
-    Ok(())
-}
-
 fn hash_canonical_event_value(value: &Value) -> Result<PortableHash> {
     let bytes = serde_json::to_vec(&value)?;
     Ok(hash_bytes(&bytes))
 }
 
-fn normalize_raw_chunk_local_ids(
-    portable_event: &mut Value,
-    raw_chunk_hashes_by_local_id: &HashMap<i64, PortableHash>,
-) -> Result<()> {
-    let Some(payload) = portable_event
-        .as_object_mut()
-        .and_then(|object| object.get_mut("payload"))
-        .and_then(Value::as_object_mut)
-    else {
-        return Ok(());
-    };
-
-    normalize_completion_chunk_payload(payload, raw_chunk_hashes_by_local_id)?;
-    normalize_raw_chunk_persisted_payload(payload, raw_chunk_hashes_by_local_id)?;
-    Ok(())
+fn canonical_event_hash(portable_event: &PortableEventEnvelope) -> Result<PortableHash> {
+    hash_canonical_event_value(&serde_json::to_value(portable_event)?)
 }
 
-fn normalize_completion_chunk_payload(
-    payload: &mut Map<String, Value>,
-    raw_chunk_hashes_by_local_id: &HashMap<i64, PortableHash>,
-) -> Result<()> {
-    let Some(chunk) = payload
-        .get_mut("CompletionChunk")
-        .and_then(Value::as_object_mut)
-    else {
-        return Ok(());
-    };
-    let raw_chunk_index = chunk.remove("raw_chunk_index");
-    if let Some(Value::Number(number)) = raw_chunk_index {
-        let Some(index) = number.as_i64() else {
-            return Err(invalid_bundle("completion raw_chunk_index is not an i64"));
-        };
-        let Some(hash) = raw_chunk_hashes_by_local_id.get(&index) else {
-            return Err(invalid_bundle(format!(
-                "completion chunk references missing raw chunk {index}"
-            )));
-        };
-        chunk.insert(
-            "raw_chunk_content_ref".to_owned(),
-            Value::String(hash.to_string()),
-        );
+impl PortableEventEnvelope {
+    fn from_live(
+        event: &EventEnvelope,
+        raw_chunk_hashes_by_local_id: &HashMap<i64, PortableHash>,
+    ) -> Result<(Self, BTreeSet<RawChunkEventRef>)> {
+        let (payload, raw_chunk_refs) =
+            PortableEventPayload::from_live(&event.payload, raw_chunk_hashes_by_local_id)?;
+        Ok((
+            Self {
+                event_id: event.event_id,
+                session_id: event.session_id,
+                branch_id: event.branch_id,
+                turn_id: event.turn_id,
+                span_id: event.span_id,
+                parent_span_id: event.parent_span_id,
+                span_kind: event.span_kind.clone(),
+                occurred_at: event.occurred_at,
+                payload,
+                attributes: event.attributes.clone(),
+            },
+            raw_chunk_refs,
+        ))
     }
-    Ok(())
+
+    fn to_live(
+        &self,
+        raw_chunk_local_ids_by_ref: &HashMap<RawChunkImportKey, i64>,
+    ) -> Result<EventEnvelope> {
+        Ok(EventEnvelope {
+            seq_id: None,
+            event_id: self.event_id,
+            session_id: self.session_id,
+            branch_id: self.branch_id,
+            turn_id: self.turn_id,
+            span_id: self.span_id,
+            parent_span_id: self.parent_span_id,
+            span_kind: self.span_kind.clone(),
+            occurred_at: self.occurred_at,
+            payload: self
+                .payload
+                .to_live(self.event_id, raw_chunk_local_ids_by_ref)?,
+            attributes: self.attributes.clone(),
+        })
+    }
 }
 
-fn normalize_raw_chunk_persisted_payload(
-    payload: &mut Map<String, Value>,
-    raw_chunk_hashes_by_local_id: &HashMap<i64, PortableHash>,
-) -> Result<()> {
-    let Some(raw) = payload
-        .get_mut("RawChunkPersisted")
-        .and_then(Value::as_object_mut)
-    else {
-        return Ok(());
-    };
-    let chunk_index = raw.remove("chunk_index");
-    if let Some(Value::Number(number)) = chunk_index {
-        let Some(index) = number.as_i64() else {
-            return Err(invalid_bundle(
-                "raw chunk persisted chunk_index is not an i64",
-            ));
+impl PortableEventPayload {
+    fn from_live(
+        payload: &EventPayload,
+        raw_chunk_hashes_by_local_id: &HashMap<i64, PortableHash>,
+    ) -> Result<(Self, BTreeSet<RawChunkEventRef>)> {
+        let mut raw_chunk_refs = BTreeSet::new();
+        let portable = match payload {
+            EventPayload::CompletionChunk {
+                llm_call_ordinal,
+                deltas,
+                raw_chunk_index,
+            } => {
+                let raw_chunk_content_ref = raw_chunk_index
+                    .map(|local_chunk_id| {
+                        raw_chunk_ref(
+                            local_chunk_id,
+                            raw_chunk_hashes_by_local_id,
+                            "completion chunk",
+                        )
+                    })
+                    .transpose()?;
+                if let Some(raw_chunk_ref) = raw_chunk_content_ref.as_ref() {
+                    raw_chunk_refs.insert(raw_chunk_ref.clone());
+                }
+                Self::CompletionChunk {
+                    llm_call_ordinal: *llm_call_ordinal,
+                    deltas: deltas.clone(),
+                    raw_chunk_content_ref: raw_chunk_content_ref
+                        .map(|raw_ref| raw_ref.content_hash),
+                }
+            }
+            EventPayload::RawChunkPersisted {
+                provider,
+                chunk_index,
+                stream,
+                llm_call_ordinal,
+            } => {
+                let raw_chunk_ref = raw_chunk_ref(
+                    *chunk_index,
+                    raw_chunk_hashes_by_local_id,
+                    "raw chunk persisted event",
+                )?;
+                raw_chunk_refs.insert(raw_chunk_ref.clone());
+                Self::RawChunkPersisted {
+                    provider: provider.clone(),
+                    raw_chunk_content_ref: raw_chunk_ref.content_hash,
+                    stream: stream.clone(),
+                    llm_call_ordinal: *llm_call_ordinal,
+                }
+            }
+            EventPayload::TurnContextManifestRecorded { manifest } => {
+                Self::TurnContextManifestRecorded {
+                    manifest: manifest.into(),
+                }
+            }
+            EventPayload::ContextCompacted {
+                compaction_id,
+                window_number,
+                previous_compaction_id,
+                first_compaction_id,
+                trigger,
+                phase,
+                status,
+                reason,
+                provider,
+                model,
+                context_boundary_seq_id: _,
+                summary_message_id,
+                first_kept_message_id,
+                first_kept_branch_id,
+                first_kept_seq_id: _,
+                latency_ms,
+                summary,
+                messages_before,
+                messages_after,
+                tokens_before,
+                tokens_after,
+                files_read,
+                files_modified,
+            } => Self::ContextCompacted {
+                compaction_id: *compaction_id,
+                window_number: *window_number,
+                previous_compaction_id: *previous_compaction_id,
+                first_compaction_id: *first_compaction_id,
+                trigger: *trigger,
+                phase: *phase,
+                status: *status,
+                reason: reason.clone(),
+                provider: provider.clone(),
+                model: model.clone(),
+                summary_message_id: *summary_message_id,
+                first_kept_message_id: *first_kept_message_id,
+                first_kept_branch_id: *first_kept_branch_id,
+                latency_ms: *latency_ms,
+                summary: summary.clone(),
+                messages_before: *messages_before,
+                messages_after: *messages_after,
+                tokens_before: *tokens_before,
+                tokens_after: *tokens_after,
+                files_read: files_read.clone(),
+                files_modified: files_modified.clone(),
+            },
+            EventPayload::SessionStarted { .. }
+            | EventPayload::SessionSpawnRequested { .. }
+            | EventPayload::SessionSpawned { .. }
+            | EventPayload::SessionHandoffRecorded { .. }
+            | EventPayload::SessionResultImported { .. }
+            | EventPayload::SessionResultRejected { .. }
+            | EventPayload::RelatedSessionMessageRecorded { .. }
+            | EventPayload::RelatedSessionMessageResolved { .. }
+            | EventPayload::SessionSettingsUpdated { .. }
+            | EventPayload::SessionEnded { .. }
+            | EventPayload::BranchCreated { .. }
+            | EventPayload::BranchActivated { .. }
+            | EventPayload::BranchSummarized { .. }
+            | EventPayload::MessageAppended { .. }
+            | EventPayload::TurnStarted { .. }
+            | EventPayload::TurnInstructionProvenanceRecorded { .. }
+            | EventPayload::CompletionRequested { .. }
+            | EventPayload::CompletionFinished { .. }
+            | EventPayload::SessionError { .. }
+            | EventPayload::TurnFinished { .. }
+            | EventPayload::ToolCallRequested { .. }
+            | EventPayload::ToolOperationRecorded { .. }
+            | EventPayload::ToolApprovalRequested { .. }
+            | EventPayload::ToolApprovalResolved { .. }
+            | EventPayload::ToolExecutionFinished { .. }
+            | EventPayload::PlanUpdated { .. }
+            | EventPayload::BudgetConfigured { .. }
+            | EventPayload::BudgetCheckpoint { .. }
+            | EventPayload::SessionQueuedMessageEnqueued { .. }
+            | EventPayload::SessionQueuedMessageResolved { .. }
+            | EventPayload::SessionCancelled { .. }
+            | EventPayload::SessionCancelCleared { .. }
+            | EventPayload::SessionSteered { .. }
+            | EventPayload::SessionSteersResolved { .. }
+            | EventPayload::OperatorCommandRecorded { .. } => {
+                serde_json::from_value(serde_json::to_value(payload)?)?
+            }
         };
-        let Some(hash) = raw_chunk_hashes_by_local_id.get(&index) else {
-            return Err(invalid_bundle(format!(
-                "raw chunk persisted event references missing raw chunk {index}"
-            )));
-        };
-        raw.insert(
-            "raw_chunk_content_ref".to_owned(),
-            Value::String(hash.to_string()),
-        );
+        Ok((portable, raw_chunk_refs))
     }
-    Ok(())
+
+    fn to_live(
+        &self,
+        event_id: EventId,
+        raw_chunk_local_ids_by_ref: &HashMap<RawChunkImportKey, i64>,
+    ) -> Result<EventPayload> {
+        match self {
+            Self::CompletionChunk {
+                llm_call_ordinal,
+                deltas,
+                raw_chunk_content_ref,
+            } => Ok(EventPayload::CompletionChunk {
+                llm_call_ordinal: *llm_call_ordinal,
+                deltas: deltas.clone(),
+                raw_chunk_index: raw_chunk_content_ref
+                    .as_ref()
+                    .map(|content_hash| {
+                        imported_raw_chunk_id(
+                            event_id,
+                            content_hash,
+                            raw_chunk_local_ids_by_ref,
+                            "completion chunk",
+                        )
+                    })
+                    .transpose()?,
+            }),
+            Self::RawChunkPersisted {
+                provider,
+                raw_chunk_content_ref,
+                stream,
+                llm_call_ordinal,
+            } => Ok(EventPayload::RawChunkPersisted {
+                provider: provider.clone(),
+                chunk_index: imported_raw_chunk_id(
+                    event_id,
+                    raw_chunk_content_ref,
+                    raw_chunk_local_ids_by_ref,
+                    "raw chunk persisted event",
+                )?,
+                stream: stream.clone(),
+                llm_call_ordinal: *llm_call_ordinal,
+            }),
+            Self::TurnContextManifestRecorded { manifest } => {
+                Ok(EventPayload::TurnContextManifestRecorded {
+                    manifest: manifest.to_live(),
+                })
+            }
+            Self::ContextCompacted {
+                compaction_id,
+                window_number,
+                previous_compaction_id,
+                first_compaction_id,
+                trigger,
+                phase,
+                status,
+                reason,
+                provider,
+                model,
+                summary_message_id,
+                first_kept_message_id,
+                first_kept_branch_id,
+                latency_ms,
+                summary,
+                messages_before,
+                messages_after,
+                tokens_before,
+                tokens_after,
+                files_read,
+                files_modified,
+            } => Ok(EventPayload::ContextCompacted {
+                compaction_id: *compaction_id,
+                window_number: *window_number,
+                previous_compaction_id: *previous_compaction_id,
+                first_compaction_id: *first_compaction_id,
+                trigger: *trigger,
+                phase: *phase,
+                status: *status,
+                reason: reason.clone(),
+                provider: provider.clone(),
+                model: model.clone(),
+                context_boundary_seq_id: None,
+                summary_message_id: *summary_message_id,
+                first_kept_message_id: *first_kept_message_id,
+                first_kept_branch_id: *first_kept_branch_id,
+                first_kept_seq_id: None,
+                latency_ms: *latency_ms,
+                summary: summary.clone(),
+                messages_before: *messages_before,
+                messages_after: *messages_after,
+                tokens_before: *tokens_before,
+                tokens_after: *tokens_after,
+                files_read: files_read.clone(),
+                files_modified: files_modified.clone(),
+            }),
+            Self::SessionStarted { .. }
+            | Self::SessionSpawnRequested { .. }
+            | Self::SessionSpawned { .. }
+            | Self::SessionHandoffRecorded { .. }
+            | Self::SessionResultImported { .. }
+            | Self::SessionResultRejected { .. }
+            | Self::RelatedSessionMessageRecorded { .. }
+            | Self::RelatedSessionMessageResolved { .. }
+            | Self::SessionSettingsUpdated { .. }
+            | Self::SessionEnded { .. }
+            | Self::BranchCreated { .. }
+            | Self::BranchActivated { .. }
+            | Self::BranchSummarized { .. }
+            | Self::MessageAppended { .. }
+            | Self::TurnStarted { .. }
+            | Self::TurnInstructionProvenanceRecorded { .. }
+            | Self::CompletionRequested { .. }
+            | Self::CompletionFinished { .. }
+            | Self::SessionError { .. }
+            | Self::TurnFinished { .. }
+            | Self::ToolCallRequested { .. }
+            | Self::ToolOperationRecorded { .. }
+            | Self::ToolApprovalRequested { .. }
+            | Self::ToolApprovalResolved { .. }
+            | Self::ToolExecutionFinished { .. }
+            | Self::PlanUpdated { .. }
+            | Self::BudgetConfigured { .. }
+            | Self::BudgetCheckpoint { .. }
+            | Self::SessionQueuedMessageEnqueued { .. }
+            | Self::SessionQueuedMessageResolved { .. }
+            | Self::SessionCancelled { .. }
+            | Self::SessionCancelCleared { .. }
+            | Self::SessionSteered { .. }
+            | Self::SessionSteersResolved { .. }
+            | Self::OperatorCommandRecorded { .. } => {
+                Ok(serde_json::from_value(serde_json::to_value(self)?)?)
+            }
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::SessionStarted { .. } => "session.started",
+            Self::SessionSpawnRequested { .. } => "session.spawn.requested",
+            Self::SessionSpawned { .. } => "session.spawned",
+            Self::SessionHandoffRecorded { .. } => "session.handoff.recorded",
+            Self::SessionResultImported { .. } => "session.result.imported",
+            Self::SessionResultRejected { .. } => "session.result.rejected",
+            Self::RelatedSessionMessageRecorded { .. } => "session.related_message.recorded",
+            Self::RelatedSessionMessageResolved { .. } => "session.related_message.resolved",
+            Self::SessionSettingsUpdated { .. } => "session.settings.updated",
+            Self::SessionEnded { .. } => "session.ended",
+            Self::BranchCreated { .. } => "branch.created",
+            Self::BranchActivated { .. } => "branch.activated",
+            Self::BranchSummarized { .. } => "branch.summarized",
+            Self::MessageAppended { .. } => "message.appended",
+            Self::TurnStarted { .. } => "turn.started",
+            Self::TurnInstructionProvenanceRecorded { .. } => "turn.instructions.recorded",
+            Self::TurnContextManifestRecorded { .. } => "turn.context_manifest.recorded",
+            Self::CompletionRequested { .. } => "completion.requested",
+            Self::CompletionChunk { .. } => "completion.chunk",
+            Self::CompletionFinished { .. } => "completion.finished",
+            Self::SessionError { .. } => "session.error",
+            Self::TurnFinished { .. } => "turn.finished",
+            Self::ToolCallRequested { .. } => "tool.call.requested",
+            Self::ToolOperationRecorded { .. } => "tool.operation.recorded",
+            Self::ToolApprovalRequested { .. } => "tool.approval.requested",
+            Self::ToolApprovalResolved { .. } => "tool.approval.resolved",
+            Self::ToolExecutionFinished { .. } => "tool.execution.finished",
+            Self::PlanUpdated { .. } => "plan.updated",
+            Self::BudgetConfigured { .. } => "budget.configured",
+            Self::ContextCompacted { .. } => "context.compacted",
+            Self::BudgetCheckpoint { .. } => "budget.checkpoint",
+            Self::SessionQueuedMessageEnqueued { .. } => "session.queued_message.enqueued",
+            Self::SessionQueuedMessageResolved { .. } => "session.queued_message.resolved",
+            Self::SessionCancelled { .. } => "session.cancelled",
+            Self::SessionCancelCleared { .. } => "session.cancel.cleared",
+            Self::SessionSteered { .. } => "session.steered",
+            Self::SessionSteersResolved { .. } => "session.steers.resolved",
+            Self::OperatorCommandRecorded { .. } => "operator.command.recorded",
+            Self::RawChunkPersisted { .. } => "raw_chunk.persisted",
+        }
+    }
+
+    fn raw_chunk_content_refs(&self) -> BTreeSet<PortableHash> {
+        match self {
+            Self::CompletionChunk {
+                raw_chunk_content_ref: Some(content_hash),
+                ..
+            }
+            | Self::RawChunkPersisted {
+                raw_chunk_content_ref: content_hash,
+                ..
+            } => BTreeSet::from([content_hash.clone()]),
+            _ => BTreeSet::new(),
+        }
+    }
+}
+
+fn raw_chunk_ref(
+    local_chunk_id: i64,
+    raw_chunk_hashes_by_local_id: &HashMap<i64, PortableHash>,
+    label: &str,
+) -> Result<RawChunkEventRef> {
+    let content_hash = raw_chunk_hashes_by_local_id
+        .get(&local_chunk_id)
+        .cloned()
+        .ok_or_else(|| {
+            invalid_bundle(format!(
+                "{label} references missing raw chunk {local_chunk_id}"
+            ))
+        })?;
+    Ok(RawChunkEventRef {
+        local_chunk_id,
+        content_hash,
+    })
+}
+
+fn imported_raw_chunk_id(
+    event_id: EventId,
+    content_hash: &PortableHash,
+    raw_chunk_local_ids_by_ref: &HashMap<RawChunkImportKey, i64>,
+    label: &str,
+) -> Result<i64> {
+    let key = RawChunkImportKey {
+        event_id,
+        content_hash: content_hash.clone(),
+    };
+    raw_chunk_local_ids_by_ref.get(&key).copied().ok_or_else(|| {
+        invalid_bundle(format!(
+            "{label} event {event_id} references raw chunk content {content_hash} that was not imported"
+        ))
+    })
 }
 
 fn build_branch_manifests(
@@ -1681,7 +2298,6 @@ fn validate_event_records(
 ) -> Result<Vec<EventRecordInfo>> {
     let mut infos = Vec::with_capacity(event_records.len());
     let mut event_ids = BTreeSet::new();
-    let raw_chunk_hashes_by_local_id = HashMap::new();
     for (expected_ordinal, record) in event_records.iter().enumerate() {
         let expected_ordinal = expected_ordinal as u64;
         if record.bundle_event_ordinal != expected_ordinal {
@@ -1690,21 +2306,21 @@ fn validate_event_records(
                 expected_ordinal, record.bundle_event_ordinal
             )));
         }
-        let event_hash = canonical_event_hash(&record.event, &raw_chunk_hashes_by_local_id)?;
+        let event_hash = canonical_event_hash(&record.event)?;
         if event_hash != record.event_hash {
             return Err(invalid_bundle(format!(
                 "event {} hash mismatch: expected {}, got {}",
                 record.bundle_event_ordinal, record.event_hash, event_hash
             )));
         }
-        let payload_kind = portable_event_kind(&record.event)?;
+        let payload_kind = record.event.payload.kind();
         if record.event_kind != payload_kind {
             return Err(invalid_bundle(format!(
                 "event {} kind mismatch: declared {}, payload {}",
                 record.bundle_event_ordinal, record.event_kind, payload_kind
             )));
         }
-        let content_refs = raw_chunk_content_refs_in_event(&record.event)?;
+        let content_refs = record.event.payload.raw_chunk_content_refs();
         for content_ref in &content_refs {
             if !manifest_content_hashes.contains(&content_ref) {
                 return Err(invalid_bundle(format!(
@@ -1719,12 +2335,12 @@ fn validate_event_records(
                 )));
             }
         }
-        let event_id = portable_event_id(&record.event)?;
+        let event_id = record.event.event_id;
         if !event_ids.insert(event_id) {
             return Err(invalid_bundle(format!("duplicate event_id {}", event_id)));
         }
-        let event_session_id = portable_session_id(&record.event)?;
-        let branch_id = portable_branch_id(&record.event)?;
+        let event_session_id = record.event.session_id;
+        let branch_id = record.event.branch_id;
         if event_session_id != manifest.session.session_id {
             return Err(invalid_bundle(format!(
                 "event {} belongs to session {}, expected {}",
@@ -1743,247 +2359,11 @@ fn validate_event_records(
     Ok(infos)
 }
 
-fn raw_chunk_content_refs_in_event(value: &Value) -> Result<BTreeSet<PortableHash>> {
-    let mut refs = BTreeSet::new();
-    collect_raw_chunk_content_refs(value, &mut refs)?;
-    Ok(refs)
-}
-
-fn collect_raw_chunk_content_refs(value: &Value, refs: &mut BTreeSet<PortableHash>) -> Result<()> {
-    match value {
-        Value::Object(object) => {
-            for (key, child) in object {
-                if key == "raw_chunk_content_ref" {
-                    let Some(raw_ref) = child.as_str() else {
-                        return Err(invalid_bundle("raw_chunk_content_ref is not a string"));
-                    };
-                    refs.insert(PortableHash::new(raw_ref.to_owned()).map_err(|error| {
-                        invalid_bundle(format!("invalid raw_chunk_content_ref {raw_ref}: {error}"))
-                    })?);
-                }
-                collect_raw_chunk_content_refs(child, refs)?;
-            }
-        }
-        Value::Array(items) => {
-            for child in items {
-                collect_raw_chunk_content_refs(child, refs)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn parse_portable_event_value(value: &Value) -> Result<EventEnvelope> {
-    let mut value = value.clone();
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| invalid_bundle("event record is not an object"))?;
-    object.insert("seq_id".to_owned(), Value::Null);
-    serde_json::from_value(value).map_err(BelltowerError::from)
-}
-
 fn import_event_value(
-    value: &Value,
+    event: &PortableEventEnvelope,
     raw_chunk_local_ids_by_ref: &HashMap<RawChunkImportKey, i64>,
 ) -> Result<EventEnvelope> {
-    let event_id = portable_event_id(value)?;
-    let mut value = value.clone();
-    denormalize_raw_chunk_content_refs(&mut value, event_id, raw_chunk_local_ids_by_ref)?;
-    parse_portable_event_value(&value)
-}
-
-fn denormalize_raw_chunk_content_refs(
-    portable_event: &mut Value,
-    event_id: EventId,
-    raw_chunk_local_ids_by_ref: &HashMap<RawChunkImportKey, i64>,
-) -> Result<()> {
-    let Some(payload) = portable_event
-        .as_object_mut()
-        .and_then(|object| object.get_mut("payload"))
-        .and_then(Value::as_object_mut)
-    else {
-        return Ok(());
-    };
-
-    denormalize_completion_chunk_payload(payload, event_id, raw_chunk_local_ids_by_ref)?;
-    denormalize_raw_chunk_persisted_payload(payload, event_id, raw_chunk_local_ids_by_ref)?;
-    Ok(())
-}
-
-fn denormalize_completion_chunk_payload(
-    payload: &mut Map<String, Value>,
-    event_id: EventId,
-    raw_chunk_local_ids_by_ref: &HashMap<RawChunkImportKey, i64>,
-) -> Result<()> {
-    let Some(chunk) = payload
-        .get_mut("CompletionChunk")
-        .and_then(Value::as_object_mut)
-    else {
-        return Ok(());
-    };
-    if let Some(chunk_id) = take_raw_chunk_content_ref(
-        chunk,
-        event_id,
-        raw_chunk_local_ids_by_ref,
-        "completion chunk",
-    )? {
-        chunk.insert(
-            "raw_chunk_index".to_owned(),
-            Value::Number(serde_json::Number::from(chunk_id)),
-        );
-    }
-    Ok(())
-}
-
-fn denormalize_raw_chunk_persisted_payload(
-    payload: &mut Map<String, Value>,
-    event_id: EventId,
-    raw_chunk_local_ids_by_ref: &HashMap<RawChunkImportKey, i64>,
-) -> Result<()> {
-    let Some(raw) = payload
-        .get_mut("RawChunkPersisted")
-        .and_then(Value::as_object_mut)
-    else {
-        return Ok(());
-    };
-    if let Some(chunk_id) = take_raw_chunk_content_ref(
-        raw,
-        event_id,
-        raw_chunk_local_ids_by_ref,
-        "raw chunk persisted event",
-    )? {
-        raw.insert(
-            "chunk_index".to_owned(),
-            Value::Number(serde_json::Number::from(chunk_id)),
-        );
-    }
-    Ok(())
-}
-
-fn take_raw_chunk_content_ref(
-    object: &mut Map<String, Value>,
-    event_id: EventId,
-    raw_chunk_local_ids_by_ref: &HashMap<RawChunkImportKey, i64>,
-    label: &str,
-) -> Result<Option<i64>> {
-    let Some(value) = object.remove("raw_chunk_content_ref") else {
-        return Ok(None);
-    };
-    let Some(raw_ref) = value.as_str() else {
-        return Err(invalid_bundle(format!(
-            "{label} raw_chunk_content_ref is not a string"
-        )));
-    };
-    let hash = PortableHash::new(raw_ref.to_owned()).map_err(|error| {
-        invalid_bundle(format!("invalid raw_chunk_content_ref {raw_ref}: {error}"))
-    })?;
-    let key = RawChunkImportKey {
-        event_id,
-        content_hash: hash.clone(),
-    };
-    let Some(chunk_id) = raw_chunk_local_ids_by_ref.get(&key).copied() else {
-        return Err(invalid_bundle(format!(
-            "{label} event {event_id} references raw chunk content {hash} that was not imported"
-        )));
-    };
-    Ok(Some(chunk_id))
-}
-
-fn portable_event_id(value: &Value) -> Result<EventId> {
-    let raw_event_id = portable_string_field(value, "event_id")?;
-    raw_event_id.parse().map_err(|error| {
-        invalid_bundle(format!(
-            "portable event has invalid event_id {raw_event_id}: {error}"
-        ))
-    })
-}
-
-fn portable_session_id(value: &Value) -> Result<SessionId> {
-    let raw_session_id = portable_string_field(value, "session_id")?;
-    raw_session_id.parse().map_err(|error| {
-        invalid_bundle(format!(
-            "portable event has invalid session_id {raw_session_id}: {error}"
-        ))
-    })
-}
-
-fn portable_branch_id(value: &Value) -> Result<BranchId> {
-    let raw_branch_id = portable_string_field(value, "branch_id")?;
-    raw_branch_id.parse().map_err(|error| {
-        invalid_bundle(format!(
-            "portable event has invalid branch_id {raw_branch_id}: {error}"
-        ))
-    })
-}
-
-fn portable_event_kind(value: &Value) -> Result<&'static str> {
-    let payload = value
-        .as_object()
-        .and_then(|object| object.get("payload"))
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid_bundle("portable event is missing payload"))?;
-    if payload.len() != 1 {
-        return Err(invalid_bundle(
-            "portable event payload must contain exactly one variant",
-        ));
-    }
-    let variant = payload.keys().next().expect("payload has one key").as_str();
-    let kind = match variant {
-        "SessionStarted" => "session.started",
-        "SessionSpawnRequested" => "session.spawn.requested",
-        "SessionSpawned" => "session.spawned",
-        "SessionHandoffRecorded" => "session.handoff.recorded",
-        "SessionResultImported" => "session.result.imported",
-        "SessionResultRejected" => "session.result.rejected",
-        "RelatedSessionMessageRecorded" => "session.related_message.recorded",
-        "RelatedSessionMessageResolved" => "session.related_message.resolved",
-        "SessionSettingsUpdated" => "session.settings.updated",
-        "SessionEnded" => "session.ended",
-        "BranchCreated" => "branch.created",
-        "BranchActivated" => "branch.activated",
-        "BranchSummarized" => "branch.summarized",
-        "MessageAppended" => "message.appended",
-        "TurnStarted" => "turn.started",
-        "TurnInstructionProvenanceRecorded" => "turn.instructions.recorded",
-        "TurnContextManifestRecorded" => "turn.context_manifest.recorded",
-        "CompletionRequested" => "completion.requested",
-        "CompletionChunk" => "completion.chunk",
-        "CompletionFinished" => "completion.finished",
-        "SessionError" => "session.error",
-        "TurnFinished" => "turn.finished",
-        "ToolCallRequested" => "tool.call.requested",
-        "ToolOperationRecorded" => "tool.operation.recorded",
-        "ToolApprovalRequested" => "tool.approval.requested",
-        "ToolApprovalResolved" => "tool.approval.resolved",
-        "ToolExecutionFinished" => "tool.execution.finished",
-        "PlanUpdated" => "plan.updated",
-        "BudgetConfigured" => "budget.configured",
-        "ContextCompacted" => "context.compacted",
-        "BudgetCheckpoint" => "budget.checkpoint",
-        "SessionQueuedMessageEnqueued" => "session.queued_message.enqueued",
-        "SessionQueuedMessageResolved" => "session.queued_message.resolved",
-        "SessionCancelled" => "session.cancelled",
-        "SessionCancelCleared" => "session.cancel.cleared",
-        "SessionSteered" => "session.steered",
-        "SessionSteersResolved" => "session.steers.resolved",
-        "OperatorCommandRecorded" => "operator.command.recorded",
-        "RawChunkPersisted" => "raw_chunk.persisted",
-        _ => {
-            return Err(invalid_bundle(format!(
-                "unknown event payload variant {variant}"
-            )));
-        }
-    };
-    Ok(kind)
-}
-
-fn portable_string_field<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
-    value
-        .as_object()
-        .and_then(|object| object.get(field))
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_bundle(format!("portable event is missing {field}")))
+    event.to_live(raw_chunk_local_ids_by_ref)
 }
 
 fn validate_raw_chunk_refs(

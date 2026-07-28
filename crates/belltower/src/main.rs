@@ -455,11 +455,12 @@ fn run_session_validate(args: SessionValidateArgs) -> Result<()> {
     let report = validate_session_bundle_directory(&args.bundle)?;
     println!("Valid session bundle {}", args.bundle.display());
     println!(
-        "bundle_hash={} session={} events={} raw_chunks={} contents={} artifacts={}",
+        "bundle_hash={} session={} events={} raw_chunk_references={} raw_chunk_contents={} contents={} artifacts={}",
         report.bundle_hash,
         report.session_id,
         report.event_count,
-        report.raw_chunk_count,
+        report.raw_chunk_reference_count,
+        report.raw_chunk_content_count,
         report.content_count,
         report.artifact_count
     );
@@ -472,12 +473,13 @@ fn run_session_import(args: SessionImportArgs) -> Result<()> {
     let report = store.import_session_bundle_directory(&args.bundle)?;
     println!("Imported session bundle {}", args.bundle.display());
     println!(
-        "bundle_hash={} session={} branches={} events={} raw_chunks={}",
+        "bundle_hash={} session={} branches={} events={} raw_chunk_references={} raw_chunk_contents={}",
         report.bundle_hash,
         report.session_id,
         report.branch_count,
         report.event_count,
-        report.raw_chunk_count
+        report.raw_chunk_reference_count,
+        report.raw_chunk_content_count
     );
     Ok(())
 }

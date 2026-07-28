@@ -343,6 +343,14 @@ Portable-session direction:
 - preserve `event_id`, treat SQLite `seq_id` and raw chunk row ids as local
   debug/display metadata, and validate portable `event_hash` values over
   documented canonical event bytes using `sha256:<lowercase-hex>` hashes
+- keep live and portable event contracts distinct. The live/store
+  `EventEnvelope` schema remains `schema/belltower-event-v1.schema.json`; each
+  `events.jsonl` row is a strict `SessionBundleEventRecord` described by
+  `schema/belltower-portable-event-v1.schema.json`
+- canonicalize through typed portable payloads: omit only explicitly typed
+  store-local sequence refs, rewrite only `CompletionChunk.raw_chunk_index` and
+  `RawChunkPersisted.chunk_index`, and never traverse arbitrary tool arguments,
+  results, or attributes looking for locality-like key names
 - keep `SessionExportResponse { content: String }` for textual/projection
   exports; `session.bt` export/import/validate/diff need distinct
   file/archive-aware protocol and CLI surfaces
@@ -359,7 +367,9 @@ Portable-session direction:
   movement before HTTP archive transport lands.
 - validation is closed: unknown bundle files, unreferenced checksum entries,
   missing checksum paths, malformed branch/event ranges, dangling raw refs, and
-  mismatched branch-head tuples reject before import or sync
+  mismatched branch-head tuples reject before import or sync. Live raw chunk
+  row-id fields and malformed portable locality refs reject during typed
+  `events.jsonl` parsing rather than being treated as live envelopes.
 - import is atomic: a validation-passing bundle that fails during event
   denormalization or append leaves no partial session, branches, events, or raw
   chunks in the destination store
@@ -374,6 +384,11 @@ Portable-session direction:
   needing a circular checksum entry for itself
 - include deterministic `ContentRef` mappings for raw chunks in the first
   bundle schema/export slice, not as a later migration
+- report `raw_chunk_reference_count` separately from
+  `raw_chunk_content_count` in validation, import, and each diff side. Repeated
+  event refs retain their `(event_id, content_hash)` mappings while identical
+  content hashes count once in the unique-content total. The former ambiguous
+  `raw_chunk_count` alias is removed.
 - add `belltower session validate <bundle>` before remote push/pull so external
   readers can verify a bundle offline
 - add `belltower session diff <a> <b>` as the structural review surface for

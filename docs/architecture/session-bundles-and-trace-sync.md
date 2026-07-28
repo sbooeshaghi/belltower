@@ -266,6 +266,45 @@ Excluded from the core bundle:
 Those may be emitted as separate exports or optional caches, but validation and
 import must be able to ignore them.
 
+### Portable Event Wire Contract
+
+The `event` field in each `SessionBundleEventRecord` is a
+`PortableEventEnvelope`, not an `EventEnvelope` with keys removed after generic
+JSON serialization. The contracts are published separately:
+
+- `schema/belltower-event-v1.schema.json` describes the live/store
+  `EventEnvelope`, including `seq_id` and store-local raw chunk row ids.
+- `schema/belltower-portable-event-v1.schema.json` describes one complete
+  `events.jsonl` record, including its strict portable envelope and
+  discriminated portable payload.
+
+The portable DTO omits the envelope `seq_id` and the explicitly typed context
+sequence refs (`ContextManifest.context_boundary_seq_id`,
+`ContextMessageRef.source_seq_id`, and the context-compaction boundary sequence
+fields). Import restores those omitted optional fields as `None`.
+
+Raw chunk canonicalization has exactly two rewrite locations:
+
+- `CompletionChunk.raw_chunk_index` becomes an optional
+  `raw_chunk_content_ref`.
+- `RawChunkPersisted.chunk_index` becomes a required
+  `raw_chunk_content_ref`.
+
+No recursive key deletion or rewriting is allowed. Arbitrary semantic JSON in
+tool arguments, tool results, event attributes, or other value-bearing fields
+must retain keys such as `source_seq_id`, `chunk_index`, `raw_chunk_index`, and
+`raw_chunk_content_ref` unchanged. Validation parses the portable DTO directly
+and rejects live locality fields or malformed portable hashes before import.
+Only import converts a validated portable event into a live `EventEnvelope`
+with destination-store raw chunk row ids.
+
+This strict contract remains `session.bt` schema version 1 because the intended
+v1 wire shape already used `raw_chunk_content_ref`, and omitted optional context
+sequence refs remain valid. The cutover tightens validation and publishes the
+previously missing portable schema; it does not attempt to recover arbitrary
+nested keys already lost by an older recursive exporter. Such bundles must be
+regenerated from their source store when that lost semantic data matters.
+
 ### Legacy `/export legacy-bundle` Surface
 
 The current `/sessions/{session_id}/export/legacy-bundle` endpoint returns a legacy
@@ -311,6 +350,19 @@ example, a raw persistence event and the normalized completion chunk event can
 both refer to one stored provider chunk. Import recreates one local raw chunk per
 bundle `chunk_ordinal` and denormalizes each event ref to that imported local row
 inside the destination SQLite store.
+
+Validation, import, and diff reports distinguish two counts:
+
+- `raw_chunk_reference_count` is the number of event-scoped rows in
+  `raw_chunk_refs.jsonl`.
+- `raw_chunk_content_count` is the number of unique raw content hashes/blobs
+  referenced by those rows.
+
+The former ambiguous `raw_chunk_count` report field is removed. A raw
+persistence event and completion event that
+both refer to one provider chunk therefore report two references and one unique
+raw content blob. The `(event_id, content_hash)` mapping remains mandatory in
+both directions even when references share a `chunk_ordinal` or content hash.
 
 ## Branching Across Bundles
 
@@ -400,6 +452,8 @@ Validation checks:
 - event hashes and hash-chain/hash-tree membership
 - branch heads, branch ordinals, and parent refs resolve to the exact event
   tuple they claim
+- portable event records conform to the portable DTO/schema rather than being
+  accepted as partially rewritten live envelopes
 - raw chunk refs resolve to content blobs and to the branch/event that emitted
   them; every event-level raw chunk content ref must have a matching
   `(event_id, content_hash)` raw chunk ref
@@ -440,7 +494,9 @@ The first local diff implementation classifies bundles by portable event hashes
 and structural inventory rather than by SQLite sequence numbers or raw chunk row
 ids. It reports equivalent bundles, same-lineage updates, fork divergence,
 different lineage, redaction differences, and non-event structural differences
-such as branch/content/artifact inventory drift.
+such as branch/content/artifact inventory drift. Each diff side reports raw
+event-reference and unique raw-content counts separately, so repeated refs do
+not masquerade as distinct content blobs.
 
 ## Remote Sync
 

@@ -823,143 +823,6 @@
       ],
       "type": "string"
     },
-    "ContextManifest": {
-      "additionalProperties": false,
-      "description": "Durable manifest of the context that was made visible to one provider call.\n\nThe manifest intentionally stores references and counts, not full message or\nprompt bodies. Full message content and instruction provenance already live\nin canonical session events; this shape makes the model-visible boundary\nreplayable without duplicating large payloads in every completion event.",
-      "properties": {
-        "attachments": {
-          "items": {
-            "$ref": "#/$defs/ContextAttachment"
-          },
-          "type": "array"
-        },
-        "branch_id": {
-          "format": "uuid",
-          "type": "string"
-        },
-        "compacted": {
-          "type": "boolean"
-        },
-        "context_boundary_seq_id": {
-          "description": "Store-local sequence ref; transport-only, removed from canonical\n(hashed) bytes and from `session.bt` bundle event records.",
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "llm_call_ordinal": {
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "max_tokens": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "messages": {
-          "items": {
-            "$ref": "#/$defs/ContextMessageRef"
-          },
-          "type": "array"
-        },
-        "model": {
-          "type": "string"
-        },
-        "provider": {
-          "type": "string"
-        },
-        "settings_revision_id": {
-          "default": 1,
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "system_prompt": {
-          "$ref": "#/$defs/ContextSystemPromptRef"
-        },
-        "thinking": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ThinkingConfig"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "tools": {
-          "items": {
-            "$ref": "#/$defs/ContextToolRef"
-          },
-          "type": "array"
-        },
-        "turn_id": {
-          "format": "uuid",
-          "type": "string"
-        }
-      },
-      "required": [
-        "turn_id",
-        "branch_id",
-        "llm_call_ordinal",
-        "provider",
-        "model",
-        "system_prompt",
-        "messages",
-        "tools",
-        "compacted"
-      ],
-      "type": "object"
-    },
-    "ContextMessageRef": {
-      "additionalProperties": false,
-      "properties": {
-        "message_id": {
-          "format": "uuid",
-          "type": "string"
-        },
-        "part_count": {
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "role": {
-          "$ref": "#/$defs/Role"
-        },
-        "source_branch_id": {
-          "format": "uuid",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "source_seq_id": {
-          "description": "Store-local sequence ref; transport-only, removed from canonical\n(hashed) bytes and from `session.bt` bundle event records.",
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "visible_text_chars": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "message_id",
-        "role",
-        "part_count",
-        "visible_text_chars"
-      ],
-      "type": "object"
-    },
     "ContextPromptPlacement": {
       "enum": [
         "not_placed",
@@ -1082,8 +945,531 @@
       ],
       "type": "string"
     },
-    "EventPayload": {
-      "description": "Externally tagged canonical event payload union: exactly one key naming\nthe variant (for example `{\"SessionStarted\": {...}}`). The serialized\nevent kind strings (`session.started`, ...) are derived labels, not the\nserde tag.",
+    "InstructionDocument": {
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "title",
+        "body"
+      ],
+      "type": "object"
+    },
+    "Message": {
+      "additionalProperties": false,
+      "properties": {
+        "created_at": {
+          "description": "Timestamp in the `time` crate's default serde representation: [year, day_of_year, hour, minute, second, nanosecond, offset_hour, offset_minute, offset_second].",
+          "items": false,
+          "maxItems": 9,
+          "minItems": 9,
+          "prefixItems": [
+            {
+              "description": "calendar year",
+              "maximum": 9999,
+              "minimum": -9999,
+              "type": "integer"
+            },
+            {
+              "description": "ordinal day of the year",
+              "maximum": 366,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "description": "hour",
+              "maximum": 23,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "minute",
+              "maximum": 59,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "second",
+              "maximum": 59,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "nanosecond",
+              "maximum": 999999999,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset hours",
+              "maximum": 25,
+              "minimum": -25,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset minutes",
+              "maximum": 59,
+              "minimum": -59,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset seconds",
+              "maximum": 59,
+              "minimum": -59,
+              "type": "integer"
+            }
+          ],
+          "type": "array"
+        },
+        "message_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "parts": {
+          "items": {
+            "$ref": "#/$defs/MessagePart"
+          },
+          "type": "array"
+        },
+        "role": {
+          "$ref": "#/$defs/Role"
+        }
+      },
+      "required": [
+        "message_id",
+        "role",
+        "parts",
+        "created_at"
+      ],
+      "type": "object"
+    },
+    "MessagePart": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Text": {
+              "additionalProperties": false,
+              "properties": {
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "text"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "Text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Reasoning": {
+              "additionalProperties": false,
+              "properties": {
+                "opaque_replay": true,
+                "redacted": {
+                  "type": "boolean"
+                },
+                "text": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "redacted"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "Reasoning"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "ToolCall": {
+              "additionalProperties": false,
+              "properties": {
+                "call": {
+                  "$ref": "#/$defs/ToolCall"
+                }
+              },
+              "required": [
+                "call"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "ToolCall"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "ToolResult": {
+              "additionalProperties": false,
+              "properties": {
+                "result": {
+                  "$ref": "#/$defs/ToolResultEnvelope"
+                }
+              },
+              "required": [
+                "result"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "ToolResult"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Refusal": {
+              "additionalProperties": false,
+              "properties": {
+                "opaque_metadata": true,
+                "provider_reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "text": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "Refusal"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Structured": {
+              "additionalProperties": false,
+              "properties": {
+                "schema_name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "value": true
+              },
+              "required": [
+                "value"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "Structured"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PlanItem": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/PlanStatus"
+        }
+      },
+      "required": [
+        "id",
+        "content",
+        "status"
+      ],
+      "type": "object"
+    },
+    "PlanStatus": {
+      "enum": [
+        "pending",
+        "in_progress",
+        "completed",
+        "blocked"
+      ],
+      "type": "string"
+    },
+    "PortableContextManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "attachments": {
+          "items": {
+            "$ref": "#/$defs/ContextAttachment"
+          },
+          "type": "array"
+        },
+        "branch_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "compacted": {
+          "type": "boolean"
+        },
+        "llm_call_ordinal": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "messages": {
+          "items": {
+            "$ref": "#/$defs/PortableContextMessageRef"
+          },
+          "type": "array"
+        },
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "settings_revision_id": {
+          "default": 1,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "system_prompt": {
+          "$ref": "#/$defs/ContextSystemPromptRef"
+        },
+        "thinking": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThinkingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/$defs/ContextToolRef"
+          },
+          "type": "array"
+        },
+        "turn_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "turn_id",
+        "branch_id",
+        "llm_call_ordinal",
+        "provider",
+        "model",
+        "system_prompt",
+        "messages",
+        "tools",
+        "compacted"
+      ],
+      "type": "object"
+    },
+    "PortableContextMessageRef": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "part_count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "role": {
+          "$ref": "#/$defs/Role"
+        },
+        "source_branch_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "visible_text_chars": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "message_id",
+        "role",
+        "part_count",
+        "visible_text_chars"
+      ],
+      "type": "object"
+    },
+    "PortableEventEnvelope": {
+      "additionalProperties": false,
+      "properties": {
+        "attributes": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "branch_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "event_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "occurred_at": {
+          "description": "Timestamp in the `time` crate's default serde representation: [year, day_of_year, hour, minute, second, nanosecond, offset_hour, offset_minute, offset_second].",
+          "items": false,
+          "maxItems": 9,
+          "minItems": 9,
+          "prefixItems": [
+            {
+              "description": "calendar year",
+              "maximum": 9999,
+              "minimum": -9999,
+              "type": "integer"
+            },
+            {
+              "description": "ordinal day of the year",
+              "maximum": 366,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "description": "hour",
+              "maximum": 23,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "minute",
+              "maximum": 59,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "second",
+              "maximum": 59,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "nanosecond",
+              "maximum": 999999999,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset hours",
+              "maximum": 25,
+              "minimum": -25,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset minutes",
+              "maximum": 59,
+              "minimum": -59,
+              "type": "integer"
+            },
+            {
+              "description": "UTC offset seconds",
+              "maximum": 59,
+              "minimum": -59,
+              "type": "integer"
+            }
+          ],
+          "type": "array"
+        },
+        "parent_span_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload": {
+          "$ref": "#/$defs/PortableEventPayload"
+        },
+        "session_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "span_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "span_kind": {
+          "$ref": "#/$defs/SpanKind"
+        },
+        "turn_id": {
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "event_id",
+        "session_id",
+        "branch_id",
+        "span_id",
+        "span_kind",
+        "occurred_at",
+        "payload",
+        "attributes"
+      ],
+      "type": "object"
+    },
+    "PortableEventPayload": {
       "oneOf": [
         {
           "additionalProperties": false,
@@ -1594,7 +1980,7 @@
               "additionalProperties": false,
               "properties": {
                 "manifest": {
-                  "$ref": "#/$defs/ContextManifest"
+                  "$ref": "#/$defs/PortableContextManifest"
                 }
               },
               "required": [
@@ -1647,7 +2033,6 @@
         },
         {
           "additionalProperties": false,
-          "description": "Live/store shape. In `session.bt` bundle event records the\nstore-local `raw_chunk_index` is replaced by a portable\n`raw_chunk_content_ref` string (`sha256:<hex>`).",
           "properties": {
             "CompletionChunk": {
               "additionalProperties": false,
@@ -1666,12 +2051,14 @@
                     "null"
                   ]
                 },
-                "raw_chunk_index": {
-                  "description": "Store-local raw chunk row id; transport-only. Removed from\ncanonical (hashed) bytes and replaced by\n`raw_chunk_content_ref` in bundles.",
-                  "format": "int64",
-                  "type": [
-                    "integer",
-                    "null"
+                "raw_chunk_content_ref": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/PortableHash"
+                    },
+                    {
+                      "type": "null"
+                    }
                   ]
                 }
               },
@@ -2042,14 +2429,6 @@
                   "format": "uuid",
                   "type": "string"
                 },
-                "context_boundary_seq_id": {
-                  "description": "Store-local sequence ref; transport-only, removed from canonical\n(hashed) bytes and from `session.bt` bundle event records.",
-                  "format": "int64",
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
-                },
                 "files_modified": {
                   "items": {
                     "type": "string"
@@ -2063,7 +2442,6 @@
                   "type": "array"
                 },
                 "first_compaction_id": {
-                  "description": "`compaction_id` of the first `context.compacted` event in this\nbranch's window chain (self-referential for the first window).",
                   "format": "uuid",
                   "type": [
                     "string",
@@ -2081,14 +2459,6 @@
                   "format": "uuid",
                   "type": [
                     "string",
-                    "null"
-                  ]
-                },
-                "first_kept_seq_id": {
-                  "description": "Store-local sequence ref; transport-only, removed from canonical\n(hashed) bytes and from `session.bt` bundle event records.",
-                  "format": "int64",
-                  "type": [
-                    "integer",
                     "null"
                   ]
                 },
@@ -2121,7 +2491,6 @@
                   "default": "pre_turn"
                 },
                 "previous_compaction_id": {
-                  "description": "`compaction_id` of the previous `context.compacted` event on this\nbranch, forming the window chain.",
                   "format": "uuid",
                   "type": [
                     "string",
@@ -2170,7 +2539,6 @@
                   "default": "token_budget"
                 },
                 "window_number": {
-                  "description": "1-based compaction window ordinal on this branch: how many\ncompactions (including this one) have been recorded on the branch.",
                   "format": "uint64",
                   "minimum": 0,
                   "type": [
@@ -2441,16 +2809,10 @@
         },
         {
           "additionalProperties": false,
-          "description": "Live/store shape. In `session.bt` bundle event records the\nstore-local `chunk_index` is replaced by a portable\n`raw_chunk_content_ref` string (`sha256:<hex>`).",
           "properties": {
             "RawChunkPersisted": {
               "additionalProperties": false,
               "properties": {
-                "chunk_index": {
-                  "description": "Store-local raw chunk row id; transport-only. Removed from\ncanonical (hashed) bytes and replaced by\n`raw_chunk_content_ref` in bundles.",
-                  "format": "int64",
-                  "type": "integer"
-                },
                 "llm_call_ordinal": {
                   "format": "uint32",
                   "minimum": 0,
@@ -2462,13 +2824,16 @@
                 "provider": {
                   "type": "string"
                 },
+                "raw_chunk_content_ref": {
+                  "$ref": "#/$defs/PortableHash"
+                },
                 "stream": {
                   "type": "string"
                 }
               },
               "required": [
                 "provider",
-                "chunk_index",
+                "raw_chunk_content_ref",
                 "stream"
               ],
               "type": "object"
@@ -2481,289 +2846,9 @@
         }
       ]
     },
-    "InstructionDocument": {
-      "additionalProperties": false,
-      "properties": {
-        "body": {
-          "type": "string"
-        },
-        "source": {
-          "type": "string"
-        },
-        "title": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "source",
-        "title",
-        "body"
-      ],
-      "type": "object"
-    },
-    "Message": {
-      "additionalProperties": false,
-      "properties": {
-        "created_at": {
-          "description": "Timestamp in the `time` crate's default serde representation: [year, day_of_year, hour, minute, second, nanosecond, offset_hour, offset_minute, offset_second].",
-          "items": false,
-          "maxItems": 9,
-          "minItems": 9,
-          "prefixItems": [
-            {
-              "description": "calendar year",
-              "maximum": 9999,
-              "minimum": -9999,
-              "type": "integer"
-            },
-            {
-              "description": "ordinal day of the year",
-              "maximum": 366,
-              "minimum": 1,
-              "type": "integer"
-            },
-            {
-              "description": "hour",
-              "maximum": 23,
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "description": "minute",
-              "maximum": 59,
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "description": "second",
-              "maximum": 59,
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "description": "nanosecond",
-              "maximum": 999999999,
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "description": "UTC offset hours",
-              "maximum": 25,
-              "minimum": -25,
-              "type": "integer"
-            },
-            {
-              "description": "UTC offset minutes",
-              "maximum": 59,
-              "minimum": -59,
-              "type": "integer"
-            },
-            {
-              "description": "UTC offset seconds",
-              "maximum": 59,
-              "minimum": -59,
-              "type": "integer"
-            }
-          ],
-          "type": "array"
-        },
-        "message_id": {
-          "format": "uuid",
-          "type": "string"
-        },
-        "parts": {
-          "items": {
-            "$ref": "#/$defs/MessagePart"
-          },
-          "type": "array"
-        },
-        "role": {
-          "$ref": "#/$defs/Role"
-        }
-      },
-      "required": [
-        "message_id",
-        "role",
-        "parts",
-        "created_at"
-      ],
-      "type": "object"
-    },
-    "MessagePart": {
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "Text": {
-              "additionalProperties": false,
-              "properties": {
-                "text": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "text"
-              ],
-              "type": "object"
-            }
-          },
-          "required": [
-            "Text"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "Reasoning": {
-              "additionalProperties": false,
-              "properties": {
-                "opaque_replay": true,
-                "redacted": {
-                  "type": "boolean"
-                },
-                "text": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                }
-              },
-              "required": [
-                "redacted"
-              ],
-              "type": "object"
-            }
-          },
-          "required": [
-            "Reasoning"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "ToolCall": {
-              "additionalProperties": false,
-              "properties": {
-                "call": {
-                  "$ref": "#/$defs/ToolCall"
-                }
-              },
-              "required": [
-                "call"
-              ],
-              "type": "object"
-            }
-          },
-          "required": [
-            "ToolCall"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "ToolResult": {
-              "additionalProperties": false,
-              "properties": {
-                "result": {
-                  "$ref": "#/$defs/ToolResultEnvelope"
-                }
-              },
-              "required": [
-                "result"
-              ],
-              "type": "object"
-            }
-          },
-          "required": [
-            "ToolResult"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "Refusal": {
-              "additionalProperties": false,
-              "properties": {
-                "opaque_metadata": true,
-                "provider_reason": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "text": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                }
-              },
-              "type": "object"
-            }
-          },
-          "required": [
-            "Refusal"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "Structured": {
-              "additionalProperties": false,
-              "properties": {
-                "schema_name": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "value": true
-              },
-              "required": [
-                "value"
-              ],
-              "type": "object"
-            }
-          },
-          "required": [
-            "Structured"
-          ],
-          "type": "object"
-        }
-      ]
-    },
-    "PlanItem": {
-      "additionalProperties": false,
-      "properties": {
-        "content": {
-          "type": "string"
-        },
-        "id": {
-          "type": "string"
-        },
-        "status": {
-          "$ref": "#/$defs/PlanStatus"
-        }
-      },
-      "required": [
-        "id",
-        "content",
-        "status"
-      ],
-      "type": "object"
-    },
-    "PlanStatus": {
-      "enum": [
-        "pending",
-        "in_progress",
-        "completed",
-        "blocked"
-      ],
+    "PortableHash": {
+      "description": "Portable content hash: `sha256:` followed by 64 lowercase hex characters.",
+      "pattern": "^sha256:[0-9a-f]{64}$",
       "type": "string"
     },
     "QueuedMessageResolutionOutcome": {
@@ -3305,133 +3390,32 @@
       "type": "string"
     }
   },
-  "$id": "https://belltower.dev/schemas/belltower-event/v1.json",
+  "$id": "https://belltower.dev/schemas/belltower-portable-event/v1.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "description": "Canonical live/store Belltower session event envelope, exactly as serialized from bt_core::EventEnvelope. This shape is served verbatim by the live event API (GET /sessions/{session_id}/events, with the store-assigned seq_id populated). It is not the session.bt portable event contract; portable event records have a separately generated schema.",
+  "description": "One events.jsonl record in a schema_version 1 session.bt bundle, exactly as serialized from bt_session::SessionBundleEventRecord. The nested portable event omits the live envelope seq_id and typed store-local context sequence refs. Only the typed raw-chunk locality fields are rewritten: CompletionChunk.raw_chunk_index and RawChunkPersisted.chunk_index become raw_chunk_content_ref values. Arbitrary JSON in semantic fields such as tool arguments and event attributes is preserved and is never traversed for locality-looking key names. event_hash covers the compact, recursively key-sorted JSON form of the nested portable event.",
   "properties": {
-    "attributes": {
-      "additionalProperties": true,
-      "type": "object"
+    "bundle_event_ordinal": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
     },
-    "branch_id": {
-      "format": "uuid",
+    "event": {
+      "$ref": "#/$defs/PortableEventEnvelope"
+    },
+    "event_hash": {
+      "$ref": "#/$defs/PortableHash"
+    },
+    "event_kind": {
       "type": "string"
-    },
-    "event_id": {
-      "format": "uuid",
-      "type": "string"
-    },
-    "occurred_at": {
-      "description": "Timestamp in the `time` crate's default serde representation: [year, day_of_year, hour, minute, second, nanosecond, offset_hour, offset_minute, offset_second].",
-      "items": false,
-      "maxItems": 9,
-      "minItems": 9,
-      "prefixItems": [
-        {
-          "description": "calendar year",
-          "maximum": 9999,
-          "minimum": -9999,
-          "type": "integer"
-        },
-        {
-          "description": "ordinal day of the year",
-          "maximum": 366,
-          "minimum": 1,
-          "type": "integer"
-        },
-        {
-          "description": "hour",
-          "maximum": 23,
-          "minimum": 0,
-          "type": "integer"
-        },
-        {
-          "description": "minute",
-          "maximum": 59,
-          "minimum": 0,
-          "type": "integer"
-        },
-        {
-          "description": "second",
-          "maximum": 59,
-          "minimum": 0,
-          "type": "integer"
-        },
-        {
-          "description": "nanosecond",
-          "maximum": 999999999,
-          "minimum": 0,
-          "type": "integer"
-        },
-        {
-          "description": "UTC offset hours",
-          "maximum": 25,
-          "minimum": -25,
-          "type": "integer"
-        },
-        {
-          "description": "UTC offset minutes",
-          "maximum": 59,
-          "minimum": -59,
-          "type": "integer"
-        },
-        {
-          "description": "UTC offset seconds",
-          "maximum": 59,
-          "minimum": -59,
-          "type": "integer"
-        }
-      ],
-      "type": "array"
-    },
-    "parent_span_id": {
-      "format": "uuid",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "payload": {
-      "$ref": "#/$defs/EventPayload"
-    },
-    "seq_id": {
-      "description": "Store sequence id; transport-only. Present (possibly `null`) on the\nlive event API, absent from `session.bt` bundle event records, and\nexcluded from the canonical bytes that `event_hash` covers.",
-      "format": "int64",
-      "type": [
-        "integer",
-        "null"
-      ]
-    },
-    "session_id": {
-      "format": "uuid",
-      "type": "string"
-    },
-    "span_id": {
-      "format": "uuid",
-      "type": "string"
-    },
-    "span_kind": {
-      "$ref": "#/$defs/SpanKind"
-    },
-    "turn_id": {
-      "format": "uuid",
-      "type": [
-        "string",
-        "null"
-      ]
     }
   },
   "required": [
-    "event_id",
-    "session_id",
-    "branch_id",
-    "span_id",
-    "span_kind",
-    "occurred_at",
-    "payload",
-    "attributes"
+    "bundle_event_ordinal",
+    "event_kind",
+    "event_hash",
+    "event"
   ],
-  "title": "Belltower canonical event envelope v1",
+  "title": "Belltower portable bundle event record v1",
   "type": "object"
 }

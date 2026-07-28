@@ -2,7 +2,7 @@
 
 use super::{ContinuationClaim, ResumedContinuationKind, SessionTurnAdmission, SqliteSessionStore};
 use crate::{
-    LEGACY_SESSION_EXPORT_BUNDLE_SCHEMA_VERSION, LegacySessionExporter,
+    LEGACY_SESSION_EXPORT_BUNDLE_SCHEMA_VERSION, LegacySessionExporter, PortableEventPayload,
     PortableSessionBundleExporter, PortableSessionBundleImporter, SESSION_BT_ARTIFACTS_DIR,
     SESSION_BT_CHECKSUMS, SESSION_BT_EVENTS, SESSION_BT_MANIFEST, SESSION_BT_PARENT_NODE_REF_ATTR,
     SESSION_BT_RAW_CHUNK_REFS, SessionBundleArtifactInput, SessionBundleDiffRelationship,
@@ -3943,7 +3943,8 @@ fn portable_bundle_round_trips_completion_chunk_with_null_raw_chunk_index() {
 
     let report = validate_session_bundle_directory(bundle_dir.path()).expect("validate bundle");
     assert_eq!(report.session_id, session.session_id);
-    assert_eq!(report.raw_chunk_count, 0);
+    assert_eq!(report.raw_chunk_reference_count, 0);
+    assert_eq!(report.raw_chunk_content_count, 0);
 
     let import_file = NamedTempFile::new().expect("import tempfile");
     let mut import_store = SqliteSessionStore::open(import_file.path()).expect("import store");
@@ -3969,7 +3970,8 @@ fn portable_session_bundle_exports_and_validates_offline() {
     let report = validate_session_bundle_directory(bundle_dir.path()).expect("validate bundle");
     assert_eq!(report.session_id, session_id);
     assert_eq!(report.event_count, 4);
-    assert_eq!(report.raw_chunk_count, 1);
+    assert_eq!(report.raw_chunk_reference_count, 1);
+    assert_eq!(report.raw_chunk_content_count, 1);
     assert_eq!(report.content_count, 1);
 
     let manifest_path = bundle_dir.path().join("manifest.json");
@@ -4002,6 +4004,86 @@ fn portable_session_bundle_exports_and_validates_offline() {
 }
 
 #[test]
+fn portable_session_bundle_preserves_semantic_nested_locality_keys() {
+    let mut source = SqliteSessionStore::open_in_memory().expect("source store");
+    let (session, branch) = sample_session();
+    source
+        .create_session(&session, &branch)
+        .expect("create session");
+    let arguments = serde_json::json!({
+        "source_seq_id": 11,
+        "chunk_index": 12,
+        "raw_chunk_index": 13,
+        "raw_chunk_content_ref": "semantic-tool-value",
+        "nested": {
+            "context_boundary_seq_id": 14,
+            "first_kept_seq_id": 15,
+            "requested_seq_id": 16,
+            "completed_seq_id": 17
+        }
+    });
+    source
+        .append_event(
+            &EventEnvelope::new(
+                session.session_id,
+                branch.branch_id,
+                SpanKind::Tool,
+                EventPayload::ToolCallRequested {
+                    call_id: ToolCallId::new("semantic-locality-call"),
+                    tool_name: "semantic_locality_keys".to_owned(),
+                    arguments: arguments.clone(),
+                },
+            )
+            .with_attribute("semantic.locality", arguments.clone()),
+        )
+        .expect("append tool call");
+
+    let bundle_dir = tempdir().expect("bundle dir");
+    source
+        .export_session_bundle_directory(session.session_id, bundle_dir.path())
+        .expect("export bundle");
+    let validation = validate_session_bundle_directory(bundle_dir.path()).expect("validate bundle");
+    assert_eq!(validation.raw_chunk_reference_count, 0);
+    assert_eq!(validation.raw_chunk_content_count, 0);
+
+    let record = fs::read_to_string(bundle_dir.path().join(SESSION_BT_EVENTS))
+        .expect("events jsonl")
+        .lines()
+        .next()
+        .map(|line| serde_json::from_str::<SessionBundleEventRecord>(line).expect("event record"))
+        .expect("tool event");
+    let PortableEventPayload::ToolCallRequested {
+        arguments: portable_arguments,
+        ..
+    } = &record.event.payload
+    else {
+        panic!("expected portable tool call");
+    };
+    assert_eq!(portable_arguments, &arguments);
+    assert_eq!(record.event.attributes["semantic.locality"], arguments);
+
+    let mut imported = SqliteSessionStore::open_in_memory().expect("import store");
+    imported
+        .import_session_bundle_directory(bundle_dir.path())
+        .expect("import bundle");
+    let imported_event = imported
+        .load_all_events(session.session_id)
+        .expect("imported events")
+        .into_iter()
+        .next()
+        .expect("imported tool event");
+    let EventPayload::ToolCallRequested {
+        arguments: imported_arguments,
+        ..
+    } = imported_event.payload
+    else {
+        panic!("expected imported tool call");
+    };
+    assert_eq!(imported_arguments, arguments);
+    assert_eq!(imported_event.attributes["semantic.locality"], arguments);
+}
+
+#[test]
 fn portable_session_bundle_import_round_trips_canonical_evidence() {
     let (bundle_dir, session_id) = export_portable_bundle_fixture();
     let original_event_hashes = bundle_event_hashes(bundle_dir.path());
@@ -4013,7 +4095,8 @@ fn portable_session_bundle_import_round_trips_canonical_evidence() {
     assert_eq!(report.session_id, session_id);
     assert_eq!(report.branch_count, 1);
     assert_eq!(report.event_count, 4);
-    assert_eq!(report.raw_chunk_count, 1);
+    assert_eq!(report.raw_chunk_reference_count, 1);
+    assert_eq!(report.raw_chunk_content_count, 1);
 
     let loaded_session = imported
         .load_session(session_id)
@@ -4192,31 +4275,22 @@ fn portable_session_bundle_validation_rejects_untracked_bundle_files() {
 }
 
 #[test]
-fn portable_session_bundle_import_rolls_back_when_event_denormalization_fails() {
+fn portable_session_bundle_rejects_malformed_event_before_import() {
     let (bundle_dir, session_id) = export_portable_bundle_fixture();
     let events_path = bundle_dir.path().join(SESSION_BT_EVENTS);
     let mut event_records = fs::read_to_string(&events_path)
         .expect("events jsonl")
         .lines()
-        .map(|line| serde_json::from_str::<SessionBundleEventRecord>(line).expect("event record"))
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event record"))
         .collect::<Vec<_>>();
     let completion = event_records
         .iter_mut()
-        .find(|record| record.event_kind == "completion.chunk")
+        .find(|record| record["event_kind"] == "completion.chunk")
         .expect("completion chunk event");
-    let completion_event_id: bt_core::EventId = completion.event["event_id"]
-        .as_str()
-        .expect("completion event id")
-        .parse()
-        .expect("parse completion event id");
-    let old_completion_event_hash = completion.event_hash.clone();
-    completion.event["payload"]["CompletionChunk"]
+    completion["event"]["payload"]["CompletionChunk"]
         .as_object_mut()
         .expect("completion chunk payload")
         .remove("deltas");
-    completion.event_hash =
-        test_hash_bytes(&serde_json::to_vec(&completion.event).expect("event bytes"));
-    let completion_event_hash = completion.event_hash.clone();
     let event_lines = event_records
         .iter()
         .map(|record| serde_json::to_string(record).expect("event record json"))
@@ -4225,39 +4299,17 @@ fn portable_session_bundle_import_rolls_back_when_event_denormalization_fails() 
     fs::write(&events_path, format!("{event_lines}\n")).expect("write events");
     refresh_bundle_checksum_for_path(bundle_dir.path(), SESSION_BT_EVENTS);
 
-    let manifest_path = bundle_dir.path().join(SESSION_BT_MANIFEST);
-    let mut manifest: SessionBundleManifest =
-        serde_json::from_slice(&fs::read(&manifest_path).expect("manifest bytes"))
-            .expect("manifest json");
-    let bundle_hash = manifest.bundle_hash.clone();
-    for branch in &mut manifest.branches {
-        if let Some(head) = &mut branch.head {
-            head.bundle_hash = Some(bundle_hash.clone());
-            if head.event_id == completion_event_id {
-                head.event_hash = completion_event_hash.clone();
-            }
-        }
-    }
-    for range in &mut manifest.event_ranges {
-        if range.first_event_hash == old_completion_event_hash {
-            range.first_event_hash = completion_event_hash.clone();
-        }
-        if range.last_event_hash == old_completion_event_hash {
-            range.last_event_hash = completion_event_hash.clone();
-        }
-    }
-    fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&manifest).expect("manifest bytes"),
-    )
-    .expect("write manifest");
-
-    validate_session_bundle_directory(bundle_dir.path()).expect("validation still passes");
+    let validation_error =
+        validate_session_bundle_directory(bundle_dir.path()).expect_err("validation must fail");
+    assert!(
+        validation_error.to_string().contains("deltas"),
+        "{validation_error}"
+    );
 
     let mut store = SqliteSessionStore::open_in_memory().expect("store");
     let error = store
         .import_session_bundle_directory(bundle_dir.path())
-        .expect_err("import should fail during event denormalization");
+        .expect_err("import should fail during validation");
     assert!(
         error.to_string().contains("missing field") || error.to_string().contains("deltas"),
         "{error}"
@@ -4265,9 +4317,9 @@ fn portable_session_bundle_import_rolls_back_when_event_denormalization_fails() 
     assert!(
         store
             .load_session(session_id)
-            .expect("load rolled-back session")
+            .expect("load rejected session")
             .is_none(),
-        "failed import must not leave a partial session behind"
+        "validation failure must not leave a partial session behind"
     );
 }
 
@@ -4295,8 +4347,10 @@ fn portable_session_bundle_continue_rejects_existing_parent_hash_mismatch() {
         created_at: manifest.session.created_at,
         is_default: true,
     };
-    let mut local_event: EventEnvelope =
-        serde_json::from_value(first_record.event.clone()).expect("parse event");
+    let mut local_event: EventEnvelope = serde_json::from_value(
+        serde_json::to_value(&first_record.event).expect("portable event value"),
+    )
+    .expect("parse event");
     local_event.payload = EventPayload::MessageAppended {
         message: Message::text(Role::Assistant, "same event id, different payload"),
     };
@@ -4377,7 +4431,8 @@ fn portable_session_bundle_exports_explicit_artifact_refs() {
 
     let report = validate_session_bundle_directory(bundle_dir.path()).expect("validate bundle");
     assert_eq!(report.event_count, 1);
-    assert_eq!(report.raw_chunk_count, 0);
+    assert_eq!(report.raw_chunk_reference_count, 0);
+    assert_eq!(report.raw_chunk_content_count, 0);
     assert_eq!(report.artifact_count, 1);
 }
 
@@ -4655,6 +4710,38 @@ fn portable_session_bundle_validation_rejects_tampered_events() {
 }
 
 #[test]
+fn portable_session_bundle_validation_rejects_completion_local_row_id() {
+    let (bundle_dir, _) = export_portable_bundle_fixture();
+    insert_live_locality_field(
+        bundle_dir.path(),
+        "completion.chunk",
+        "CompletionChunk",
+        "raw_chunk_index",
+    );
+
+    let error = validate_session_bundle_directory(bundle_dir.path()).expect_err("invalid bundle");
+    let message = error.to_string();
+    assert!(message.contains("event records line"), "{message}");
+    assert!(message.contains("raw_chunk_index"), "{message}");
+}
+
+#[test]
+fn portable_session_bundle_validation_rejects_raw_persisted_local_row_id() {
+    let (bundle_dir, _) = export_raw_chunk_persisted_bundle_fixture();
+    insert_live_locality_field(
+        bundle_dir.path(),
+        "raw_chunk.persisted",
+        "RawChunkPersisted",
+        "chunk_index",
+    );
+
+    let error = validate_session_bundle_directory(bundle_dir.path()).expect_err("invalid bundle");
+    let message = error.to_string();
+    assert!(message.contains("event records line"), "{message}");
+    assert!(message.contains("chunk_index"), "{message}");
+}
+
+#[test]
 fn portable_session_bundle_validation_rejects_missing_raw_chunk_content() {
     let (bundle_dir, _) = export_portable_bundle_fixture();
     let raw_refs =
@@ -4908,7 +4995,15 @@ fn portable_session_bundle_import_preserves_one_raw_chunk_referenced_by_multiple
     reopened
         .export_session_bundle_directory(session.session_id, bundle_dir.path())
         .expect("export portable bundle");
-    validate_session_bundle_directory(bundle_dir.path()).expect("validate bundle");
+    let validation = validate_session_bundle_directory(bundle_dir.path()).expect("validate bundle");
+    assert_eq!(validation.raw_chunk_reference_count, 2);
+    assert_eq!(validation.raw_chunk_content_count, 1);
+    let diff = diff_session_bundle_directories(bundle_dir.path(), bundle_dir.path())
+        .expect("diff bundle with itself");
+    assert_eq!(diff.left.raw_chunk_reference_count, 2);
+    assert_eq!(diff.left.raw_chunk_content_count, 1);
+    assert_eq!(diff.right.raw_chunk_reference_count, 2);
+    assert_eq!(diff.right.raw_chunk_content_count, 1);
 
     let raw_refs = fs::read_to_string(bundle_dir.path().join(SESSION_BT_RAW_CHUNK_REFS))
         .expect("raw refs")
@@ -4936,9 +5031,11 @@ fn portable_session_bundle_import_preserves_one_raw_chunk_referenced_by_multiple
     );
 
     let mut imported = SqliteSessionStore::open_in_memory().expect("import store");
-    imported
+    let import_report = imported
         .import_session_bundle_directory(bundle_dir.path())
         .expect("import bundle");
+    assert_eq!(import_report.raw_chunk_reference_count, 2);
+    assert_eq!(import_report.raw_chunk_content_count, 1);
     let raw_chunks = imported
         .load_all_raw_chunks(session.session_id)
         .expect("raw chunks");
@@ -5160,6 +5257,35 @@ fn refresh_bundle_checksum_for_path(bundle_dir: &std::path::Path, relative_path:
     .expect("write manifest");
 }
 
+fn insert_live_locality_field(
+    bundle_dir: &std::path::Path,
+    event_kind: &str,
+    variant: &str,
+    field: &str,
+) {
+    let events_path = bundle_dir.join(SESSION_BT_EVENTS);
+    let mut records = fs::read_to_string(&events_path)
+        .expect("events jsonl")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event record"))
+        .collect::<Vec<_>>();
+    let record = records
+        .iter_mut()
+        .find(|record| record["event_kind"] == event_kind)
+        .expect("target event");
+    record["event"]["payload"][variant]
+        .as_object_mut()
+        .expect("portable payload")
+        .insert(field.to_owned(), serde_json::json!(123));
+    let jsonl = records
+        .iter()
+        .map(|record| serde_json::to_string(record).expect("event record json"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&events_path, format!("{jsonl}\n")).expect("write events");
+    refresh_bundle_checksum_for_path(bundle_dir, SESSION_BT_EVENTS);
+}
+
 fn bundle_event_hashes(bundle_dir: &std::path::Path) -> Vec<PortableHash> {
     fs::read_to_string(bundle_dir.join(SESSION_BT_EVENTS))
         .expect("events jsonl")
@@ -5225,6 +5351,44 @@ fn export_portable_bundle_fixture() -> (tempfile::TempDir, bt_core::SessionId) {
     let reopened = SqliteSessionStore::open(file.path()).expect("reopen store");
     let bundle_dir = tempdir().expect("bundle dir");
     reopened
+        .export_session_bundle_directory(session.session_id, bundle_dir.path())
+        .expect("export portable bundle");
+    (bundle_dir, session.session_id)
+}
+
+fn export_raw_chunk_persisted_bundle_fixture() -> (tempfile::TempDir, bt_core::SessionId) {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (session, branch) = sample_session();
+    store
+        .create_session(&session, &branch)
+        .expect("create session");
+    store
+        .append_raw_chunk_with_event(
+            session.session_id,
+            branch.branch_id,
+            None,
+            Some(1),
+            "openai-compatible",
+            "completion",
+            b"raw-persisted-bytes",
+            |chunk_id| {
+                Ok(EventEnvelope::new(
+                    session.session_id,
+                    branch.branch_id,
+                    SpanKind::Llm,
+                    EventPayload::RawChunkPersisted {
+                        provider: "openai-compatible".to_owned(),
+                        chunk_index: chunk_id,
+                        stream: "completion".to_owned(),
+                        llm_call_ordinal: Some(1),
+                    },
+                ))
+            },
+        )
+        .expect("append raw persisted event");
+
+    let bundle_dir = tempdir().expect("bundle dir");
+    store
         .export_session_bundle_directory(session.session_id, bundle_dir.path())
         .expect("export portable bundle");
     (bundle_dir, session.session_id)
@@ -7116,20 +7280,15 @@ fn continuous_export_prefix_stability_with_context_compacted_event() {
     assert_eq!(records_b.len(), 9);
     let compacted = &records_b[4];
     assert_eq!(compacted.event_kind, "context.compacted");
-    let payload = compacted
-        .event
-        .get("payload")
-        .and_then(|payload| payload.get("ContextCompacted"))
-        .expect("compacted payload");
-    assert!(
-        payload.get("context_boundary_seq_id").is_none(),
-        "store-local seq refs must be stripped from portable records"
-    );
-    assert!(payload.get("first_kept_seq_id").is_none());
-    assert_eq!(
-        payload.get("summary").and_then(|value| value.as_str()),
-        Some("compacted early turns")
-    );
+    let PortableEventPayload::ContextCompacted { summary, .. } = &compacted.event.payload else {
+        panic!("expected portable context compaction payload");
+    };
+    assert_eq!(summary, "compacted early turns");
+    let portable_payload =
+        serde_json::to_value(&compacted.event.payload).expect("portable payload value");
+    let portable_compaction = &portable_payload["ContextCompacted"];
+    assert!(portable_compaction.get("context_boundary_seq_id").is_none());
+    assert!(portable_compaction.get("first_kept_seq_id").is_none());
 
     validate_session_bundle_directory(bundle_b.path()).expect("compacted bundle validates");
     let mut imported = SqliteSessionStore::open_in_memory().expect("import store");
