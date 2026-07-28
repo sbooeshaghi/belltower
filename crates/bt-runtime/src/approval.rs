@@ -207,7 +207,10 @@ impl PolicyApprovalEvaluator {
             return Some(ApprovalDecision::Approved {
                 decided_at: time::OffsetDateTime::now_utc(),
                 decided_by: "policy:session-auto-approve".to_owned(),
-                scope: ApprovalScope::Session,
+                // Auto mode is process-local and intentionally fail-safe. Record the
+                // decision for this call without creating a reusable grant that would
+                // silently survive after auto mode is disabled or the process restarts.
+                scope: ApprovalScope::Once,
                 source: ApprovalDecisionSource::Policy {
                     rule: "session_auto_approve".to_owned(),
                 },
@@ -441,7 +444,7 @@ mod tests {
             decision,
             Some(ApprovalDecision::Approved {
                 source: ApprovalDecisionSource::Policy { ref rule },
-                scope: ApprovalScope::Session,
+                scope: ApprovalScope::Once,
                 ..
             }) if rule == "session_auto_approve"
         ));
@@ -455,10 +458,15 @@ mod tests {
         );
 
         evaluator.set_session_auto_approval(auto_session, false);
+        let mut disabled_request = request(auto_session, "shell", json!({"command": "rm x"}));
+        disabled_request.call_id = ToolCallId::new("call-shell-after-auto");
         let disabled = evaluator
-            .evaluate(&request(auto_session, "shell", json!({"command": "ls"})))
+            .evaluate(&disabled_request)
             .expect("evaluation should succeed");
-        assert!(disabled.is_none(), "disabling auto mode must re-gate");
+        assert!(
+            disabled.is_none(),
+            "an auto decision must not become a reusable session grant"
+        );
     }
 
     #[test]

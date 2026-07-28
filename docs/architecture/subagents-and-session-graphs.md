@@ -309,8 +309,9 @@ Auto-approval is the explicit policy form of inheritance: a session may run in
 auto-approval mode (`approval_mode: "auto"` at create time, or per spawn with
 `inherit`/`auto`/`prompt`, where `inherit` copies the parent's mode). In auto
 mode every approval resolves as a durable `Policy { rule:
-"session_auto_approve" }` decision — recorded, session-scoped, and auditable.
-The mode flag itself is process-local and fail-safe: a restart falls back to
+"session_auto_approve" }` decision with `Once` scope. Each decision is durable
+and auditable, but it does not create a reusable approval grant. The mode flag
+itself is process-local and fail-safe: disabling it or restarting falls back to
 prompting. Spawn approval is how the operator consents to a child's mode: the
 `approval_mode` argument is visible in the spawn arguments they approve, and a
 parent already in auto mode delegates within the depth and descendant caps.

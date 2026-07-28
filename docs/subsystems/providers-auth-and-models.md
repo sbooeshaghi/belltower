@@ -118,10 +118,11 @@ Subscription-backed Claude (`claude-code` connection, provider `claude-cli`):
   connection), the CLI's own tools are disallowed and the loop is capped at
   one turn, and structured output is unsupported — use the `anthropic` API
   connection for tool-calling sessions until an MCP bridge lands
-- readiness reports Degraded when the `claude` binary (override:
-  `BELLTOWER_CLAUDE_BIN`) is missing or unresponsive; auth problems surface
-  on the first completion as a durable session error rather than a quota-
-  spending readiness probe
+- readiness uses the CLI's non-billing `claude auth status --json` command and
+  reports Degraded when the binary (override: `BELLTOWER_CLAUDE_BIN`) is
+  missing, unresponsive, or not authenticated; completion stderr is drained
+  concurrently and bounded for diagnostics so a full pipe cannot deadlock the
+  provider stream
 
 Important rule:
 

@@ -22,11 +22,12 @@ use bt_core::{
 use serde_json::Value;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 const READ_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_STDERR_DETAIL_BYTES: usize = 8 * 1024;
 
 /// The CLI's own tools stay off: belltower owns tool execution and approvals,
 /// and a print-mode subprocess must not mutate the workspace out of band.
@@ -77,7 +78,7 @@ impl Provider for ClaudeCliProvider {
             let probe = tokio::time::timeout(
                 VALIDATE_TIMEOUT,
                 self.base_command()
-                    .arg("--version")
+                    .args(["auth", "status", "--json"])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -87,7 +88,12 @@ impl Provider for ClaudeCliProvider {
             match probe {
                 Ok(Ok(output)) if output.status.success() => Ok(ConnectionStatus::Healthy),
                 Ok(Ok(output)) => Ok(ConnectionStatus::Degraded {
-                    reason: format!("`{} --version` exited with {}", self.binary, output.status),
+                    reason: format!(
+                        "`{} auth status --json` exited with {}: {}",
+                        self.binary,
+                        output.status,
+                        command_output_detail(&output.stdout, &output.stderr)
+                    ),
                 }),
                 Ok(Err(error)) => Ok(ConnectionStatus::Degraded {
                     reason: format!(
@@ -96,7 +102,7 @@ impl Provider for ClaudeCliProvider {
                     ),
                 }),
                 Err(_) => Ok(ConnectionStatus::Degraded {
-                    reason: format!("`{} --version` timed out", self.binary),
+                    reason: format!("`{} auth status --json` timed out", self.binary),
                 }),
             }
         })
@@ -177,7 +183,12 @@ impl Provider for ClaudeCliProvider {
             let stdout = child.stdout.take().ok_or_else(|| {
                 BelltowerError::Provider("claude CLI stdout unavailable".to_owned())
             })?;
-            let stderr = child.stderr.take();
+            let stderr = child.stderr.take().ok_or_else(|| {
+                BelltowerError::Provider("claude CLI stderr unavailable".to_owned())
+            })?;
+            // Drain stderr concurrently with stdout. Waiting until the process exits can
+            // deadlock when the child's stderr pipe fills before stdout reaches EOF.
+            let stderr_task = tokio::spawn(capture_bounded_stderr(stderr));
 
             let stream = try_stream! {
                 let mut lines = BufReader::new(stdout).lines();
@@ -264,21 +275,15 @@ impl Provider for ClaudeCliProvider {
                 let status = child.wait().await.map_err(|error| {
                     BelltowerError::Provider(format!("claude CLI wait failed: {error}"))
                 })?;
+                let stderr_detail = stderr_task.await.map_err(|error| {
+                    BelltowerError::Provider(format!(
+                        "claude CLI stderr capture task failed: {error}"
+                    ))
+                })?;
                 if !status.success() {
-                    let mut detail = String::new();
-                    if let Some(stderr) = stderr {
-                        let mut reader = BufReader::new(stderr).lines();
-                        while let Ok(Some(line)) = reader.next_line().await {
-                            if detail.len() > 800 {
-                                break;
-                            }
-                            detail.push_str(&line);
-                            detail.push('\n');
-                        }
-                    }
                     Err(BelltowerError::Provider(format!(
                         "claude CLI exited with {status}: {}",
-                        detail.trim()
+                        stderr_detail.trim()
                     )))?;
                 }
                 if !saw_result {
@@ -308,6 +313,39 @@ impl Provider for ClaudeCliProvider {
 
     fn completion_summary(&self, summary: CompletionSummary) -> Result<CompletionSummary> {
         Ok(summary)
+    }
+}
+
+async fn capture_bounded_stderr(mut stderr: impl AsyncRead + Unpin) -> String {
+    let mut detail = Vec::with_capacity(MAX_STDERR_DETAIL_BYTES);
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match stderr.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => {
+                let remaining = MAX_STDERR_DETAIL_BYTES.saturating_sub(detail.len());
+                detail.extend_from_slice(&buffer[..read.min(remaining)]);
+            }
+            Err(error) => {
+                let suffix = format!("\n[stderr read failed: {error}]");
+                let remaining = MAX_STDERR_DETAIL_BYTES.saturating_sub(detail.len());
+                detail.extend_from_slice(&suffix.as_bytes()[..suffix.len().min(remaining)]);
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&detail).into_owned()
+}
+
+fn command_output_detail(stdout: &[u8], stderr: &[u8]) -> String {
+    let bytes = if stderr.is_empty() { stdout } else { stderr };
+    let end = bytes.len().min(MAX_STDERR_DETAIL_BYTES);
+    let detail = String::from_utf8_lossy(&bytes[..end]);
+    let detail = detail.trim();
+    if detail.is_empty() {
+        "no diagnostic output".to_owned()
+    } else {
+        detail.to_owned()
     }
 }
 
@@ -466,5 +504,13 @@ mod tests {
         assert!(prompt.contains("Assistant: first answer"));
         assert!(prompt.contains("User: follow-up"));
         assert!(prompt.starts_with("The following is the conversation so far"));
+    }
+
+    #[tokio::test]
+    async fn stderr_capture_drains_the_stream_but_bounds_diagnostics() {
+        let input = vec![b'x'; MAX_STDERR_DETAIL_BYTES * 4];
+        let detail = capture_bounded_stderr(input.as_slice()).await;
+        assert_eq!(detail.len(), MAX_STDERR_DETAIL_BYTES);
+        assert!(detail.bytes().all(|byte| byte == b'x'));
     }
 }
