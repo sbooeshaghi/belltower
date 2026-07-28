@@ -1107,7 +1107,7 @@ impl SqliteSessionStore {
         if Self::cancel_requested_in_tx(&tx, session_id)? {
             return Ok(ContinuationClaim::CancelPending);
         }
-        if Self::active_turn_exists_in_tx(&tx, session_id)? {
+        if Self::session_has_pending_work_in_tx(&tx, session_id)? {
             return Ok(ContinuationClaim::Busy);
         }
         if Self::session_budget_exhausted_in_tx(&tx, session_id)? {
@@ -1141,26 +1141,32 @@ impl SqliteSessionStore {
             return Ok(ContinuationClaim::Stale);
         }
         let message: RelatedSessionMessage = serde_json::from_str(&message_json)?;
+        let claimed_turn_id = events.first().and_then(|event| match &event.payload {
+            EventPayload::RelatedSessionMessageResolved {
+                message_id: event_message_id,
+                status: RelatedSessionMessageStatus::Claimed,
+                resulting_turn_id: Some(turn_id),
+                ..
+            } if *event_message_id == message_id => Some(*turn_id),
+            _ => None,
+        });
         if events.len() != 2
+            || !matches!(message.delivery_mode, RelatedSessionDeliveryMode::Wake)
             || events.iter().any(|event| {
                 event.session_id != session_id || event.branch_id != message.destination_branch_id
             })
-            || !matches!(
-                &events[0].payload,
-                EventPayload::RelatedSessionMessageResolved {
-                    message_id: event_message_id,
-                    status: RelatedSessionMessageStatus::Claimed,
-                    resulting_turn_id: Some(turn_id),
-                    ..
-                } if *event_message_id == message_id && events[1].turn_id == Some(*turn_id)
-            )
+            || events[0].turn_id.is_some()
+            || claimed_turn_id.is_none()
+            || events[1].turn_id != claimed_turn_id
             || !matches!(
                 &events[1].payload,
                 EventPayload::TurnStarted {
+                    turn_id,
                     source: TurnStartSource::RelatedSessionMessage,
                     settings_revision_id,
                     ..
-                } if *settings_revision_id == expected_settings_revision_id
+                } if Some(*turn_id) == claimed_turn_id
+                    && *settings_revision_id == expected_settings_revision_id
             )
         {
             return Err(BelltowerError::InvalidState(

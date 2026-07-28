@@ -613,6 +613,241 @@ fn related_session_wake_survives_restart_and_claims_in_order() {
 }
 
 #[test]
+fn related_message_resolution_is_scoped_to_the_exact_session_pair() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let shared_message_id = RelatedSessionMessageId::new();
+
+    let (first_parent, first_parent_branch) = sample_session();
+    let (first_child, first_child_branch) = child_session(&first_parent, &first_parent_branch);
+    for (session, branch) in [
+        (&first_parent, &first_parent_branch),
+        (&first_child, &first_child_branch),
+    ] {
+        store
+            .create_session(session, branch)
+            .expect("create session");
+    }
+    let (first_sent, first_received) = related_message_events(
+        &first_parent,
+        &first_parent_branch,
+        &first_child,
+        &first_child_branch,
+        shared_message_id,
+        "first lineage",
+        RelatedSessionDeliveryMode::Wake,
+    );
+    store
+        .commit_related_session_message(&first_sent, &first_received)
+        .expect("commit first message");
+
+    let (second_parent, second_parent_branch) = sample_session();
+    let (second_child, second_child_branch) = child_session(&second_parent, &second_parent_branch);
+    for (session, branch) in [
+        (&second_parent, &second_parent_branch),
+        (&second_child, &second_child_branch),
+    ] {
+        store
+            .create_session(session, branch)
+            .expect("create session");
+    }
+    let (second_sent, second_received) = related_message_events(
+        &second_parent,
+        &second_parent_branch,
+        &second_child,
+        &second_child_branch,
+        shared_message_id,
+        "second lineage",
+        RelatedSessionDeliveryMode::Wake,
+    );
+    store
+        .commit_related_session_message(&second_sent, &second_received)
+        .expect("commit second message");
+
+    let first_turn_id = TurnId::new();
+    let first_claim = vec![
+        EventEnvelope::new(
+            first_child.session_id,
+            first_child_branch.branch_id,
+            SpanKind::Chain,
+            EventPayload::RelatedSessionMessageResolved {
+                message_id: shared_message_id,
+                status: RelatedSessionMessageStatus::Claimed,
+                resulting_turn_id: Some(first_turn_id),
+                reason: None,
+            },
+        ),
+        turn_started_event_with_source(
+            &first_child,
+            &first_child_branch,
+            first_turn_id,
+            TurnStartSource::RelatedSessionMessage,
+        ),
+    ];
+    assert!(matches!(
+        store
+            .claim_related_message_continuation(
+                first_child.session_id,
+                shared_message_id,
+                first_child.settings_revision_id,
+                &first_claim,
+            )
+            .expect("claim first message"),
+        ContinuationClaim::Claimed { .. }
+    ));
+
+    let second_sender = store
+        .load_related_session_messages(second_parent.session_id)
+        .expect("second sender mailbox");
+    let second_receiver = store
+        .load_related_session_messages(second_child.session_id)
+        .expect("second receiver mailbox");
+    assert_eq!(
+        second_sender[0].status,
+        RelatedSessionMessageStatus::Delivered
+    );
+    assert_eq!(
+        second_receiver[0].status,
+        RelatedSessionMessageStatus::Pending
+    );
+
+    let (third_parent, third_parent_branch) = sample_session();
+    let (third_child, third_child_branch) = child_session(&third_parent, &third_parent_branch);
+    for (session, branch) in [
+        (&third_parent, &third_parent_branch),
+        (&third_child, &third_child_branch),
+    ] {
+        store
+            .create_session(session, branch)
+            .expect("create session");
+    }
+    let (third_sent, third_received) = related_message_events(
+        &third_parent,
+        &third_parent_branch,
+        &third_child,
+        &third_child_branch,
+        shared_message_id,
+        "third lineage after first claim",
+        RelatedSessionDeliveryMode::Wake,
+    );
+    store
+        .commit_related_session_message(&third_sent, &third_received)
+        .expect("commit third message");
+    let third_receiver = store
+        .load_related_session_messages(third_child.session_id)
+        .expect("third receiver mailbox");
+    assert_eq!(
+        third_receiver[0].status,
+        RelatedSessionMessageStatus::Pending
+    );
+}
+
+#[test]
+fn related_wake_claim_rejects_mismatched_turn_identity_and_pending_work() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (parent, parent_branch) = sample_session();
+    let (child, child_branch) = child_session(&parent, &parent_branch);
+    store
+        .create_session(&parent, &parent_branch)
+        .expect("create parent");
+    store
+        .create_session(&child, &child_branch)
+        .expect("create child");
+
+    let message_id = RelatedSessionMessageId::new();
+    let (sent, received) = related_message_events(
+        &parent,
+        &parent_branch,
+        &child,
+        &child_branch,
+        message_id,
+        "claim me exactly once",
+        RelatedSessionDeliveryMode::Wake,
+    );
+    store
+        .commit_related_session_message(&sent, &received)
+        .expect("commit message");
+
+    let resolved_turn_id = TurnId::new();
+    let payload_turn_id = TurnId::new();
+    let mut mismatched_started = turn_started_event_with_source(
+        &child,
+        &child_branch,
+        payload_turn_id,
+        TurnStartSource::RelatedSessionMessage,
+    );
+    mismatched_started.turn_id = Some(resolved_turn_id);
+    let malformed = vec![
+        EventEnvelope::new(
+            child.session_id,
+            child_branch.branch_id,
+            SpanKind::Chain,
+            EventPayload::RelatedSessionMessageResolved {
+                message_id,
+                status: RelatedSessionMessageStatus::Claimed,
+                resulting_turn_id: Some(resolved_turn_id),
+                reason: None,
+            },
+        ),
+        mismatched_started,
+    ];
+    assert!(matches!(
+        store.claim_related_message_continuation(
+            child.session_id,
+            message_id,
+            child.settings_revision_id,
+            &malformed,
+        ),
+        Err(BelltowerError::InvalidState(_))
+    ));
+
+    store
+        .append_event(&queued_message_event(
+            &child,
+            &child_branch,
+            "queued operator input",
+        ))
+        .expect("queue message");
+    let valid_turn_id = TurnId::new();
+    let valid = vec![
+        EventEnvelope::new(
+            child.session_id,
+            child_branch.branch_id,
+            SpanKind::Chain,
+            EventPayload::RelatedSessionMessageResolved {
+                message_id,
+                status: RelatedSessionMessageStatus::Claimed,
+                resulting_turn_id: Some(valid_turn_id),
+                reason: None,
+            },
+        ),
+        turn_started_event_with_source(
+            &child,
+            &child_branch,
+            valid_turn_id,
+            TurnStartSource::RelatedSessionMessage,
+        ),
+    ];
+    assert_eq!(
+        store
+            .claim_related_message_continuation(
+                child.session_id,
+                message_id,
+                child.settings_revision_id,
+                &valid,
+            )
+            .expect("pending work defers wake"),
+        ContinuationClaim::Busy
+    );
+    assert_eq!(
+        store
+            .load_pending_related_session_messages(child.session_id)
+            .expect("pending wake remains")
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn failed_child_spawn_with_initial_message_rolls_back_everything() {
     let mut store = SqliteSessionStore::open_in_memory().expect("store");
     let (parent_session, parent_branch) = sample_session();

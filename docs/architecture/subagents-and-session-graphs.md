@@ -232,7 +232,9 @@ related_session_message }` before provider or tool execution. The destination's
 current settings revision is captured at claim time; a concurrent settings
 change retries admission instead of silently stranding the wake. When both
 session logs are present in one store, the derived sender and receiver mailbox
-rows expose the same claimed or dropped status. Server startup claims pending
+rows expose the same claimed or dropped status. Mirrored projection updates are
+scoped by source session, destination session, and message id, so an unrelated
+lineage cannot inherit another delivery's resolution. Server startup claims pending
 idle-session wakes through ordinary admitted turns. A previously claimed
 interrupted turn is terminalized rather than retried, because tool side effects
 may already have occurred; runtime reopening repairs one durable typed error to

@@ -245,9 +245,16 @@ impl SqliteSessionStore {
                     .query_row(
                         "SELECT status, resulting_turn_id, resolved_at
                          FROM related_session_message_projection
-                         WHERE message_id = ?1 AND status IN ('claimed', 'dropped')
+                         WHERE message_id = ?1
+                           AND source_session_id = ?2
+                           AND destination_session_id = ?3
+                           AND status IN ('claimed', 'dropped')
                          LIMIT 1",
-                        params![message.message_id.to_string()],
+                        params![
+                            message.message_id.to_string(),
+                            message.source_session_id.to_string(),
+                            message.destination_session_id.to_string(),
+                        ],
                         |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
@@ -300,15 +307,35 @@ impl SqliteSessionStore {
                 resulting_turn_id,
                 ..
             } => {
+                let (source_session_id, destination_session_id) = tx
+                    .query_row(
+                        "SELECT source_session_id, destination_session_id
+                         FROM related_session_message_projection
+                         WHERE session_id = ?1 AND message_id = ?2 AND direction = 'received'",
+                        params![event.session_id.to_string(), message_id.to_string()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()
+                    .map_err(storage_error)?
+                    .ok_or_else(|| {
+                        BelltowerError::InvalidState(format!(
+                            "related message {message_id} has no received projection in session {}",
+                            event.session_id
+                        ))
+                    })?;
                 tx.execute(
                     "UPDATE related_session_message_projection
                      SET status = ?1, resulting_turn_id = ?2, resolved_at = ?3
-                     WHERE message_id = ?4",
+                     WHERE message_id = ?4
+                       AND source_session_id = ?5
+                       AND destination_session_id = ?6",
                     params![
                         related_message_status(status),
                         resulting_turn_id.map(|turn_id| turn_id.to_string()),
                         format_time(event.occurred_at)?,
                         message_id.to_string(),
+                        source_session_id,
+                        destination_session_id,
                     ],
                 )
                 .map_err(storage_error)?;

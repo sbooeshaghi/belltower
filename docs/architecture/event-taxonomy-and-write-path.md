@@ -258,9 +258,11 @@ The control-plane rule is now explicit:
 - related-session communication uses `session.related_message.recorded` and
   `session.related_message.resolved`, not transcript text or a process-local
   mailbox. One logical message commits matching `Sent` and `Received` copies to
-  the source and destination sessions atomically. Message ids are idempotency
-  identities: an exact retry returns the existing receipt, while conflicting
-  content under the same id fails
+  the source and destination sessions atomically. The source session,
+  destination session, and message id form the delivery identity: an exact
+  retry returns the existing receipt, while conflicting content under that
+  identity fails. Resolution projection updates use that same exact endpoint
+  pair and cannot mutate an unrelated lineage that happens to reuse an id
 - `wake` messages remain pending while the destination is busy. An idle claim
   consumes the oldest pending message and atomically appends its `Claimed`
   resolution plus `turn.started { source: related_session_message }` using the
