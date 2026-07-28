@@ -88,6 +88,16 @@ struct OtlpToolSpan {
 }
 
 #[derive(Clone, Debug)]
+struct OtlpSessionMailboxSpan {
+    name: &'static str,
+    otlp_span_id: String,
+    occurred_at: time::OffsetDateTime,
+    attributes: Vec<Value>,
+    event: Value,
+    links: Vec<Value>,
+}
+
+#[derive(Clone, Debug)]
 struct CachedToolRequest {
     tool_name: String,
     arguments: Option<Value>,
@@ -147,6 +157,7 @@ fn build_otlp_export(
     project_name: Option<&str>,
 ) -> Value {
     let mut turns = derive_otlp_turns(events);
+    let mailbox_spans = derive_session_mailbox_spans(session, events);
 
     let mut spans = Vec::new();
     for turn in turns.values_mut() {
@@ -192,6 +203,22 @@ fn build_otlp_export(
                 "status": otlp_status(tool.is_error != Some(true)),
             }));
         }
+    }
+
+    let session_trace_id = otlp_trace_id(session.session_id.0.as_bytes());
+    for mailbox in mailbox_spans {
+        spans.push(json!({
+            "traceId": session_trace_id,
+            "spanId": mailbox.otlp_span_id,
+            "name": mailbox.name,
+            "kind": 1,
+            "startTimeUnixNano": unix_nanos(mailbox.occurred_at),
+            "endTimeUnixNano": unix_nanos(mailbox.occurred_at),
+            "attributes": mailbox.attributes,
+            "events": [mailbox.event],
+            "links": mailbox.links,
+            "status": otlp_status(true),
+        }));
     }
 
     let mut resource_attributes = vec![
@@ -521,6 +548,50 @@ fn derive_otlp_turns(events: &[EventEnvelope]) -> BTreeMap<TurnId, OtlpTurnSpan>
         .collect()
 }
 
+fn derive_session_mailbox_spans(
+    session: &SessionRecord,
+    events: &[EventEnvelope],
+) -> Vec<OtlpSessionMailboxSpan> {
+    events
+        .iter()
+        .filter(|event| {
+            event.turn_id.is_none()
+                && matches!(
+                    event.payload,
+                    EventPayload::RelatedSessionMessageRecorded { .. }
+                        | EventPayload::RelatedSessionMessageResolved { .. }
+                )
+        })
+        .map(|event| {
+            let mut attributes = vec![
+                string_attr(OI_SPAN_KIND, "CHAIN"),
+                string_attr("session.id", session.session_id.to_string()),
+            ];
+            attributes.extend(otlp_event_attributes(event));
+
+            let links = match &event.payload {
+                EventPayload::RelatedSessionMessageResolved {
+                    resulting_turn_id: Some(turn_id),
+                    ..
+                } => vec![json!({
+                    "traceId": otlp_trace_id(turn_id.0.as_bytes()),
+                    "spanId": otlp_span_id_from_bytes(&turn_id.0.as_bytes()[..8]),
+                })],
+                _ => Vec::new(),
+            };
+
+            OtlpSessionMailboxSpan {
+                name: event.kind(),
+                otlp_span_id: otlp_span_id_from_bytes(&event.span_id.0.as_bytes()[..8]),
+                occurred_at: event.occurred_at,
+                attributes,
+                event: otlp_event_from_envelope(event),
+                links,
+            }
+        })
+        .collect()
+}
+
 fn trailing_messages(history: &[Message], count: usize) -> Vec<Message> {
     if count == 0 {
         return Vec::new();
@@ -618,6 +689,14 @@ fn ensure_otlp_tool_span<'a>(
 }
 
 fn otlp_event_from_envelope(event: &EventEnvelope) -> Value {
+    json!({
+        "timeUnixNano": unix_nanos(event.occurred_at),
+        "name": event.kind(),
+        "attributes": otlp_event_attributes(event),
+    })
+}
+
+fn otlp_event_attributes(event: &EventEnvelope) -> Vec<Value> {
     let mirrored = mirrored_event_fields(event);
     let mut attributes = vec![
         string_attr("belltower.event.kind", event.kind()),
@@ -868,11 +947,7 @@ fn otlp_event_from_envelope(event: &EventEnvelope) -> Value {
     push_optional_bool_attr(&mut attributes, "belltower.success", mirrored.success);
     push_optional_bool_attr(&mut attributes, "belltower.is_error", mirrored.is_error);
 
-    json!({
-        "timeUnixNano": unix_nanos(event.occurred_at),
-        "name": event.kind(),
-        "attributes": attributes,
-    })
+    attributes
 }
 
 fn turn_span_attributes(turn: &OtlpTurnSpan, session: &SessionRecord) -> Vec<Value> {

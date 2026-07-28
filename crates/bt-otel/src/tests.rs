@@ -16,6 +16,8 @@ use bt_core::{
 };
 use bt_protocol::ExportFormat;
 use camino::Utf8PathBuf;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use prost::Message as _;
 use serde_json::Value;
 
 fn session() -> SessionRecord {
@@ -1155,5 +1157,143 @@ fn otlp_export_preserves_resumed_turn_provenance_and_tool_input() {
         span_attr(resumed_tool_span, "belltower.tool.approval_risk_class")
             .and_then(|value| value["stringValue"].as_str()),
         Some("High")
+    );
+}
+
+#[test]
+fn otlp_exports_turnless_destination_mailbox_events_as_session_chain_spans() {
+    let session = session();
+    let branch_id = BranchId::new();
+    let source_session_id = SessionId::new();
+    let message_id = RelatedSessionMessageId::new();
+    let resulting_turn_id = TurnId::new();
+    let message = RelatedSessionMessage {
+        message_id,
+        context_message_id: MessageId::new(),
+        source_session_id,
+        source_branch_id: BranchId::new(),
+        caused_by_turn_id: None,
+        destination_session_id: session.session_id,
+        destination_branch_id: branch_id,
+        kind: RelatedSessionMessageKind::Instruction,
+        delivery_mode: RelatedSessionDeliveryMode::Wake,
+        in_reply_to: None,
+        text: "inspect the export boundary".to_owned(),
+        artifact_refs: Vec::new(),
+        created_at: time::OffsetDateTime::now_utc(),
+    };
+    let recorded = EventEnvelope::new(
+        session.session_id,
+        branch_id,
+        SpanKind::Chain,
+        EventPayload::RelatedSessionMessageRecorded {
+            direction: RelatedSessionMessageDirection::Received,
+            counterpart_event_id: EventId::new(),
+            message,
+        },
+    );
+    let resolved = EventEnvelope::new(
+        session.session_id,
+        branch_id,
+        SpanKind::Chain,
+        EventPayload::RelatedSessionMessageResolved {
+            message_id,
+            status: RelatedSessionMessageStatus::Claimed,
+            resulting_turn_id: Some(resulting_turn_id),
+            reason: None,
+        },
+    );
+
+    let otlp = export_session(
+        &session,
+        &[],
+        &[recorded.clone(), resolved.clone()],
+        ExportFormat::Otlp,
+    )
+    .expect("otlp export");
+    let document: Value = serde_json::from_str(&otlp.content).expect("valid otlp json");
+    let recorded_span = span_by_name(&document, "session.related_message.recorded");
+    let resolved_span = span_by_name(&document, "session.related_message.resolved");
+    let session_trace_id = session.session_id.to_string().replace('-', "");
+    let recorded_span_id = recorded.span_id.to_string().replace('-', "");
+    let resolved_span_id = resolved.span_id.to_string().replace('-', "");
+
+    assert_eq!(recorded_span["traceId"], session_trace_id);
+    assert_eq!(recorded_span["spanId"], recorded_span_id[..16]);
+    assert_eq!(
+        span_attr(recorded_span, "openinference.span.kind")
+            .and_then(|value| value["stringValue"].as_str()),
+        Some("CHAIN")
+    );
+    assert_eq!(span_attr(recorded_span, "turn.id"), None);
+    assert_eq!(span_attr(recorded_span, "belltower.turn_id"), None);
+    assert!(recorded_span.get("parentSpanId").is_none());
+    assert_eq!(
+        span_attr(recorded_span, "belltower.related_message.id")
+            .and_then(|value| value["stringValue"].as_str()),
+        Some(message_id.to_string().as_str())
+    );
+    assert_eq!(
+        span_attr(recorded_span, "belltower.related_message.direction")
+            .and_then(|value| value["stringValue"].as_str()),
+        Some("Received")
+    );
+    assert_eq!(
+        span_attr(recorded_span, "belltower.related_message.peer_session_id")
+            .and_then(|value| value["stringValue"].as_str()),
+        Some(source_session_id.to_string().as_str())
+    );
+    assert_eq!(
+        span_attr(recorded_span, "belltower.related_message.delivery_mode")
+            .and_then(|value| value["stringValue"].as_str()),
+        Some("Wake")
+    );
+    assert_eq!(
+        span_attr(recorded_span, "belltower.related_message.kind")
+            .and_then(|value| value["stringValue"].as_str()),
+        Some("Instruction")
+    );
+    assert_eq!(
+        span_attr(recorded_span, "belltower.related_message.status")
+            .and_then(|value| value["stringValue"].as_str()),
+        Some("Pending")
+    );
+    assert!(recorded_span["links"].as_array().is_some_and(Vec::is_empty));
+
+    assert_eq!(resolved_span["traceId"], session_trace_id);
+    assert_eq!(resolved_span["spanId"], resolved_span_id[..16]);
+    assert_eq!(span_attr(resolved_span, "turn.id"), None);
+    assert_eq!(
+        span_attr(resolved_span, "belltower.related_message.resulting_turn_id")
+            .and_then(|value| value["stringValue"].as_str()),
+        Some(resulting_turn_id.to_string().as_str())
+    );
+    assert_eq!(
+        resolved_span["links"],
+        serde_json::json!([{
+            "traceId": resulting_turn_id.to_string().replace('-', ""),
+            "spanId": resulting_turn_id.to_string().replace('-', "")[..16],
+        }])
+    );
+
+    let request = ExportTraceServiceRequest::decode(
+        crate::export_otlp_protobuf(&session, &[recorded, resolved], None)
+            .expect("otlp protobuf")
+            .as_slice(),
+    )
+    .expect("decodable otlp protobuf");
+    let protobuf_spans = &request.resource_spans[0].scope_spans[0].spans;
+    let protobuf_resolved = protobuf_spans
+        .iter()
+        .find(|span| span.name == "session.related_message.resolved")
+        .expect("resolved mailbox span");
+    assert_eq!(protobuf_resolved.links.len(), 1);
+    assert_eq!(
+        protobuf_resolved.links[0].trace_id,
+        resulting_turn_id.0.as_bytes()
+    );
+    assert_eq!(
+        protobuf_resolved.links[0].span_id,
+        resulting_turn_id.0.as_bytes()[..8]
     );
 }

@@ -153,8 +153,10 @@ That means tool-using turns may contain multiple `llm_call` spans:
 
 The current `bt-otel` export now maps the canonical store into richer OpenInference-style spans:
 
-- each session export may contain many OTLP traces, one per turn in the session
-- each exported trace uses the turn as the root `AGENT` span
+- each session export may contain many OTLP traces, one per turn in the session,
+  plus a deterministic session-scoped trace when it contains turnless
+  related-session mailbox events
+- each turn-scoped exported trace uses the turn as the root `AGENT` span
 - every exported span carries `session.id = <belltower session_id>` for cross-trace correlation
 - `llm_call` exports as an `LLM` span with:
   - `input.value` / `output.value`
@@ -171,7 +173,12 @@ The current `bt-otel` export now maps the canonical store into richer OpenInfere
 - OTLP span events include payload previews and mirrored event attributes so the event stream is useful inside Phoenix instead of only showing bare event names
 - related-session mailbox events mirror message direction, peer session,
   delivery mode, kind, status, and message/turn correlation; the canonical
-  paired session events remain the source of truth
+  paired session events remain the source of truth. Turnless destination
+  `session.related_message.recorded` and `session.related_message.resolved`
+  events export as session-trace `CHAIN` spans keyed by their canonical event
+  span ids, retain mailbox attributes, and do not carry `turn.id`. A resolution
+  with `resulting_turn_id` links to that turn's trace/root span rather than
+  claiming the mailbox event belongs to the resulting turn.
 
 Portable session bundles preserve each session's own mailbox event copy. When
 related parent and child bundles are imported into the same store, projections
