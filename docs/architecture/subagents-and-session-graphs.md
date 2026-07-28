@@ -51,6 +51,12 @@ references. `notify` makes evidence available to a later turn. `wake` also asks
 an idle destination session to claim the oldest pending message and begin an
 ordinary runtime-owned turn. It never interrupts active work.
 
+If an active turn calls `wait_agent` and observes one or more pending `wake`
+messages, the store atomically claims those exact messages into that active
+turn before returning them. The wake pump can therefore never start a second
+turn for evidence the caller already observed. A claim that loses active-turn
+ownership fails without appending an ambiguous resolution.
+
 This is intentionally bounded:
 
 - messages are limited to direct parent-child edges
@@ -234,11 +240,14 @@ change retries admission instead of silently stranding the wake. When both
 session logs are present in one store, the derived sender and receiver mailbox
 rows expose the same claimed or dropped status. Mirrored projection updates are
 scoped by source session, destination session, and message id, so an unrelated
-lineage cannot inherit another delivery's resolution. Server startup claims pending
-idle-session wakes through ordinary admitted turns. A previously claimed
+lineage cannot inherit another delivery's resolution. Server startup claims
+pending idle-session wakes through ordinary admitted turns. A previously claimed
 interrupted turn is terminalized rather than retried, because tool side effects
 may already have occurred; runtime reopening repairs one durable typed error to
 the sender when the interruption terminal event committed before that reply.
+The wake pump also rechecks durable pending work after a turn finishes, session
+settings change, or a cancel request clears, so a wake deferred while the
+destination was busy or blocked is not stranded in process-local state.
 
 ## Spawn Contract
 

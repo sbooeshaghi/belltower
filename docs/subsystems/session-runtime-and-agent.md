@@ -512,6 +512,12 @@ path as other continuations, and queued wakes are considered after cancel and
 steer but before ordinary queued user follow-ups. `notify` messages remain
 durable context for a later turn.
 
+`wait_agent` is an observation and consumption boundary. When the calling turn
+observes pending `wake` messages, `bt-session` atomically resolves those exact
+messages into that active turn before the tool returns them. They are not left
+pending for a second continuation. The server wake pump rechecks durable work
+after relevant unblock transitions, but it does not own mailbox or turn state.
+
 Child sessions have independent settings revisions, approvals, queues, cancel,
 steer, and budgets. A child may use a different configured connection and model
 from its parent. The runtime constrains model-facing spawn to depth four and

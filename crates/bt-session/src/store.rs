@@ -9,7 +9,7 @@ use bt_core::{
     TurnStartSource,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -1173,6 +1173,87 @@ impl SqliteSessionStore {
                 "related-session continuation events are malformed".to_owned(),
             ));
         }
+        let seq_ids = Self::append_events_in_tx(&tx, events)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(ContinuationClaim::Claimed { seq_ids })
+    }
+
+    pub fn claim_related_messages_for_active_turn(
+        &mut self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        turn_id: TurnId,
+        message_ids: &[RelatedSessionMessageId],
+        events: &[EventEnvelope],
+    ) -> Result<ContinuationClaim> {
+        if message_ids.is_empty() || message_ids.len() != events.len() {
+            return Err(BelltowerError::InvalidState(
+                "active-turn related-message claim requires one resolution event per message"
+                    .to_owned(),
+            ));
+        }
+        if message_ids.iter().copied().collect::<HashSet<_>>().len() != message_ids.len() {
+            return Err(BelltowerError::InvalidState(
+                "active-turn related-message claim contains duplicate message ids".to_owned(),
+            ));
+        }
+
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        if let Err(error) =
+            Self::ensure_active_turn_owner_in_tx(&tx, session_id, branch_id, turn_id)
+        {
+            return match error {
+                BelltowerError::InvalidState(_) => Ok(ContinuationClaim::Busy),
+                error => Err(error),
+            };
+        }
+
+        for (message_id, event) in message_ids.iter().zip(events) {
+            if event.session_id != session_id
+                || event.branch_id != branch_id
+                || event.turn_id != Some(turn_id)
+                || !matches!(
+                    &event.payload,
+                    EventPayload::RelatedSessionMessageResolved {
+                        message_id: event_message_id,
+                        status: RelatedSessionMessageStatus::Claimed,
+                        resulting_turn_id: Some(resulting_turn_id),
+                        ..
+                    } if event_message_id == message_id && *resulting_turn_id == turn_id
+                )
+            {
+                return Err(BelltowerError::InvalidState(
+                    "active-turn related-message claim contains a malformed resolution event"
+                        .to_owned(),
+                ));
+            }
+
+            let pending = tx
+                .query_row(
+                    "SELECT message_json, status
+                     FROM related_session_message_projection
+                     WHERE session_id = ?1 AND message_id = ?2 AND direction = 'received'",
+                    params![session_id.to_string(), message_id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(storage_error)?;
+            let Some((message_json, status)) = pending else {
+                return Ok(ContinuationClaim::Stale);
+            };
+            let message: RelatedSessionMessage = serde_json::from_str(&message_json)?;
+            if status != "pending"
+                || message.delivery_mode != RelatedSessionDeliveryMode::Wake
+                || message.destination_session_id != session_id
+                || message.destination_branch_id != branch_id
+            {
+                return Ok(ContinuationClaim::Stale);
+            }
+        }
+
         let seq_ids = Self::append_events_in_tx(&tx, events)?;
         tx.commit().map_err(storage_error)?;
         Ok(ContinuationClaim::Claimed { seq_ids })

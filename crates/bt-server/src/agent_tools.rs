@@ -50,6 +50,7 @@ pub(super) fn register_agent_tools(
     registry.register_arc(Arc::new(WaitAgentTool {
         runtime: state.runtime,
         session_id,
+        branch_id,
     }));
 }
 
@@ -409,6 +410,7 @@ impl ToolExecutor for ListAgentsTool {
 struct WaitAgentTool {
     runtime: Arc<BelltowerRuntime>,
     session_id: SessionId,
+    branch_id: BranchId,
 }
 
 impl ToolExecutor for WaitAgentTool {
@@ -455,12 +457,39 @@ impl ToolExecutor for WaitAgentTool {
                 .clamp(1, MAX_WAIT_SECONDS);
             let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
             loop {
-                let messages = matching_received_messages(
+                let mut messages = matching_received_messages(
                     &self.runtime,
                     self.session_id,
+                    self.branch_id,
                     target_session_id,
                     after_seq_id,
                 )?;
+                let pending_wake_ids = messages
+                    .iter()
+                    .filter(|record| {
+                        record.status == RelatedSessionMessageStatus::Pending
+                            && record.message.delivery_mode == RelatedSessionDeliveryMode::Wake
+                    })
+                    .map(|record| record.message.message_id)
+                    .collect::<Vec<_>>();
+                if !pending_wake_ids.is_empty() {
+                    let turn_id = active_turn_id(&self.runtime, self.session_id, self.branch_id)?;
+                    if !self.runtime.claim_related_messages_for_active_turn(
+                        self.session_id,
+                        self.branch_id,
+                        turn_id,
+                        &pending_wake_ids,
+                    )? {
+                        continue;
+                    }
+                    messages = matching_received_messages(
+                        &self.runtime,
+                        self.session_id,
+                        self.branch_id,
+                        target_session_id,
+                        after_seq_id,
+                    )?;
+                }
                 if !messages.is_empty() || tokio::time::Instant::now() >= deadline {
                     let workflow = self
                         .runtime
@@ -509,18 +538,21 @@ pub(super) fn spawn_wake_pump(state: AppState) {
         loop {
             match events.recv().await {
                 Ok(event) => {
-                    let EventPayload::RelatedSessionMessageRecorded {
-                        direction, message, ..
-                    } = &event.payload
-                    else {
-                        continue;
+                    let should_dispatch = match &event.payload {
+                        EventPayload::RelatedSessionMessageRecorded {
+                            direction, message, ..
+                        } => {
+                            *direction == RelatedSessionMessageDirection::Received
+                                && message.delivery_mode == RelatedSessionDeliveryMode::Wake
+                        }
+                        EventPayload::TurnFinished { .. }
+                        | EventPayload::SessionSettingsUpdated { .. }
+                        | EventPayload::SessionCancelCleared { .. } => true,
+                        _ => false,
                     };
-                    if *direction != RelatedSessionMessageDirection::Received
-                        || message.delivery_mode != RelatedSessionDeliveryMode::Wake
-                    {
-                        continue;
+                    if should_dispatch {
+                        dispatch_pending_wakes(&state, event.session_id);
                     }
-                    dispatch_pending_wakes(&state, event.session_id);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::warn!(skipped, "wake pump lagged; sweeping pending agent turns");
@@ -698,6 +730,7 @@ fn latest_assistant_text(
 fn matching_received_messages(
     runtime: &BelltowerRuntime,
     session_id: SessionId,
+    branch_id: BranchId,
     target_session_id: Option<SessionId>,
     after_seq_id: i64,
 ) -> Result<Vec<bt_core::RelatedSessionMessageRecord>> {
@@ -708,6 +741,7 @@ fn matching_received_messages(
             .filter(|record| {
                 record.direction == RelatedSessionMessageDirection::Received
                     && record.seq_id > after_seq_id
+                    && record.message.destination_branch_id == branch_id
                     && target_session_id
                         .is_none_or(|target| record.message.source_session_id == target)
             })
@@ -1113,6 +1147,106 @@ mod tests {
                         message["message"]["text"] == "No counterexample exists below 100."
                     })
                 })
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_agent_claims_wake_into_the_active_turn_without_a_duplicate_turn() {
+        let (state, parent, parent_branch, _file) = fixture();
+        let (child, child_branch) = state
+            .runtime
+            .spawn_child_session(
+                parent.session_id,
+                parent_branch.branch_id,
+                None,
+                "return one result".to_owned(),
+                Some("worker".to_owned()),
+                None,
+                None,
+            )
+            .expect("child session");
+        let admitted = state
+            .runtime
+            .admit_user_message(
+                &parent,
+                &parent_branch,
+                bt_core::Message::text(Role::User, "wait for the worker"),
+            )
+            .expect("admit parent turn");
+        let bt_runtime::UserMessageAdmission::Started(admitted) = admitted else {
+            panic!("parent turn should start");
+        };
+        let receipt = state
+            .runtime
+            .send_related_session_message(
+                child.session_id,
+                child_branch.branch_id,
+                None,
+                parent.session_id,
+                parent_branch.branch_id,
+                RelatedSessionMessageKind::Result,
+                RelatedSessionDeliveryMode::Wake,
+                None,
+                "The delegated check passed.".to_owned(),
+                Vec::new(),
+            )
+            .expect("send child result");
+
+        let waited = registry(state.clone(), parent.session_id, parent_branch.branch_id)
+            .get("wait_agent")
+            .expect("wait tool")
+            .execute(
+                json!({
+                    "call_id": "call-wait-wake",
+                    "target_session_id": child.session_id,
+                    "after_seq_id": 0,
+                    "timeout_seconds": 1
+                }),
+                context(),
+            )
+            .await
+            .expect("wait for wake result");
+        assert_eq!(waited.output["timed_out"], false);
+
+        let record = state
+            .runtime
+            .related_session_messages(parent.session_id)
+            .expect("parent mailbox")
+            .into_iter()
+            .find(|record| record.message.message_id == receipt.message_id)
+            .expect("claimed child result");
+        assert_eq!(record.status, RelatedSessionMessageStatus::Claimed);
+        assert_eq!(record.resulting_turn_id, Some(admitted.turn_id()));
+
+        state
+            .runtime
+            .record_turn_failure_transition(
+                parent.session_id,
+                parent_branch.branch_id,
+                "openai-compatible",
+                "qwen3.5:latest",
+                admitted.turn_id(),
+                Vec::new(),
+                &BelltowerError::Runtime("test terminalization".to_owned()),
+                0,
+            )
+            .expect("finish active parent turn");
+        assert!(
+            state
+                .runtime
+                .claim_next_related_session_message(parent.session_id)
+                .expect("no duplicate wake claim")
+                .is_none()
+        );
+        assert_eq!(
+            state
+                .runtime
+                .all_events(parent.session_id)
+                .expect("parent events")
+                .into_iter()
+                .filter(|event| matches!(event.payload, EventPayload::TurnStarted { .. }))
+                .count(),
+            1
         );
     }
 

@@ -193,6 +193,61 @@ impl BelltowerRuntime {
             .load_all_pending_related_session_messages()
     }
 
+    pub fn claim_related_messages_for_active_turn(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        turn_id: TurnId,
+        message_ids: &[RelatedSessionMessageId],
+    ) -> Result<bool> {
+        let events = message_ids
+            .iter()
+            .map(|message_id| {
+                EventEnvelope::new(
+                    session_id,
+                    branch_id,
+                    SpanKind::Chain,
+                    EventPayload::RelatedSessionMessageResolved {
+                        message_id: *message_id,
+                        status: RelatedSessionMessageStatus::Claimed,
+                        resulting_turn_id: Some(turn_id),
+                        reason: Some("Observed by wait_agent in the active turn.".to_owned()),
+                    },
+                )
+                .with_turn_id(turn_id)
+            })
+            .collect::<Vec<_>>();
+        let claim = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?
+            .claim_related_messages_for_active_turn(
+                session_id,
+                branch_id,
+                turn_id,
+                message_ids,
+                &events,
+            )?;
+        match claim {
+            ContinuationClaim::Claimed { seq_ids } => {
+                for (event, seq_id) in events.into_iter().zip(seq_ids) {
+                    self.publish_committed_event(event, seq_id);
+                }
+                Ok(true)
+            }
+            ContinuationClaim::Stale => Ok(false),
+            ContinuationClaim::Busy => Err(bt_core::BelltowerError::InvalidState(
+                "wait_agent caller no longer owns the active turn".to_owned(),
+            )),
+            ContinuationClaim::BudgetExhausted | ContinuationClaim::CancelPending => {
+                Err(bt_core::BelltowerError::InvalidState(
+                    "active-turn related-message claim returned an impossible control state"
+                        .to_owned(),
+                ))
+            }
+        }
+    }
+
     pub fn claim_next_related_session_message(
         &self,
         session_id: SessionId,
