@@ -33,10 +33,12 @@ use bt_session::{
     SessionTurnAdmission, SqliteSessionStore, SteerProjection, TranscriptPage,
 };
 use camino::Utf8PathBuf;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 mod budget;
+mod cancellation;
 mod context;
 mod control_plane;
 mod inspection;
@@ -58,9 +60,9 @@ pub(crate) use context::{
     TurnContextSummarizationPlan,
 };
 pub use types::{
-    AdmittedTurn, BranchTranscriptPage, BudgetEnforcementOutcome, ContextCompactionReport,
-    PostTurnControlAction, PreparedTurnContext, QueuedDispatch, ResumableToolCall,
-    UserMessageAdmission,
+    ActiveTurnFinishOutcome, AdmittedTurn, BranchTranscriptPage, BudgetEnforcementOutcome,
+    ContextCompactionReport, PostTurnControlAction, PreparedTurnContext, QueuedDispatch,
+    ResumableToolCall, UserMessageAdmission,
 };
 pub(super) use types::{PendingToolCallContext, ResumableToolCallKind, TurnBudgetWindow};
 
@@ -76,4 +78,41 @@ pub struct BelltowerRuntime {
     models: LocalModelManager,
     instructions: MarkdownInstructionResolver,
     event_bus: broadcast::Sender<EventEnvelope>,
+    active_cancellations: Mutex<HashMap<SessionId, ActiveCancellationEntry>>,
+}
+
+#[derive(Clone)]
+struct ActiveCancellationEntry {
+    branch_id: BranchId,
+    turn_id: TurnId,
+    signal: bt_core::CancellationSignal,
+}
+
+/// Keeps one process-local signal aligned with one canonical active-turn
+/// claim. Dropping the guard cannot alter durable control state.
+pub struct ActiveTurnCancellation<'runtime> {
+    runtime: &'runtime BelltowerRuntime,
+    session_id: SessionId,
+    branch_id: BranchId,
+    turn_id: TurnId,
+    signal: bt_core::CancellationSignal,
+}
+
+impl ActiveTurnCancellation<'_> {
+    #[must_use]
+    pub fn signal(&self) -> bt_core::CancellationSignal {
+        self.signal.clone()
+    }
+}
+
+impl Drop for ActiveTurnCancellation<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.runtime.active_cancellations.lock()
+            && active.get(&self.session_id).is_some_and(|entry| {
+                entry.branch_id == self.branch_id && entry.turn_id == self.turn_id
+            })
+        {
+            active.remove(&self.session_id);
+        }
+    }
 }

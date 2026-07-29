@@ -39,7 +39,7 @@ where
 /// turn ids carried by turn-boundary payloads. Events without a resolvable
 /// turn id do not touch the projection.
 pub(crate) fn projected_turn_id(event: &EventEnvelope) -> Option<TurnId> {
-    event.turn_id.or_else(|| match &event.payload {
+    event.turn_id.or(match &event.payload {
         EventPayload::TurnStarted { turn_id, .. } | EventPayload::TurnFinished { turn_id, .. } => {
             Some(*turn_id)
         }

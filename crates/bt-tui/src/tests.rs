@@ -1,14 +1,15 @@
 use super::{
     COMPOSER_BACKGROUND, ChatAction, ChatApp, CommandOutcome, ConnectionId, ESCAPE_PREFIX_TIMEOUT,
     EventEnvelope, EventPayload, LoadedTranscriptPage, Message, MessagePart, PendingCommand,
-    PendingSendCompletion, Role, ScrollbackSeparator, SessionId, SessionToolMode, ToolCallId,
-    ToolResultEnvelope, TranscriptDensity, TranscriptEntryKind, command_help_output,
-    completion_for_input, composer_body_height, composer_text_area_rect, composer_wrap_width,
-    desired_inline_viewport_height, render_bottom_panel, render_doctor_output,
-    render_execution_output, render_footer_lines, render_message_with_options,
-    render_models_output, render_raw_diff_output, render_session_output, render_status_output,
-    render_tool_block_entry, render_tool_call_inspection_output, resolve_command,
-    session_readiness_summary, shell_aux_lines, shell_top_gap_height,
+    PendingSendCompletion, QUEUE_REFRESH_INTERVAL, Role, ScrollbackSeparator, SessionId,
+    SessionToolMode, ToolCallId, ToolResultEnvelope, TranscriptDensity, TranscriptEntryKind,
+    command_help_output, completion_for_input, composer_body_height, composer_text_area_rect,
+    composer_wrap_width, desired_inline_viewport_height, render_bottom_panel,
+    render_compaction_output, render_doctor_output, render_execution_output, render_footer_lines,
+    render_message_with_options, render_models_output, render_raw_diff_output,
+    render_session_output, render_status_output, render_tool_block_entry,
+    render_tool_call_inspection_output, resolve_command, session_readiness_summary,
+    shell_aux_lines, shell_top_gap_height,
 };
 use bt_client::BelltowerClient;
 use bt_core::{
@@ -2183,6 +2184,16 @@ async fn export_without_path_prefills_editable_path_prompt() {
     );
 }
 
+#[tokio::test]
+async fn export_with_path_clears_the_path_prompt_notice() {
+    let mut app = test_app();
+    app.prompt_export_path("jsonl");
+
+    app.render_export_command("/export jsonl output.jsonl", "jsonl", "output.jsonl");
+
+    assert!(app.active_notice().is_none());
+}
+
 #[test]
 fn slash_surface_takes_precedence_over_pending_question_prompt() {
     let mut app = test_app();
@@ -2882,6 +2893,79 @@ fn turn_busy_uses_canonical_runtime_state() {
 }
 
 #[test]
+fn terminal_turn_event_requests_refresh_without_rewriting_queue_projection() {
+    let mut app = test_app();
+    app.apply_queue_inspection(SessionQueueInspection {
+        session_id: app.session_id,
+        runtime_state: SessionRuntimeState::Working,
+        cancel_requested: false,
+        pending_steer_count: 0,
+        queued_messages: Vec::new(),
+        pending_approvals: Vec::new(),
+        pending_inputs: Vec::new(),
+    });
+    app.queue_refresh_requested = false;
+
+    app.apply_stream_event(event(
+        1,
+        EventPayload::TurnFinished {
+            turn_id: bt_core::TurnId::new(),
+            provider: "openai".to_owned(),
+            model: "o4-mini".to_owned(),
+            status: "completed".to_owned(),
+            finish_reason: Some("stop".to_owned()),
+            latency_ms: 10,
+        },
+    ));
+
+    assert!(app.turn_is_busy());
+    assert_eq!(
+        app.queue_inspection
+            .as_ref()
+            .map(|inspection| inspection.runtime_state),
+        Some(SessionRuntimeState::Working)
+    );
+    assert!(app.queue_refresh_requested);
+    assert!(app.last_queue_refresh.elapsed() >= QUEUE_REFRESH_INTERVAL);
+}
+
+#[test]
+fn nonterminal_turn_event_preserves_waiting_runtime_projection() {
+    let mut app = test_app();
+    app.apply_queue_inspection(SessionQueueInspection {
+        session_id: app.session_id,
+        runtime_state: SessionRuntimeState::WaitingOnApproval,
+        cancel_requested: false,
+        pending_steer_count: 0,
+        queued_messages: Vec::new(),
+        pending_approvals: Vec::new(),
+        pending_inputs: Vec::new(),
+    });
+    app.queue_refresh_requested = false;
+
+    app.apply_stream_event(event(
+        1,
+        EventPayload::TurnFinished {
+            turn_id: bt_core::TurnId::new(),
+            provider: "openai".to_owned(),
+            model: "o4-mini".to_owned(),
+            status: "awaiting_approval".to_owned(),
+            finish_reason: Some("tool_calls".to_owned()),
+            latency_ms: 10,
+        },
+    ));
+
+    assert!(app.turn_is_busy());
+    assert_eq!(
+        app.queue_inspection
+            .as_ref()
+            .map(|inspection| inspection.runtime_state),
+        Some(SessionRuntimeState::WaitingOnApproval)
+    );
+    assert!(app.queue_refresh_requested);
+}
+
+#[test]
 fn ctrl_c_cancels_when_runtime_reports_active_turn() {
     let mut app = test_app();
     app.apply_queue_inspection(SessionQueueInspection {
@@ -3299,8 +3383,8 @@ fn execution_output_renders_canonical_turn_provenance() {
         event_counts: TraceEventCounts::default(),
         related_sessions: Vec::new(),
         turns: vec![TraceTurnInspection {
-            turn_id: turn_id.clone(),
-            branch_id: branch_id.clone(),
+            turn_id,
+            branch_id,
             settings_revision_id: default_settings_revision_id(),
             source: Some(TurnStartSource::ApprovalResume),
             resumed_from_call_id: Some(ToolCallId::new("call-resume-1")),
@@ -3323,7 +3407,7 @@ fn execution_output_renders_canonical_turn_provenance() {
             cost: None,
             context_manifests: vec![ContextManifest {
                 turn_id,
-                branch_id: branch_id.clone(),
+                branch_id,
                 llm_call_ordinal: 1,
                 provider: "openai".to_owned(),
                 model: "gpt-5.1".to_owned(),
@@ -3367,6 +3451,16 @@ fn execution_output_renders_canonical_turn_provenance() {
     assert_eq!(
         render_turn_start_source(&TurnStartSource::RelatedSessionMessage),
         "related_session_message"
+    );
+}
+
+#[test]
+fn compaction_noop_output_does_not_claim_an_unnecessary_attempt() {
+    let output = render_compaction_output("branch-1".to_owned(), "o4-mini", None);
+
+    assert_eq!(
+        output,
+        "No context reduction was recorded for branch branch-1 on model o4-mini."
     );
 }
 
@@ -3919,4 +4013,183 @@ async fn network_slash_command_enqueues_instead_of_blocking_dispatch() {
     while let Some(pending) = app.pending_commands.pop_front() {
         pending.handle.abort();
     }
+}
+
+#[tokio::test]
+async fn enqueued_slash_command_keeps_its_invocation_branch() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind capture server");
+    let address = listener.local_addr().expect("capture server address");
+    let captured_request = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept request");
+        let mut bytes = Vec::new();
+        let body_start;
+        let content_length;
+        loop {
+            let mut chunk = [0_u8; 4096];
+            let count = socket.read(&mut chunk).await.expect("read request");
+            assert!(count > 0, "request closed before headers completed");
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                body_start = index + 4;
+                let headers = String::from_utf8_lossy(&bytes[..index]).to_ascii_lowercase();
+                content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map(str::trim)
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .expect("content length");
+                break;
+            }
+        }
+        while bytes.len() < body_start + content_length {
+            let mut chunk = [0_u8; 4096];
+            let count = socket.read(&mut chunk).await.expect("read request body");
+            assert!(count > 0, "request closed before body completed");
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        socket
+            .write_all(b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .await
+            .expect("write response");
+        serde_json::from_slice::<bt_protocol::RecordOperatorCommandRequest>(
+            &bytes[body_start..body_start + content_length],
+        )
+        .expect("operator command request")
+    });
+
+    let client =
+        BelltowerClient::try_from(format!("http://{address}/").as_str()).expect("capture client");
+    let invocation_branch = BranchId::new();
+    let mut app = ChatApp::new(
+        client,
+        SessionId::new(),
+        invocation_branch,
+        "/tmp/belltower".to_owned(),
+        ConnectionId::new("local"),
+    );
+    app.enqueue_recorded_command_output("/help", "help output".to_owned());
+    app.branch_id = BranchId::new();
+
+    let pending = app.pending_commands.pop_front().expect("pending command");
+    pending
+        .handle
+        .await
+        .expect("command task")
+        .expect("record command");
+    let request = captured_request.await.expect("capture task");
+    assert_eq!(request.branch_id, invocation_branch);
+    assert_eq!(request.raw_input, "/help");
+}
+
+#[tokio::test]
+async fn enqueued_settings_update_keeps_its_invocation_branch() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind capture server");
+    let address = listener.local_addr().expect("capture server address");
+    let session_id = SessionId::new();
+    let invocation_branch = BranchId::new();
+    let captured_request = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept request");
+        let mut bytes = Vec::new();
+        let body_start;
+        let content_length;
+        loop {
+            let mut chunk = [0_u8; 4096];
+            let count = socket.read(&mut chunk).await.expect("read request");
+            assert!(count > 0, "request closed before headers completed");
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                body_start = index + 4;
+                let headers = String::from_utf8_lossy(&bytes[..index]).to_ascii_lowercase();
+                content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map(str::trim)
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .expect("content length");
+                break;
+            }
+        }
+        while bytes.len() < body_start + content_length {
+            let mut chunk = [0_u8; 4096];
+            let count = socket.read(&mut chunk).await.expect("read request body");
+            assert!(count > 0, "request closed before body completed");
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        let request = serde_json::from_slice::<bt_protocol::UpdateSessionRequest>(
+            &bytes[body_start..body_start + content_length],
+        )
+        .expect("settings request");
+        let now = OffsetDateTime::now_utc();
+        let response = bt_protocol::CreateSessionResponse {
+            session: SessionRecord {
+                session_id,
+                project_root: "/tmp/belltower".into(),
+                connection_id: ConnectionId::new("local"),
+                model_id: Some("qwen3.5:latest".to_owned()),
+                tool_mode: SessionToolMode::Extended,
+                settings_revision_id: default_settings_revision_id() + 1,
+                created_at: now,
+                updated_at: now,
+                status: SessionStatus::Active,
+                display_name: None,
+                objective: None,
+                parent_session_id: None,
+                parent_branch_id: None,
+                parent_turn_id: None,
+            },
+            branch: bt_core::BranchRecord {
+                branch_id: invocation_branch,
+                session_id,
+                parent_branch_id: None,
+                parent_event_id: None,
+                head_event_id: None,
+                summary: None,
+                created_at: now,
+                is_default: true,
+            },
+        };
+        let response_body = serde_json::to_vec(&response).expect("serialize response");
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            response_body.len()
+        );
+        socket
+            .write_all(headers.as_bytes())
+            .await
+            .expect("write response headers");
+        socket
+            .write_all(&response_body)
+            .await
+            .expect("write response body");
+        request
+    });
+
+    let client =
+        BelltowerClient::try_from(format!("http://{address}/").as_str()).expect("capture client");
+    let mut app = ChatApp::new(
+        client,
+        session_id,
+        invocation_branch,
+        "/tmp/belltower".to_owned(),
+        ConnectionId::new("local"),
+    );
+    app.apply_session_settings(None, Some("qwen3.5:latest".to_owned()), None, false, None);
+    app.branch_id = BranchId::new();
+
+    let pending = app.pending_commands.pop_front().expect("pending command");
+    pending
+        .handle
+        .await
+        .expect("command task")
+        .expect("update settings");
+    let request = captured_request.await.expect("capture task");
+    assert_eq!(request.branch_id, invocation_branch);
 }

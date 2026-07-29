@@ -42,6 +42,7 @@ async fn stdio_registry_discovers_and_executes_tools() {
             }),
             ToolContext {
                 project_root: Utf8PathBuf::from("/tmp"),
+                cancellation: None,
             },
         )
         .await
@@ -176,6 +177,7 @@ async fn http_registry_discovers_and_executes_tools() {
             }),
             ToolContext {
                 project_root: Utf8PathBuf::from("/tmp"),
+                cancellation: None,
             },
         )
         .await

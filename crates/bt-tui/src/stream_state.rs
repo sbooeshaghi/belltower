@@ -421,10 +421,10 @@ impl ChatApp {
                     handled_by_live_cell |= self.reconcile_canonical_tool_call(call);
                 }
             }
-            if let Some(result) = message.tool_result() {
-                if self.active_or_committed_tool_call(&result.call_id) {
-                    handled_by_live_cell |= self.reconcile_canonical_tool_result(result);
-                }
+            if let Some(result) = message.tool_result()
+                && self.active_or_committed_tool_call(&result.call_id)
+            {
+                handled_by_live_cell |= self.reconcile_canonical_tool_result(result);
             }
             if handled_by_live_cell {
                 self.printed_message_ids.insert(message_key);
@@ -905,10 +905,8 @@ impl ChatApp {
                     }
                 }
 
-                if live_output_changed {
-                    if self.should_follow_messages() {
-                        self.scroll_to_bottom();
-                    }
+                if live_output_changed && self.should_follow_messages() {
+                    self.scroll_to_bottom();
                 }
             }
             EventPayload::CompletionFinished {
@@ -948,6 +946,7 @@ impl ChatApp {
                 self.clear_live_turn_boundary();
                 self.clear_live_turn_items();
                 self.clear_task_status();
+                self.request_queue_refresh_now();
                 if status == "failed" {
                     self.status = "Turn failed".to_owned();
                 }

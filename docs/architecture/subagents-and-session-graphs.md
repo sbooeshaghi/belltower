@@ -25,7 +25,8 @@ Belltower can now perform a bounded form of "spawning itself." That means:
 - attach explicit lineage to the parent session, branch, and turn
 - select a configured connection and model independently for the child
 - run the child session with its own queue, approvals, controls, and execution timeline
-- exchange typed durable messages with the parent
+- exchange typed durable messages with any distinct session in the same lineage
+  tree
 - return a typed result, progress update, or error to the parent
 
 This keeps branching, delegation, and telemetry understandable instead of collapsing them into one opaque transcript.
@@ -35,7 +36,8 @@ This keeps branching, delegation, and telemetry understandable instead of collap
 Extended-tool sessions expose four model-facing operations:
 
 - `spawn_agent` creates and starts a child session for one bounded objective
-- `send_agent_message` sends a typed message to a direct parent or child
+- `send_agent_message` sends a typed message to an explicitly addressed branch
+  of any distinct same-lineage session
 - `list_agents` reads lineage, runtime status, and recent durable mailbox state
 - `wait_agent` waits for mailbox activity for at most 30 seconds; it does not join, cancel, or hide another turn
 
@@ -47,9 +49,14 @@ Cross-session communication is a typed mailbox, not transcript reconstruction.
 Each logical message commits one `Sent` event in the source session and one
 `Received` event in the destination session atomically. Messages have a kind,
 `notify` or `wake` delivery mode, optional reply correlation, text, and artifact
-references. `notify` makes evidence available to a later turn. `wake` also asks
-an idle destination session to claim the oldest pending message and begin an
-ordinary runtime-owned turn. It never interrupts active work.
+references. New messages require `target_branch_id`; the model discovers the
+current branch through `list_agents` rather than relying on a server-side
+default. A reply's `in_reply_to` record is authoritative: source and target
+must reverse the original session-and-branch edge exactly, even if a default
+branch changes later. `notify` makes evidence available to a later turn.
+`wake` also asks an idle destination session to claim the oldest pending
+message and begin an ordinary runtime-owned turn. It never interrupts active
+work.
 
 If an active turn calls `wait_agent` and observes one or more pending `wake`
 messages, the store atomically claims those exact messages into that active
@@ -59,7 +66,8 @@ ownership fails without appending an ambiguous resolution.
 
 This is intentionally bounded:
 
-- messages are limited to direct parent-child edges
+- messages are limited to distinct sessions sharing one lineage root; parent,
+  child, sibling, and deeper-relative edges are valid
 - maximum lineage depth is four and maximum descendants per lineage is eight
 - model-facing spawn always requires human approval
 - child sessions currently share the parent's project root, so the tool also
@@ -233,7 +241,10 @@ is causal provenance and does not grant permission to append new live evidence
 to a completed turn.
 
 Related-session delivery follows the same rule. The source and destination
-event copies commit together or not at all. A `wake` claim atomically appends
+event copies commit together or not at all, and both record the explicit source
+and destination branches. A reply must reverse that immutable edge exactly;
+the runtime rejects a conflicting requested target before append and the store
+rechecks the invariant inside the delivery transaction. A `wake` claim atomically appends
 `session.related_message.resolved` plus `turn.started { source:
 related_session_message }` before provider or tool execution. The destination's
 current settings revision is captured at claim time; a concurrent settings
@@ -394,7 +405,7 @@ This is the safest first execution slice because:
 
 Status: complete for the deliberate operator path.
 
-The current manual operator surface is `/spawn [--connection <id>] [--model <model-id>] <objective>`. It is an explicit authenticated operator action rather than an agent-tool approval flow. It creates a child session, links it to the parent session, branch, and latest branch turn by default, records canonical spawn and handoff events, and leaves the operator in the parent session so the child can be resumed explicitly. It does not autonomously execute the child in the shared project root.
+The current manual operator surface is `/spawn [--connection <id>] [--model <model-id>] <objective>`. It is an explicit authenticated operator action rather than an agent-tool approval flow. It creates a child session, links it to the parent session, branch, and latest branch turn by default, records canonical spawn and handoff events, delivers the objective as a wake instruction, and dispatches the child immediately while leaving the operator in the parent session. The HTTP route supports `dispatch: false` for an intentionally prepared-but-idle child; the TUI command uses the default dispatched behavior.
 
 If `--connection` or `--model` are omitted, runtime inheritance remains the source of truth: the child inherits the parent connection, and it inherits the parent model only when the connection is unchanged. This keeps model selection explicit when the operator intentionally assigns a child session to a different provider.
 

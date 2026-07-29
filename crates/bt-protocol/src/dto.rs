@@ -207,6 +207,7 @@ pub struct SessionTreeResponse {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UpdateSessionRequest {
+    pub branch_id: BranchId,
     pub connection_id: Option<ConnectionId>,
     pub model_id: Option<String>,
     pub tool_mode: Option<SessionToolMode>,
@@ -215,6 +216,7 @@ pub struct UpdateSessionRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UpdateSessionBudgetRequest {
+    pub branch_id: BranchId,
     pub budget: BudgetConfig,
 }
 
@@ -311,16 +313,19 @@ pub struct AnswerToolRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CancelSessionRequest {
+    pub branch_id: BranchId,
     pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SteerSessionRequest {
+    pub branch_id: BranchId,
     pub message: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RecordOperatorCommandRequest {
+    pub branch_id: BranchId,
     pub command_type: String,
     pub raw_input: String,
     pub output: String,
@@ -329,6 +334,7 @@ pub struct RecordOperatorCommandRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunShellCommandRequest {
+    pub branch_id: BranchId,
     pub raw_input: String,
     pub command: String,
     pub timeout_seconds: Option<u64>,

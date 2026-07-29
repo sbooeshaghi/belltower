@@ -2,7 +2,8 @@
 
 use super::{
     AppState, build_app, build_session_system_prompt_with_provenance, build_tool_registry,
-    queue_message_input, raw_sse_payload, status_for_error, write_auth_token,
+    queue_message_input, raw_sse_payload, run_resumed_approval_turn, status_for_error,
+    write_auth_token,
 };
 use axum::response::sse::{Event, Sse};
 use axum::routing::{get, post};
@@ -180,6 +181,46 @@ fn write_auth_token_creates_parent_directories() {
     assert_eq!(
         std::fs::read_to_string(&token_path).expect("read token"),
         "test-token"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&token_path)
+                .expect("token metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn write_auth_token_atomically_replaces_a_permissive_file_as_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = TempDir::new().expect("temp dir");
+    let token_path = temp_dir.path().join("server-auth.token");
+    std::fs::write(&token_path, "old-token").expect("seed token");
+    std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o644))
+        .expect("make seed permissive");
+
+    write_auth_token(&token_path, "replacement-token").expect("replace auth token");
+
+    assert_eq!(
+        std::fs::read_to_string(&token_path).expect("read replacement"),
+        "replacement-token"
+    );
+    assert_eq!(
+        std::fs::metadata(&token_path)
+            .expect("replacement metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
     );
 }
 
@@ -2230,6 +2271,7 @@ async fn session_settings_can_be_updated() {
             &format!("sessions/{}", created.session.session_id),
         )
         .json(&UpdateSessionRequest {
+            branch_id: created.branch.branch_id,
             connection_id: Some(ConnectionId::new("openai")),
             model_id: Some("o4-mini".to_owned()),
             tool_mode: None,
@@ -2277,6 +2319,7 @@ async fn session_budget_route_configures_runtime_budget() {
             &format!("sessions/{}/budget", created.session.session_id),
         )
         .json(&UpdateSessionBudgetRequest {
+            branch_id: created.branch.branch_id,
             budget: BudgetConfig {
                 max_wall_clock_seconds: Some(30),
                 max_tokens: Some(1_000),
@@ -2312,6 +2355,352 @@ async fn session_budget_route_configures_runtime_budget() {
 }
 
 #[tokio::test]
+async fn settings_and_budget_updates_preserve_explicit_branch_provenance_across_restart() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let database_path = temp_dir.path().join("belltower.sqlite");
+    let first_server = spawn_server_with_database_path(
+        BelltowerConfig::from_embedded().expect("config"),
+        &database_path,
+        None,
+    )
+    .await;
+    let client = Client::new();
+
+    let created: CreateSessionResponse = first_server
+        .request(&client, Method::POST, "sessions")
+        .json(&CreateSessionRequest {
+            approval_mode: None,
+            project_root: "/tmp/project".to_owned(),
+            connection_id: ConnectionId::new("local"),
+            model_id: None,
+            tool_mode: None,
+            display_name: Some("branch-provenance".to_owned()),
+            objective: None,
+            budget: None,
+        })
+        .send()
+        .await
+        .expect("create session")
+        .json()
+        .await
+        .expect("create session body");
+    let child: CreateBranchResponse = first_server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/branches", created.session.session_id),
+        )
+        .json(&CreateBranchRequest {
+            from_branch_id: created.branch.branch_id,
+            from_event_id: None,
+            activate: false,
+            carry_summary: false,
+        })
+        .send()
+        .await
+        .expect("create child branch")
+        .json()
+        .await
+        .expect("create child branch body");
+    assert_eq!(
+        first_server
+            .runtime
+            .default_branch(created.session.session_id)
+            .expect("default branch")
+            .expect("default branch exists")
+            .branch_id,
+        created.branch.branch_id
+    );
+    let root_head_before = first_server
+        .runtime
+        .load_branch(created.session.session_id, created.branch.branch_id)
+        .expect("load root before policy updates")
+        .expect("root before policy updates")
+        .head_event_id;
+    let child_head_before = first_server
+        .runtime
+        .load_branch(created.session.session_id, child.branch.branch_id)
+        .expect("load child before policy updates")
+        .expect("child before policy updates")
+        .head_event_id;
+
+    let updated: CreateSessionResponse = first_server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}", created.session.session_id),
+        )
+        .json(&UpdateSessionRequest {
+            branch_id: child.branch.branch_id,
+            connection_id: Some(ConnectionId::new("openai")),
+            model_id: Some("o4-mini".to_owned()),
+            tool_mode: Some(SessionToolMode::Standard),
+            reset_model_to_default: false,
+        })
+        .send()
+        .await
+        .expect("update settings on child branch")
+        .json()
+        .await
+        .expect("settings response");
+    assert_eq!(updated.branch.branch_id, child.branch.branch_id);
+    assert_eq!(updated.session.connection_id, ConnectionId::new("openai"));
+
+    let budget_response: SessionInspectionResponse = first_server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/budget", created.session.session_id),
+        )
+        .json(&UpdateSessionBudgetRequest {
+            branch_id: child.branch.branch_id,
+            budget: BudgetConfig {
+                max_wall_clock_seconds: Some(90),
+                max_tokens: Some(4_000),
+                max_turns: Some(5),
+                max_cost_usd: Some(2.5),
+            },
+        })
+        .send()
+        .await
+        .expect("update budget on child branch")
+        .json()
+        .await
+        .expect("budget response");
+    assert_eq!(
+        budget_response
+            .inspection
+            .budget
+            .as_ref()
+            .expect("budget projection")
+            .budget
+            .max_turns,
+        Some(5)
+    );
+
+    let source_events = first_server
+        .runtime
+        .all_events(created.session.session_id)
+        .expect("source events");
+    let policy_events = source_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.payload,
+                EventPayload::SessionSettingsUpdated { .. } | EventPayload::BudgetConfigured { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(policy_events.len(), 2);
+    assert!(
+        policy_events
+            .iter()
+            .all(|event| event.branch_id == child.branch.branch_id)
+    );
+    assert!(
+        policy_events
+            .iter()
+            .any(|event| { matches!(event.payload, EventPayload::SessionSettingsUpdated { .. }) })
+    );
+    let budget_event_id = policy_events
+        .iter()
+        .find(|event| matches!(event.payload, EventPayload::BudgetConfigured { .. }))
+        .expect("budget event")
+        .event_id;
+    assert!(!source_events.iter().any(|event| {
+        event.branch_id == created.branch.branch_id
+            && matches!(
+                event.payload,
+                EventPayload::SessionSettingsUpdated { .. } | EventPayload::BudgetConfigured { .. }
+            )
+    }));
+    let root_head_after = first_server
+        .runtime
+        .load_branch(created.session.session_id, created.branch.branch_id)
+        .expect("load root after policy updates")
+        .expect("root after policy updates")
+        .head_event_id;
+    let child_head_after = first_server
+        .runtime
+        .load_branch(created.session.session_id, child.branch.branch_id)
+        .expect("load child after policy updates")
+        .expect("child after policy updates")
+        .head_event_id;
+    assert_eq!(root_head_after, root_head_before);
+    assert_ne!(child_head_after, child_head_before);
+    assert_eq!(child_head_after, Some(budget_event_id));
+
+    let unrelated: CreateSessionResponse = first_server
+        .request(&client, Method::POST, "sessions")
+        .json(&CreateSessionRequest {
+            approval_mode: None,
+            project_root: "/tmp/project".to_owned(),
+            connection_id: ConnectionId::new("local"),
+            model_id: None,
+            tool_mode: None,
+            display_name: Some("foreign".to_owned()),
+            objective: None,
+            budget: None,
+        })
+        .send()
+        .await
+        .expect("create unrelated session")
+        .json()
+        .await
+        .expect("unrelated session body");
+    let event_count = source_events.len();
+    let rejected_settings = first_server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}", created.session.session_id),
+        )
+        .json(&UpdateSessionRequest {
+            branch_id: unrelated.branch.branch_id,
+            connection_id: Some(ConnectionId::new("local")),
+            model_id: None,
+            tool_mode: None,
+            reset_model_to_default: false,
+        })
+        .send()
+        .await
+        .expect("foreign settings response");
+    assert_error_response(
+        rejected_settings,
+        StatusCode::NOT_FOUND,
+        ErrorClass::NotFound,
+    )
+    .await;
+    let rejected_budget = first_server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/budget", created.session.session_id),
+        )
+        .json(&UpdateSessionBudgetRequest {
+            branch_id: unrelated.branch.branch_id,
+            budget: BudgetConfig::default(),
+        })
+        .send()
+        .await
+        .expect("foreign budget response");
+    assert_error_response(rejected_budget, StatusCode::NOT_FOUND, ErrorClass::NotFound).await;
+    assert_eq!(
+        first_server
+            .runtime
+            .all_events(created.session.session_id)
+            .expect("events after rejected writes")
+            .len(),
+        event_count
+    );
+
+    drop(first_server);
+    let second_server = spawn_server_with_database_path(
+        BelltowerConfig::from_embedded().expect("restart config"),
+        &database_path,
+        None,
+    )
+    .await;
+    let restarted: SessionInspectionResponse = second_server
+        .request(
+            &client,
+            Method::GET,
+            &format!("sessions/{}", created.session.session_id),
+        )
+        .send()
+        .await
+        .expect("restart inspection")
+        .json()
+        .await
+        .expect("restart inspection body");
+    assert_eq!(
+        restarted.inspection.session.connection_id,
+        ConnectionId::new("openai")
+    );
+    assert_eq!(
+        restarted
+            .inspection
+            .budget
+            .as_ref()
+            .expect("restarted budget")
+            .budget
+            .max_turns,
+        Some(5)
+    );
+    assert_eq!(
+        second_server
+            .runtime
+            .default_branch(created.session.session_id)
+            .expect("restarted default branch")
+            .expect("restarted default branch exists")
+            .branch_id,
+        created.branch.branch_id
+    );
+    assert_eq!(
+        second_server
+            .runtime
+            .load_branch(created.session.session_id, created.branch.branch_id)
+            .expect("load restarted root")
+            .expect("restarted root")
+            .head_event_id,
+        root_head_after
+    );
+    assert_eq!(
+        second_server
+            .runtime
+            .load_branch(created.session.session_id, child.branch.branch_id)
+            .expect("load restarted child")
+            .expect("restarted child")
+            .head_event_id,
+        child_head_after
+    );
+
+    let exported: SessionExportResponse = second_server
+        .request(
+            &client,
+            Method::GET,
+            &format!("sessions/{}/export/jsonl", created.session.session_id),
+        )
+        .send()
+        .await
+        .expect("export after restart")
+        .json()
+        .await
+        .expect("export body");
+    let exported_events = exported
+        .content
+        .lines()
+        .map(serde_json::from_str::<EventEnvelope>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("exported events");
+    let exported_policy_events = exported_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.payload,
+                EventPayload::SessionSettingsUpdated { .. } | EventPayload::BudgetConfigured { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(exported_policy_events.len(), 2);
+    assert!(
+        exported_policy_events
+            .iter()
+            .all(|event| event.branch_id == child.branch.branch_id)
+    );
+    assert!(
+        exported_policy_events
+            .iter()
+            .any(|event| { matches!(event.payload, EventPayload::SessionSettingsUpdated { .. }) })
+    );
+    assert!(
+        exported_policy_events
+            .iter()
+            .any(|event| { matches!(event.payload, EventPayload::BudgetConfigured { .. }) })
+    );
+}
+
+#[tokio::test]
 async fn compact_route_runs_runtime_owned_compaction() {
     let server = spawn_server(BelltowerConfig::from_embedded().expect("config")).await;
     let client = Client::new();
@@ -2335,13 +2724,14 @@ async fn compact_route_runs_runtime_owned_compaction() {
         .await
         .expect("create session body");
 
+    let first_context = "first task context ".repeat(1_000);
     server
         .runtime
         .append_message(
             &created.session,
             &created.branch,
             Role::User,
-            "first task context",
+            &first_context,
         )
         .expect("first message");
     server
@@ -2435,6 +2825,86 @@ async fn compact_route_runs_runtime_owned_compaction() {
         }
         _ => unreachable!("matched context compacted event"),
     }
+}
+
+#[tokio::test]
+async fn compact_route_returns_truthful_noop_without_compaction_event() {
+    let server = spawn_server(BelltowerConfig::from_embedded().expect("config")).await;
+    let client = Client::new();
+
+    let created: CreateSessionResponse = server
+        .request(&client, Method::POST, "sessions")
+        .json(&CreateSessionRequest {
+            approval_mode: None,
+            project_root: "/tmp/project".to_owned(),
+            connection_id: ConnectionId::new("openai"),
+            model_id: Some("o4-mini".to_owned()),
+            tool_mode: None,
+            display_name: Some("compact-noop".to_owned()),
+            objective: None,
+            budget: None,
+        })
+        .send()
+        .await
+        .expect("create session")
+        .json()
+        .await
+        .expect("create session body");
+
+    server
+        .runtime
+        .append_message(
+            &created.session,
+            &created.branch,
+            Role::User,
+            "first task context",
+        )
+        .expect("first message");
+    server
+        .runtime
+        .append_message(
+            &created.session,
+            &created.branch,
+            Role::Assistant,
+            "acknowledged",
+        )
+        .expect("assistant message");
+    server
+        .runtime
+        .append_message(
+            &created.session,
+            &created.branch,
+            Role::User,
+            "latest request",
+        )
+        .expect("latest message");
+
+    let response: CompactSessionResponse = server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/compact", created.session.session_id),
+        )
+        .json(&CompactSessionRequest {
+            branch_id: created.branch.branch_id,
+        })
+        .send()
+        .await
+        .expect("compact request")
+        .json()
+        .await
+        .expect("compact response");
+
+    assert!(response.compaction.is_none());
+    let events = server
+        .runtime
+        .all_events(created.session.session_id)
+        .expect("events after no-op");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::ContextCompacted { .. }))
+    );
 }
 
 #[tokio::test]
@@ -3824,6 +4294,25 @@ async fn operator_commands_are_recorded_in_session_events() {
         .await
         .expect("create session body");
 
+    let child: CreateBranchResponse = server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/branches", created.session.session_id),
+        )
+        .json(&CreateBranchRequest {
+            from_branch_id: created.branch.branch_id,
+            from_event_id: None,
+            activate: false,
+            carry_summary: false,
+        })
+        .send()
+        .await
+        .expect("create child branch")
+        .json()
+        .await
+        .expect("create child branch body");
+
     let response = server
         .request(
             &client,
@@ -3831,6 +4320,7 @@ async fn operator_commands_are_recorded_in_session_events() {
             &format!("sessions/{}/commands", created.session.session_id),
         )
         .json(&RecordOperatorCommandRequest {
+            branch_id: child.branch.branch_id,
             command_type: "slash_command".to_owned(),
             raw_input: "/help".to_owned(),
             output: "help output".to_owned(),
@@ -3854,18 +4344,56 @@ async fn operator_commands_are_recorded_in_session_events() {
         .await
         .expect("events body");
 
-    assert!(events.events.iter().any(|event| matches!(
-        &event.payload,
-        EventPayload::OperatorCommandRecorded {
-            command_type,
-            raw_input,
-            output,
-            success,
-        } if command_type == "slash_command"
-            && raw_input == "/help"
-            && output == "help output"
-            && *success
-    )));
+    assert!(events.events.iter().any(|event| {
+        event.branch_id == child.branch.branch_id
+            && matches!(
+                &event.payload,
+                EventPayload::OperatorCommandRecorded {
+                    command_type,
+                    raw_input,
+                    output,
+                    success,
+                } if command_type == "slash_command"
+                    && raw_input == "/help"
+                    && output == "help output"
+                    && *success
+            )
+    }));
+
+    let child_commands: BranchOperatorCommandsResponse = server
+        .request(
+            &client,
+            Method::GET,
+            &format!(
+                "sessions/{}/branches/{}/commands",
+                created.session.session_id, child.branch.branch_id
+            ),
+        )
+        .send()
+        .await
+        .expect("child commands")
+        .json()
+        .await
+        .expect("child commands body");
+    assert_eq!(child_commands.events.len(), 1);
+    assert_eq!(child_commands.events[0].branch_id, child.branch.branch_id);
+
+    let root_commands: BranchOperatorCommandsResponse = server
+        .request(
+            &client,
+            Method::GET,
+            &format!(
+                "sessions/{}/branches/{}/commands",
+                created.session.session_id, created.branch.branch_id
+            ),
+        )
+        .send()
+        .await
+        .expect("root commands")
+        .json()
+        .await
+        .expect("root commands body");
+    assert!(root_commands.events.is_empty());
 }
 
 #[tokio::test]
@@ -4724,6 +5252,16 @@ async fn operator_shell_commands_record_tool_and_command_events() {
         .json()
         .await
         .expect("create session body");
+    let child = server
+        .runtime
+        .create_branch(
+            created.session.session_id,
+            created.branch.branch_id,
+            None,
+            false,
+            None,
+        )
+        .expect("create child branch");
 
     let response = server
         .request(
@@ -4732,6 +5270,7 @@ async fn operator_shell_commands_record_tool_and_command_events() {
             &format!("sessions/{}/commands/shell", created.session.session_id),
         )
         .json(&RunShellCommandRequest {
+            branch_id: child.branch_id,
             raw_input: "!printf ok".to_owned(),
             command: "printf ok".to_owned(),
             timeout_seconds: Some(5),
@@ -4774,6 +5313,14 @@ async fn operator_shell_commands_record_tool_and_command_events() {
         .iter()
         .position(|event| matches!(event.payload, EventPayload::OperatorCommandRecorded { .. }))
         .expect("operator command audit event");
+    for event in [
+        &events.events[operation_index],
+        &events.events[request_index],
+        &events.events[terminal_index],
+        &events.events[command_index],
+    ] {
+        assert_eq!(event.branch_id, child.branch_id);
+    }
     assert_eq!(request_index, operation_index + 1);
     assert_eq!(command_index, terminal_index + 1);
     assert!(!events.events.iter().any(|event| {
@@ -4855,6 +5402,7 @@ async fn operator_shell_request_admission_is_atomic_on_storage_failure() {
             &format!("sessions/{}/commands/shell", created.session.session_id),
         )
         .json(&RunShellCommandRequest {
+            branch_id: created.branch.branch_id,
             raw_input: "!printf should-not-run".to_owned(),
             command: "printf should-not-run".to_owned(),
             timeout_seconds: Some(5),
@@ -4909,12 +5457,14 @@ async fn operator_shell_route_recovers_terminal_batch_after_storage_failure() {
         created.session.session_id
     ));
     let token = server.token.clone();
+    let branch_id = created.branch.branch_id;
     let request_task = tokio::spawn(async move {
         request_client
             .post(request_url)
             .bearer_auth(token)
             .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
             .json(&RunShellCommandRequest {
+                branch_id,
                 raw_input: "!sleep 1; printf ok".to_owned(),
                 command: "sleep 1; printf ok".to_owned(),
                 timeout_seconds: Some(5),
@@ -5252,6 +5802,7 @@ async fn event_stream_replays_from_last_event_id_and_delivers_live_updates() {
             &format!("sessions/{}/steer", created.session.session_id),
         )
         .json(&SteerSessionRequest {
+            branch_id: created.branch.branch_id,
             message: "seed".to_owned(),
         })
         .send()
@@ -5280,6 +5831,7 @@ async fn event_stream_replays_from_last_event_id_and_delivers_live_updates() {
             &format!("sessions/{}/steer", created.session.session_id),
         )
         .json(&SteerSessionRequest {
+            branch_id: created.branch.branch_id,
             message: "replayed".to_owned(),
         })
         .send()
@@ -5316,6 +5868,7 @@ async fn event_stream_replays_from_last_event_id_and_delivers_live_updates() {
             &format!("sessions/{}/steer", created.session.session_id),
         )
         .json(&SteerSessionRequest {
+            branch_id: created.branch.branch_id,
             message: "live".to_owned(),
         })
         .send()
@@ -5576,6 +6129,7 @@ async fn event_stream_replays_across_process_restart_without_duplicates() {
         .record_operator_command(
             created.session.session_id,
             &RecordOperatorCommandRequest {
+                branch_id: created.branch.branch_id,
                 command_type: "slash_command".to_owned(),
                 raw_input: "/seed".to_owned(),
                 output: "restart-replay-seed".to_owned(),
@@ -5609,6 +6163,7 @@ async fn event_stream_replays_across_process_restart_without_duplicates() {
         .record_operator_command(
             created.session.session_id,
             &RecordOperatorCommandRequest {
+                branch_id: created.branch.branch_id,
                 command_type: "slash_command".to_owned(),
                 raw_input: "/history".to_owned(),
                 output: "restart-replay-a".to_owned(),
@@ -5623,6 +6178,7 @@ async fn event_stream_replays_across_process_restart_without_duplicates() {
         .record_operator_command(
             created.session.session_id,
             &RecordOperatorCommandRequest {
+                branch_id: created.branch.branch_id,
                 command_type: "slash_command".to_owned(),
                 raw_input: "/status".to_owned(),
                 output: "restart-replay-b".to_owned(),
@@ -5708,6 +6264,7 @@ async fn event_stream_replays_across_process_restart_without_duplicates() {
         .record_operator_command(
             created.session.session_id,
             &RecordOperatorCommandRequest {
+                branch_id: created.branch.branch_id,
                 command_type: "slash_command".to_owned(),
                 raw_input: "/session".to_owned(),
                 output: "restart-replay-c".to_owned(),
@@ -5943,6 +6500,7 @@ async fn inspection_contract_min_reconstructs_canonical_session_truth() {
         .record_operator_command(
             created.session.session_id,
             &RecordOperatorCommandRequest {
+                branch_id: created.branch.branch_id,
                 command_type: "slash_command".to_owned(),
                 raw_input: "/status".to_owned(),
                 output: "status output".to_owned(),
@@ -6370,10 +6928,22 @@ async fn control_persistence_survives_restart_via_protocol_path() {
         })
         .await
         .expect("create session");
+    let child = client
+        .create_branch(
+            created.session.session_id,
+            &CreateBranchRequest {
+                from_branch_id: created.branch.branch_id,
+                from_event_id: None,
+                activate: false,
+                carry_summary: false,
+            },
+        )
+        .await
+        .expect("create non-default child branch");
 
     let send_client = client.clone();
     let session_id = created.session.session_id;
-    let branch_id = created.branch.branch_id;
+    let branch_id = child.branch.branch_id;
     let send_handle = tokio::spawn(async move {
         send_client
             .send_message(
@@ -6386,12 +6956,71 @@ async fn control_persistence_survives_restart_via_protocol_path() {
             .await
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    for _ in 0..100 {
+        if first_server
+            .runtime
+            .active_turn_claim(created.session.session_id)
+            .expect("active turn lookup")
+            .is_some_and(|(active_branch_id, _)| active_branch_id == branch_id)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        first_server
+            .runtime
+            .active_turn_claim(created.session.session_id)
+            .expect("active child turn")
+            .is_some_and(|(active_branch_id, _)| active_branch_id == branch_id)
+    );
+
+    let raw_client = Client::new();
+    let wrong_steer = first_server
+        .request(
+            &raw_client,
+            Method::POST,
+            &format!("sessions/{}/steer", created.session.session_id),
+        )
+        .json(&SteerSessionRequest {
+            branch_id: created.branch.branch_id,
+            message: "wrong branch".to_owned(),
+        })
+        .send()
+        .await
+        .expect("cross-branch steer response");
+    assert_eq!(wrong_steer.status(), StatusCode::BAD_REQUEST);
+    let wrong_cancel = first_server
+        .request(
+            &raw_client,
+            Method::POST,
+            &format!("sessions/{}/cancel", created.session.session_id),
+        )
+        .json(&CancelSessionRequest {
+            branch_id: created.branch.branch_id,
+            reason: Some("wrong branch".to_owned()),
+        })
+        .send()
+        .await
+        .expect("cross-branch cancel response");
+    assert_eq!(wrong_cancel.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !first_server
+            .runtime
+            .all_events(created.session.session_id)
+            .expect("events after rejected controls")
+            .iter()
+            .any(|event| matches!(
+                event.payload,
+                EventPayload::SessionSteered { .. } | EventPayload::SessionCancelled { .. }
+            ))
+    );
 
     let steer = client
         .steer_session(
             created.session.session_id,
             &SteerSessionRequest {
+                branch_id,
                 message: "keep going".to_owned(),
             },
         )
@@ -6403,6 +7032,7 @@ async fn control_persistence_survives_restart_via_protocol_path() {
         .cancel_session(
             created.session.session_id,
             &CancelSessionRequest {
+                branch_id,
                 reason: Some("user request".to_owned()),
             },
         )
@@ -6438,21 +7068,51 @@ async fn control_persistence_survives_restart_via_protocol_path() {
         .session_queue(created.session.session_id)
         .await
         .expect("restarted queue inspection");
-    assert!(restarted_queue.inspection.cancel_requested);
-    assert_eq!(restarted_queue.inspection.pending_steer_count, 1);
+    if restarted_queue.inspection.cancel_requested {
+        assert_eq!(restarted_queue.inspection.pending_steer_count, 1);
+    } else {
+        assert_eq!(restarted_queue.inspection.pending_steer_count, 0);
+    }
 
     let restarted_events = restarted_client
         .session_events(created.session.session_id, None)
         .await
         .expect("restarted events");
-    assert!(restarted_events.events.iter().any(|event| matches!(
-        &event.payload,
-        EventPayload::SessionCancelled { reason } if reason == "user request"
-    )));
-    assert!(restarted_events.events.iter().any(|event| matches!(
-        &event.payload,
-        EventPayload::SessionSteered { message, .. } if message == "keep going"
-    )));
+    assert!(restarted_events.events.iter().any(|event| {
+        event.branch_id == branch_id
+            && matches!(
+                &event.payload,
+                EventPayload::SessionCancelled { reason } if reason == "user request"
+            )
+    }));
+    if !restarted_queue.inspection.cancel_requested {
+        assert!(
+            restarted_events
+                .events
+                .iter()
+                .any(|event| matches!(event.payload, EventPayload::SessionCancelCleared { .. }))
+        );
+        assert!(
+            restarted_events
+                .events
+                .iter()
+                .any(|event| matches!(event.payload, EventPayload::SessionSteersResolved { .. }))
+        );
+    }
+    assert!(restarted_events.events.iter().any(|event| {
+        event.branch_id == branch_id
+            && matches!(
+                &event.payload,
+                EventPayload::SessionSteered { message, .. } if message == "keep going"
+            )
+    }));
+    assert!(!restarted_events.events.iter().any(|event| {
+        event.branch_id == created.branch.branch_id
+            && matches!(
+                event.payload,
+                EventPayload::SessionCancelled { .. } | EventPayload::SessionSteered { .. }
+            )
+    }));
 }
 
 #[tokio::test]
@@ -7336,6 +7996,7 @@ async fn approval_resume_keeps_paused_settings_revision_after_session_model_chan
             &format!("sessions/{}", created.session.session_id),
         )
         .json(&UpdateSessionRequest {
+            branch_id: created.branch.branch_id,
             connection_id: None,
             model_id: Some("updated-model".to_owned()),
             tool_mode: None,
@@ -7862,6 +8523,410 @@ async fn approved_tool_resume_closes_turn_when_initial_terminal_append_fails() {
 }
 
 #[tokio::test]
+async fn cancellation_interrupts_approval_resumed_shell_and_records_one_terminal_result() {
+    let server = spawn_server(BelltowerConfig::from_embedded().expect("config")).await;
+    let client = Client::new();
+    let project_root = tempfile::TempDir::new().expect("project root");
+    let marker = project_root.path().join("resumed-tool-started");
+    let linger = project_root.path().join("resumed-tool-linger");
+    let command = format!(
+        "touch '{}' && sleep 5 && touch '{}'",
+        marker.display(),
+        linger.display()
+    );
+    let (session, branch) = server
+        .runtime
+        .create_session(
+            project_root.path().display().to_string().into(),
+            ConnectionId::new("local"),
+            None,
+            SessionToolMode::Extended,
+            Some("resumed-cancel".to_owned()),
+            None,
+        )
+        .expect("create session");
+    let paused_turn_id = TurnId::new();
+    let call_id = ToolCallId::new("call-resumed-cancel");
+    let arguments = serde_json::json!({"command": command, "timeout_seconds": 10});
+    let tool_call = ToolCall {
+        tool_name: "shell".to_owned(),
+        call_id: call_id.to_string(),
+        arguments: arguments.clone(),
+    };
+    let approval_request = bt_core::ApprovalRequest {
+        session_id: session.session_id,
+        call_id: call_id.clone(),
+        tool_name: "shell".to_owned(),
+        arguments: arguments.clone(),
+        requirement: bt_core::ApprovalRequirement::Always,
+        tool_metadata: bt_core::ToolMetadata {
+            risk_class: bt_core::ToolRiskClass::High,
+            is_read_only: false,
+            is_concurrency_safe: false,
+            interrupt_behavior: bt_core::ToolInterruptBehavior::TerminateProcess,
+            execution_mode: bt_core::ToolExecutionMode::Immediate,
+            should_defer: false,
+            catalogue_tags: vec!["execution".to_owned()],
+            display_group: bt_core::ToolDisplayGroup::Execution,
+        },
+        requested_at: time::OffsetDateTime::now_utc(),
+    };
+    server
+        .runtime
+        .append_message(&session, &branch, Role::User, "run and wait")
+        .expect("append user message");
+    server
+        .runtime
+        .record_turn_started(
+            session.session_id,
+            branch.branch_id,
+            paused_turn_id,
+            "openai-compatible".to_owned(),
+            "test-model".to_owned(),
+            1,
+            session.settings_revision_id,
+            TurnStartSource::UserMessage,
+            None,
+        )
+        .expect("record paused turn");
+    server
+        .runtime
+        .append_raw_message(
+            &session,
+            &branch,
+            Message::from_part(Role::Assistant, MessagePart::ToolCall { call: tool_call }),
+            Some(paused_turn_id),
+        )
+        .expect("append tool call");
+    server
+        .runtime
+        .record_tool_call_requested(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            arguments,
+            Some(paused_turn_id),
+        )
+        .expect("tool request");
+    server
+        .runtime
+        .record_approval_requested_for_request(
+            session.session_id,
+            branch.branch_id,
+            &approval_request,
+            Some(paused_turn_id),
+        )
+        .expect("approval request");
+    server
+        .runtime
+        .record_turn_finished(
+            session.session_id,
+            branch.branch_id,
+            paused_turn_id,
+            "openai-compatible".to_owned(),
+            "test-model".to_owned(),
+            "awaiting_approval".to_owned(),
+            Some("ToolCalls".to_owned()),
+            1,
+        )
+        .expect("finish paused turn");
+
+    let approve = server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/approve", session.session_id),
+        )
+        .json(&ApproveToolRequest {
+            call_id: call_id.clone(),
+            tool_name: "shell".to_owned(),
+            scope: ApprovalScope::Once,
+            decision: ApprovalDecision::Approved {
+                decided_at: time::OffsetDateTime::now_utc(),
+                decided_by: "test".to_owned(),
+                scope: ApprovalScope::Once,
+                source: ApprovalDecisionSource::Human,
+            },
+        })
+        .send()
+        .await
+        .expect("approve");
+    assert_eq!(approve.status(), StatusCode::ACCEPTED);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !marker.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("resumed shell starts");
+
+    let cancel_started = std::time::Instant::now();
+    let cancel = server
+        .request(
+            &client,
+            Method::POST,
+            &format!("sessions/{}/cancel", session.session_id),
+        )
+        .json(&bt_protocol::CancelSessionRequest {
+            branch_id: branch.branch_id,
+            reason: Some("stop resumed shell".to_owned()),
+        })
+        .send()
+        .await
+        .expect("cancel");
+    assert_eq!(cancel.status(), StatusCode::ACCEPTED);
+    settle(&api_client(&server), session.session_id).await;
+    assert!(cancel_started.elapsed() < std::time::Duration::from_secs(1));
+
+    let events = server
+        .runtime
+        .all_events(session.session_id)
+        .expect("events");
+    let resumed_turn_id = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            EventPayload::TurnStarted {
+                source: TurnStartSource::ApprovalResume,
+                ..
+            } => event.turn_id,
+            _ => None,
+        })
+        .expect("resumed turn");
+    let terminal_results = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::ToolExecutionFinished {
+                call_id: recorded,
+                result,
+                ..
+            } if *recorded == call_id && event.turn_id == Some(resumed_turn_id) => Some(result),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_results.len(), 1);
+    assert_eq!(terminal_results[0].output["cancelled"], true);
+    assert!(events.iter().any(|event| {
+        event.turn_id == Some(resumed_turn_id)
+            && matches!(
+                &event.payload,
+                EventPayload::TurnFinished { status, .. } if status == "cancelled"
+            )
+    }));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !linger.exists(),
+        "cancelled process group must not continue"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_before_approval_worker_start_never_executes_the_side_effect() {
+    let server = spawn_server(BelltowerConfig::from_embedded().expect("config")).await;
+    let project_root = tempfile::TempDir::new().expect("project root");
+    let marker = project_root.path().join("must-not-start");
+    let command = format!("touch '{}'", marker.display());
+    let (session, branch) = server
+        .runtime
+        .create_session(
+            project_root.path().display().to_string().into(),
+            ConnectionId::new("local"),
+            None,
+            SessionToolMode::Extended,
+            Some("cancel-before-resumed-worker".to_owned()),
+            None,
+        )
+        .expect("create session");
+    let paused_turn_id = TurnId::new();
+    let call_id = ToolCallId::new("call-cancel-before-resume");
+    let arguments = serde_json::json!({"command": command, "timeout_seconds": 10});
+    let tool_call = ToolCall {
+        tool_name: "shell".to_owned(),
+        call_id: call_id.to_string(),
+        arguments: arguments.clone(),
+    };
+    let approval_request = bt_core::ApprovalRequest {
+        session_id: session.session_id,
+        call_id: call_id.clone(),
+        tool_name: "shell".to_owned(),
+        arguments: arguments.clone(),
+        requirement: bt_core::ApprovalRequirement::Always,
+        tool_metadata: bt_core::ToolMetadata {
+            risk_class: bt_core::ToolRiskClass::High,
+            is_read_only: false,
+            is_concurrency_safe: false,
+            interrupt_behavior: bt_core::ToolInterruptBehavior::TerminateProcess,
+            execution_mode: bt_core::ToolExecutionMode::Immediate,
+            should_defer: false,
+            catalogue_tags: vec!["execution".to_owned()],
+            display_group: bt_core::ToolDisplayGroup::Execution,
+        },
+        requested_at: time::OffsetDateTime::now_utc(),
+    };
+    server
+        .runtime
+        .append_message(&session, &branch, Role::User, "run only if not cancelled")
+        .expect("append user message");
+    server
+        .runtime
+        .record_turn_started(
+            session.session_id,
+            branch.branch_id,
+            paused_turn_id,
+            "openai-compatible".to_owned(),
+            "test-model".to_owned(),
+            1,
+            session.settings_revision_id,
+            TurnStartSource::UserMessage,
+            None,
+        )
+        .expect("record paused turn");
+    server
+        .runtime
+        .append_raw_message(
+            &session,
+            &branch,
+            Message::from_part(
+                Role::Assistant,
+                MessagePart::ToolCall {
+                    call: tool_call.clone(),
+                },
+            ),
+            Some(paused_turn_id),
+        )
+        .expect("append tool call");
+    server
+        .runtime
+        .record_tool_call_requested(
+            session.session_id,
+            branch.branch_id,
+            call_id.clone(),
+            "shell".to_owned(),
+            arguments,
+            Some(paused_turn_id),
+        )
+        .expect("tool request");
+    server
+        .runtime
+        .record_approval_requested_for_request(
+            session.session_id,
+            branch.branch_id,
+            &approval_request,
+            Some(paused_turn_id),
+        )
+        .expect("approval request");
+    server
+        .runtime
+        .record_turn_finished(
+            session.session_id,
+            branch.branch_id,
+            paused_turn_id,
+            "openai-compatible".to_owned(),
+            "test-model".to_owned(),
+            "awaiting_approval".to_owned(),
+            Some("ToolCalls".to_owned()),
+            1,
+        )
+        .expect("finish paused turn");
+
+    let resumable = server
+        .runtime
+        .resumable_approval_call(session.session_id, call_id.clone(), "shell")
+        .expect("resumable lookup")
+        .expect("pending approval");
+    let decision = ApprovalDecision::Approved {
+        decided_at: time::OffsetDateTime::now_utc(),
+        decided_by: "test".to_owned(),
+        scope: ApprovalScope::Once,
+        source: ApprovalDecisionSource::Human,
+    };
+    let resumed = server
+        .runtime
+        .bootstrap_resumed_approval_turn(&resumable, &approval_request, decision.clone())
+        .expect("bootstrap resumed turn");
+    let resumed_turn_id = resumed.turn_id();
+    let turn_session = server
+        .runtime
+        .session_for_settings_revision(&resumable.session, resumed.settings_revision_id())
+        .expect("resumed settings");
+    let connection = server
+        .runtime
+        .connection(&turn_session.connection_id)
+        .expect("connection");
+    let model_id = turn_session
+        .model_id
+        .clone()
+        .unwrap_or_else(|| connection.default_model.clone());
+    server
+        .runtime
+        .cancel_session(
+            session.session_id,
+            branch.branch_id,
+            "cancel before worker starts",
+        )
+        .expect("canonical cancellation");
+
+    run_resumed_approval_turn(
+        AppState {
+            runtime: Arc::clone(&server.runtime),
+            token: Arc::new(server.token.clone()),
+        },
+        turn_session,
+        branch.clone(),
+        connection,
+        model_id,
+        resumed,
+        resumable,
+        decision,
+    )
+    .await
+    .expect("cancelled resumed work settles truthfully");
+
+    assert!(!marker.exists(), "cancelled side effect must never start");
+    let events = server
+        .runtime
+        .all_events(session.session_id)
+        .expect("events");
+    let terminal_results = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::ToolExecutionFinished {
+                call_id: recorded,
+                result,
+                ..
+            } if *recorded == call_id && event.turn_id == Some(resumed_turn_id) => Some(result),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_results.len(), 1);
+    assert_eq!(terminal_results[0].output["cancelled"], true);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.turn_id == Some(resumed_turn_id)
+                && matches!(
+                    &event.payload,
+                    EventPayload::TurnFinished { status, .. } if status == "cancelled"
+                ))
+            .count(),
+        1
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::SessionCancelCleared { .. }))
+    );
+    assert!(
+        !server
+            .runtime
+            .inspect_queue(session.session_id)
+            .expect("queue inspection")
+            .expect("session queue")
+            .cancel_requested
+    );
+}
+
+#[tokio::test]
 async fn answer_round_trip_starts_resumed_turn_before_result_events() {
     let mock_provider = spawn_mock_provider().await;
     let server = spawn_server(config_for_mock_provider(&mock_provider.base_url)).await;
@@ -8301,6 +9366,7 @@ async fn answer_resume_keeps_paused_settings_revision_after_session_model_change
             &format!("sessions/{}", created.session.session_id),
         )
         .json(&UpdateSessionRequest {
+            branch_id: created.branch.branch_id,
             connection_id: None,
             model_id: Some("updated-model".to_owned()),
             tool_mode: None,
@@ -8521,6 +9587,7 @@ async fn idle_cancel_request_does_not_queue_next_direct_message() {
             &format!("sessions/{}/cancel", created.session.session_id),
         )
         .json(&CancelSessionRequest {
+            branch_id: created.branch.branch_id,
             reason: Some("cancel before follow-up".to_owned()),
         })
         .send()
@@ -8610,6 +9677,7 @@ async fn steer_during_in_flight_turn_runs_a_follow_up_turn() {
             &format!("sessions/{}/steer", created.session.session_id),
         )
         .json(&SteerSessionRequest {
+            branch_id: created.branch.branch_id,
             message: "answer in one sentence".to_owned(),
         })
         .send()
@@ -8673,7 +9741,7 @@ async fn steer_during_in_flight_turn_runs_a_follow_up_turn() {
 
 #[tokio::test]
 async fn cancel_during_in_flight_turn_drops_pending_steer_follow_up() {
-    let mock_provider = spawn_mock_interrupt_provider(150, &["initial", "after-cancel"]).await;
+    let mock_provider = spawn_mock_interrupt_provider(5_000, &["initial", "after-cancel"]).await;
     let server = spawn_server(config_for_mock_provider(&mock_provider.base_url)).await;
     let client = Client::new();
 
@@ -8720,6 +9788,7 @@ async fn cancel_during_in_flight_turn_drops_pending_steer_follow_up() {
             &format!("sessions/{}/steer", created.session.session_id),
         )
         .json(&SteerSessionRequest {
+            branch_id: created.branch.branch_id,
             message: "this should be dropped".to_owned(),
         })
         .send()
@@ -8727,6 +9796,7 @@ async fn cancel_during_in_flight_turn_drops_pending_steer_follow_up() {
         .expect("steer request");
     assert_eq!(steer.status(), StatusCode::ACCEPTED);
 
+    let cancel_started = std::time::Instant::now();
     let cancel = server
         .request(
             &client,
@@ -8734,6 +9804,7 @@ async fn cancel_during_in_flight_turn_drops_pending_steer_follow_up() {
             &format!("sessions/{}/cancel", created.session.session_id),
         )
         .json(&bt_protocol::CancelSessionRequest {
+            branch_id: created.branch.branch_id,
             reason: Some("stop".to_owned()),
         })
         .send()
@@ -8743,6 +9814,37 @@ async fn cancel_during_in_flight_turn_drops_pending_steer_follow_up() {
 
     let api = api_client(&server);
     settle(&api, created.session.session_id).await;
+    assert!(
+        cancel_started.elapsed() < std::time::Duration::from_secs(1),
+        "a held provider must be interrupted rather than allowed to finish"
+    );
+
+    let turns = server
+        .runtime
+        .turn_history(created.session.session_id)
+        .expect("turn history after cancellation");
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].status.as_deref(), Some("cancelled"));
+    assert_eq!(turns[0].finish_reason.as_deref(), Some("Cancelled"));
+    let events = server
+        .runtime
+        .all_events(created.session.session_id)
+        .expect("canonical cancellation events");
+    let cancel_seq = events
+        .iter()
+        .find_map(|event| {
+            matches!(event.payload, EventPayload::SessionCancelled { .. }).then_some(event.seq_id)
+        })
+        .flatten()
+        .expect("session.cancelled sequence");
+    assert!(!events.iter().any(|event| {
+        event.seq_id.is_some_and(|seq| seq > cancel_seq)
+            && matches!(
+                &event.payload,
+                EventPayload::MessageAppended { message }
+                    if message.role == Role::Assistant
+            )
+    }));
 
     {
         let requests = mock_provider

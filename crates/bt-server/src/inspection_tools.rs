@@ -519,6 +519,7 @@ mod tests {
     fn context() -> ToolContext {
         ToolContext {
             project_root: "/tmp/project".into(),
+            cancellation: None,
         }
     }
 

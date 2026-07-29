@@ -616,25 +616,30 @@ impl SqliteSessionStore {
             }
         }
         if let Some(reply_id) = message.in_reply_to {
-            let reply_exists: i64 = tx
+            let original_raw: Option<String> = tx
                 .query_row(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM related_session_message_projection
-                        WHERE message_id = ?1
-                          AND ((source_session_id = ?2 AND destination_session_id = ?3)
-                            OR (source_session_id = ?3 AND destination_session_id = ?2))
-                    )",
-                    params![
-                        reply_id.to_string(),
-                        message.source_session_id.to_string(),
-                        message.destination_session_id.to_string(),
-                    ],
+                    "SELECT message_json
+                     FROM related_session_message_projection
+                     WHERE session_id = ?1 AND message_id = ?2 AND direction = 'received'",
+                    params![message.source_session_id.to_string(), reply_id.to_string(),],
                     |row| row.get(0),
                 )
+                .optional()
                 .map_err(storage_error)?;
-            if reply_exists == 0 {
+            let Some(original_raw) = original_raw else {
                 return Err(BelltowerError::Protocol(
-                    "related-session reply target was not found between these sessions".to_owned(),
+                    "related-session reply target was not received by the sender".to_owned(),
+                ));
+            };
+            let original: RelatedSessionMessage = serde_json::from_str(&original_raw)?;
+            if message.source_session_id != original.destination_session_id
+                || message.source_branch_id != original.destination_branch_id
+                || message.destination_session_id != original.source_session_id
+                || message.destination_branch_id != original.source_branch_id
+            {
+                return Err(BelltowerError::Protocol(
+                    "related-session reply must reverse the original session and branch edge"
+                        .to_owned(),
                 ));
             }
         }

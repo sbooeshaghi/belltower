@@ -124,9 +124,11 @@ For peer or delegated agent work, the preferred model is usually:
 
 - separate related sessions
 - explicit lineage between them
-- typed durable messages passed across direct parent-child edges
+- typed durable messages passed across explicit same-lineage session and branch
+  edges
 
-The bounded subagent implementation follows this rule today. It does not yet
+The bounded subagent implementation follows this rule today for parents,
+children, siblings, and deeper relatives in one lineage tree. It does not yet
 implement the broader participant membership, role, permission, or turn-
 arbitration subsystem described by the rest of this document.
 

@@ -26,16 +26,16 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check workspace
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --locked
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Check bt-agent purity
-        run: cargo test -p bt-agent --test purity
+        run: cargo test -p bt-agent --test purity --locked
 
       - name: Check crate boundaries
         run: bash scripts/check_crate_boundaries.sh
@@ -45,3 +45,28 @@ jobs:
 
       - name: Check OpenAPI contract
         run: make openapi-check
+
+      - name: Run foundation acceptance
+        run: make acceptance
+
+      - name: Check source/archive distribution contract
+        run: bash scripts/distribution.sh --preflight
+
+  windows-shell:
+    name: Windows shell containment
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.0
+
+      - name: Cache cargo registry and build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test Windows shell execution and process-tree teardown
+        run: cargo test -p bt-tools shell::tests --locked

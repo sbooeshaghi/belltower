@@ -20,6 +20,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
+const MCP_TOOL_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 #[derive(Clone)]
 pub struct McpRegisteredTool {
     pub descriptor: McpToolDescriptor,
@@ -107,6 +109,7 @@ struct McpServerHandle {
     http_session: Mutex<Option<HttpSession>>,
     cached_tools: Mutex<Option<Vec<DiscoveredTool>>>,
     last_error: Mutex<Option<String>>,
+    tool_call_timeout: std::time::Duration,
 }
 
 impl McpServerHandle {
@@ -117,6 +120,7 @@ impl McpServerHandle {
             http_session: Mutex::new(None),
             cached_tools: Mutex::new(None),
             last_error: Mutex::new(None),
+            tool_call_timeout: MCP_TOOL_CALL_TIMEOUT,
         }
     }
 
@@ -301,13 +305,28 @@ impl McpServerHandle {
                         return Err(error);
                     }
                 };
-                match session.call_tool(original_name, arguments).await {
-                    Ok(result) => {
+                match tokio::time::timeout(
+                    self.tool_call_timeout,
+                    session.call_tool(original_name, arguments),
+                )
+                .await
+                {
+                    Ok(Ok(result)) => {
                         self.clear_error().await;
                         Ok(result)
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         *session_guard = None;
+                        self.set_error(error.to_string()).await;
+                        Err(error)
+                    }
+                    Err(_) => {
+                        *session_guard = None;
+                        let error = BelltowerError::Protocol(format!(
+                            "MCP server `{}` tool call timed out after {} seconds",
+                            self.config.name,
+                            self.tool_call_timeout.as_secs_f64()
+                        ));
                         self.set_error(error.to_string()).await;
                         Err(error)
                     }
@@ -322,13 +341,28 @@ impl McpServerHandle {
                         return Err(error);
                     }
                 };
-                match session.call_tool(original_name, arguments).await {
-                    Ok(result) => {
+                match tokio::time::timeout(
+                    self.tool_call_timeout,
+                    session.call_tool(original_name, arguments),
+                )
+                .await
+                {
+                    Ok(Ok(result)) => {
                         self.clear_error().await;
                         Ok(result)
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         *session_guard = None;
+                        self.set_error(error.to_string()).await;
+                        Err(error)
+                    }
+                    Err(_) => {
+                        *session_guard = None;
+                        let error = BelltowerError::Protocol(format!(
+                            "MCP server `{}` tool call timed out after {} seconds",
+                            self.config.name,
+                            self.tool_call_timeout.as_secs_f64()
+                        ));
                         self.set_error(error.to_string()).await;
                         Err(error)
                     }
@@ -1025,6 +1059,37 @@ mod tests {
         Url::parse(&format!("http://{addr}/")).expect("url")
     }
 
+    async fn spawn_stalled_call_http_mcp_server() -> Url {
+        async fn handle(Json(payload): Json<Value>) -> Json<Value> {
+            let method = payload
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if method == "tools/call" {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            let id = payload.get("id").cloned().unwrap_or(Value::Null);
+            let result = match method {
+                "initialize" => json!({
+                    "serverInfo": { "name": "fixture", "version": "0.1.0" },
+                    "capabilities": {}
+                }),
+                "tools/call" => json!({"structuredContent": {"late": true}}),
+                _ => json!({}),
+            };
+            Json(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/", post(handle)))
+                .await
+                .expect("serve");
+        });
+        Url::parse(&format!("http://{addr}/")).expect("url")
+    }
+
     #[tokio::test]
     async fn descriptor_reports_discovered_after_direct_tool_call_without_cached_inventory() {
         let base_url = spawn_http_mcp_server().await;
@@ -1107,5 +1172,24 @@ mod tests {
             McpServerStatus::Degraded { ref reason } if reason == "call failed"
         ));
         assert_eq!(tools.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_tool_call_is_bounded_resets_session_and_marks_server_degraded() {
+        let base_url = spawn_stalled_call_http_mcp_server().await;
+        let mut handle = McpServerHandle::new(http_server_config(base_url));
+        handle.tool_call_timeout = std::time::Duration::from_millis(30);
+
+        let error = handle
+            .call_tool("search_docs", json!({"query": "hold"}))
+            .await
+            .expect_err("stalled call must time out");
+        assert!(error.to_string().contains("timed out"));
+        assert!(handle.http_session.lock().await.is_none());
+        let descriptor = handle.descriptor().await;
+        assert!(matches!(
+            descriptor.status,
+            McpServerStatus::Degraded { ref reason } if reason.contains("timed out")
+        ));
     }
 }

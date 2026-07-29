@@ -106,10 +106,10 @@ project docs and architecture docs as foundation commitments:
   auth storage modes (file / keychain / ephemeral / auto) competitive
   with Codex's auth-storage story, and the optional Vertex expansion
   track.
-- **Distribution:** covered by a shareable installation path
-  (`cargo install bt-server bt-tui belltower` plus binary release
-  artifacts for the major platforms) so dogfooders can hand the tool
-  to a collaborator who does not already have a Rust toolchain.
+- **Distribution:** covered by shareable GitHub release archives and a
+  source-checkout Cargo install path, so dogfooders can hand the tool to a
+  collaborator who does not already have a Rust toolchain without pretending
+  the workspace is a public crates.io API.
 - **Tools, approvals, MCP, and autonomy:** covered by the one runtime
   tool contract, named operations, M3/M7 acceptance, and the 5.4a
   inspection/tool-semantics contract.
@@ -276,11 +276,11 @@ before proceeding.
   `belltower login --storage ...`, `belltower doctor`, and the
   auth-storage docs report the selected storage path and resolution
   order.
-- **Distribution scaffolding is implemented:** `docs/install.md`
-  documents cargo, release-archive, and source-checkout install paths;
-  `scripts/publish.sh` provides publish preflight/dry-run support; and
-  `.github/workflows/release.yml` builds release artifacts for tagged
-  releases.
+- **Distribution scaffolding is implemented:** `docs/install.md` documents
+  source-checkout and release-archive paths; every workspace crate is marked
+  `publish = false`; `scripts/distribution.sh` verifies that contract and the
+  local install shape; and `.github/workflows/release.yml` builds release
+  artifacts for tagged releases.
 - **Acceptance runner is implemented:** `make acceptance` delegates to
   `scripts/acceptance.sh`, which runs deterministic milestone proxies
   for M0, M2.1, M3, M4, M5, M6, M7, M7.1, and M8 and explicitly
@@ -2636,38 +2636,32 @@ snapshots only had the workspace-checkout path
 and release scaffolding needed for dogfood; remaining work is to run
 and harden those release gates before the collaborator handoff in 5.7.
 
-Scope is deliberately narrow: a publishable `cargo install` path, a
-binary release for the major platforms, and installation
-documentation. Package managers beyond Homebrew (apt, nix, winget)
-are post-foundation.
+Scope is deliberately narrow: a source-checkout Cargo install path, a binary
+release for the major platforms, and installation documentation. Public Rust
+crate publication and package managers beyond Homebrew (apt, nix, winget) are
+post-foundation.
 
-#### 7.1 Cargo install path
+#### 7.1 Source-checkout Cargo install path
 
-**Problem.** The workspace is not set up for a `cargo install` path.
-Dependency crates (`bt-core`, `bt-protocol`, `bt-server`, etc.) are
-workspace members referenced by path, not published. The installed
-runtime also has a package-boundary seam: the primary operator command
-is `belltower`, but the launcher currently executes `bt-server` and
-`bt-tui` as sibling helper binaries. Until those helpers are moved
-behind library entrypoints inside the `belltower` package, the
-installable cargo path must publish and install all three binary
-packages (`belltower`, `bt-server`, `bt-tui`) while preserving
-`belltower` as the user-facing entrypoint.
+**Decision.** `0.1.0` deliberately does not publish workspace crates to
+crates.io. The registry already contains unrelated `belltower` and
+`bt-runtime` packages; renaming the public package graph under release
+pressure would create a premature compatibility surface. The supported Cargo
+path is therefore installation from a Belltower source checkout. The installed
+runtime still has a package-boundary seam: the primary operator command is
+`belltower`, but the launcher executes `bt-server` and `bt-tui` as sibling
+helpers, so the source path installs all three binaries.
 
 **Seam.** Repo root plus each workspace Cargo.toml.
 
 **Files touched.** `Cargo.toml` (workspace), and each
-`crates/*/Cargo.toml` (version field, description, license,
-repository, homepage, publish metadata, versioned internal path
-dependencies). Potentially new `.cargo/config.toml` if release-profile
-tuning is needed. Publication order and local install-check script
-under `scripts/` or `xtask/`. Release workflow wiring if CI owns the
-dry-run and local install checks.
+`crates/*/Cargo.toml` (version field, description, license, repository,
+homepage, private-publication metadata, versioned internal path dependencies),
+and `scripts/distribution.sh` for local-install verification. Release workflow
+wiring owns the distribution and local-install checks.
 
 **Depends on.** 4.1 (CI must be green so the released versions have
-been validated). Depends on 4.2a having landed or explicit
-file-size-overrides filed, so published crates pass the file-size
-lint.
+been validated).
 
 **Lane.** `isolated` (all Cargo.toml edits; no code). Serialize
 against any other Cargo.toml-touching work (e.g., 4.1's
@@ -2676,37 +2670,28 @@ against any other Cargo.toml-touching work (e.g., 4.1's
 **Fix.**
 
 - Ensure every crate has a version, description, inherited license,
-  repository URL, homepage, and `publish = true`.
-- Ensure internal workspace dependencies carry both `path` and
-  `version`; this keeps local development path-based while making the
-  packaged manifests resolve by registry version after publication.
+  repository URL, homepage, and `publish = false`.
+- Keep internal workspace dependencies path-based; versions remain useful for
+  workspace coherence but do not promise registry resolution.
 - The binary crates declare explicit `[[bin]]` entries for
   `belltower`, `bt-server`, and `bt-tui`.
-- Publish in topological order (workspace dependencies first);
-  document and automate the order in `scripts/publish.sh` or
-  `xtask/publish`.
 - Verify the cargo-installed shape from local package paths: install
   `bt-server`, `bt-tui`, and `belltower` into a clean Cargo root, then
   verify the installed `belltower` binary starts.
-- Track a follow-on simplification if the project later wants a literal
-  single-package `cargo install belltower` that also provides the helper
-  executables; that requires moving the helper binaries behind library
-  entrypoints or into the `belltower` package.
+- Treat any future crates.io package graph, including a possible single-package
+  install, as a deliberate new public API decision.
 
-**Invariant.** FR-19 (repo independence) — the cargo install path must
-pull only `belltower`, `bt-*` crates, and public dependencies; it must
-not pull any Frollo app code. The operator still starts with the
-`belltower` command even if helper binary packages are installed
-alongside it.
+**Invariant.** FR-19 (repo independence) — release archives and the
+source-checkout install path must contain only Belltower code and public
+dependencies; they must not pull any Frollo app code. The operator starts with
+the `belltower` command even when helper binaries are installed alongside it.
 
-**Exit test.** CI job (on release-tagged commits only) runs
-`scripts/publish.sh --preflight` to verify manifest metadata,
-package file lists, and the bootstrap root dry-run, then runs
-`scripts/publish.sh --install-check` to verify the local
-`cargo install --path` equivalent succeeds. Full
-`scripts/publish.sh --dry-run` remains the patch-release gate after
-the internal `bt-*` dependency versions exist on crates.io. Dogfood
-week operator documents the cargo-installed path in the dogfood log.
+**Exit test.** CI runs `scripts/distribution.sh --preflight` to verify that
+every workspace crate remains private to the repository, then runs
+`scripts/distribution.sh --install-check` to verify the local
+`cargo install --path` shape and launcher helper discovery. Dogfood week
+documents either the release archive or source-checkout path in the dogfood
+log.
 
 #### 7.2 Binary release artifacts
 
@@ -2757,10 +2742,10 @@ clean machine and run `belltower --version` successfully.
 
 #### 7.3 Installation documentation
 
-**Problem.** The project README does not describe how to install
-Belltower. New users — especially dogfood collaborators — need a
-page that covers the three install paths (cargo, binary, build-
-from-source) with a single happy-path example per platform.
+**Problem.** The project README must describe how to install Belltower. New
+users — especially dogfood collaborators — need a page that covers the two
+supported install paths (release archive and source checkout) with a single
+happy-path example per platform.
 
 **Seam.** Repo-root docs.
 
@@ -2774,9 +2759,8 @@ work).
 
 **Fix.**
 
-- README.md install section: three options, one paragraph each:
-  `cargo install bt-server bt-tui belltower`, download a release
-  archive, build from source.
+- README.md install section: two supported options, one paragraph each:
+  download a release archive or install from a source checkout.
 - `docs/install.md` expands each path with platform-specific notes,
   common errors, and the `belltower doctor` first-run check.
 - Cross-link from README to `docs/install.md`.
@@ -3016,7 +3000,7 @@ against silent semantics drift during the runtime relocation in 4.2b.
 - 5.8 Export round-trip suite (bundle / JSONL / ShareGPT / HTML; reuses
   the 5.4a-min representative-session builder; depends on 1.2 for
   bundle raw-linkage assertions)
-- 7.1 Cargo install path verified end-to-end
+- 7.1 Source-checkout Cargo install path verified end-to-end
 - 7.2 Binary release artifacts (parallel writer to 7.1)
 
 **Week 5 — Scripted milestones + TUI smoke + install docs:**
@@ -3171,14 +3155,13 @@ carry dated evidence.
     `auto` mode selecting the best available backend at resolution
     time. `belltower doctor` reports which backend is active for
     each connection. Backed by 6.1, 6.2, 6.3.
-19. **Installable from cargo or a binary artifact.**
-    `cargo install bt-server bt-tui belltower` succeeds from crates.io
-    for Rust-toolchain users (7.1), platform binary release artifacts
-    exist for macOS (arm64 + x86_64), Linux (x86_64 + aarch64), and
-    Windows (x86_64) on release-tagged commits (7.2), and a committed
-    `docs/install.md` describes all three install paths (7.3).
-    Dogfood week confirms at least one collaborator reached
-    `belltower doctor` via the documented install path.
+19. **Installable from a source checkout or binary artifact.**
+    The three `cargo install --path` commands succeed for Rust-toolchain users
+    from a source checkout (7.1); platform binary release artifacts exist for
+    macOS (arm64 + x86_64), Linux (x86_64 + aarch64), and Windows (x86_64) on
+    release-tagged commits (7.2); and committed `docs/install.md` describes
+    both supported install paths (7.3). Dogfood week confirms at least one
+    collaborator reached `belltower doctor` via a documented path.
 
 **Explicitly not in DoD:**
 

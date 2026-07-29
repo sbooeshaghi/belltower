@@ -604,6 +604,7 @@ impl ChatApp {
     pub(super) fn render_status_command(&mut self, raw_input: &str) {
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let connection_id = self.connection_id.clone();
         let model = self.effective_model().to_owned();
         let tool_mode = self.tool_mode;
@@ -615,7 +616,7 @@ impl ChatApp {
                 .map_err(|error| error.to_string())?;
             let output =
                 render_status_output(&response.inspection, &connection_id, &model, tool_mode);
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::ReadinessStatus {
                 inspection: response.inspection,
             })
@@ -651,6 +652,7 @@ impl ChatApp {
 
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let connection_id = self.connection_id.clone();
         let model = self.effective_model().to_owned();
         let raw = raw_input.to_owned();
@@ -681,7 +683,7 @@ impl ChatApp {
                 &connection_id,
                 &model,
             );
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::ModelInventory {
                 backends: backends.backends,
                 connections: connections.connections,
@@ -693,6 +695,7 @@ impl ChatApp {
     pub(super) fn render_doctor_command(&mut self, raw_input: &str) {
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let connection_id = self.connection_id.clone();
         let model = self.effective_model().to_owned();
         let tool_mode = self.tool_mode;
@@ -720,7 +723,7 @@ impl ChatApp {
                 &model,
                 tool_mode,
             );
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::Doctor {
                 status: status.inspection,
                 backends: backends.backends,
@@ -734,6 +737,7 @@ impl ChatApp {
     pub(super) fn render_mcp_command(&mut self, raw_input: &str, reload: bool) {
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.to_owned();
         self.enqueue_pending_command(command_label(raw_input), Some(raw.clone()), async move {
             if reload {
@@ -747,7 +751,7 @@ impl ChatApp {
                 .await
                 .map_err(|error| error.to_string())?;
             let output = render_mcp_output(&inventory.servers, &inventory.tools, reload);
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::McpInventory {
                 servers: inventory.servers,
                 tools: inventory.tools,
@@ -799,12 +803,21 @@ impl ChatApp {
             {
                 Ok(response) => {
                     let output = render_spawn_output(&response);
-                    record_slash_command(&client, session_id, &raw, output, true).await?;
+                    record_slash_command(&client, session_id, branch_id, &raw, output, true)
+                        .await?;
                     Ok(CommandOutcome::ChildSpawned)
                 }
                 Err(error) => {
                     let message = format!("Failed to spawn child session: {error}");
-                    record_slash_command(&client, session_id, &raw, message.clone(), false).await?;
+                    record_slash_command(
+                        &client,
+                        session_id,
+                        branch_id,
+                        &raw,
+                        message.clone(),
+                        false,
+                    )
+                    .await?;
                     Ok(CommandOutcome::Notice(message))
                 }
             }
@@ -814,6 +827,7 @@ impl ChatApp {
     pub(super) fn render_session_command(&mut self, raw_input: &str) {
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.to_owned();
         self.enqueue_pending_command(command_label(raw_input), Some(raw.clone()), async move {
             let response = client
@@ -821,7 +835,7 @@ impl ChatApp {
                 .await
                 .map_err(|error| error.to_string())?;
             let output = render_session_output(&response.inspection);
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::Quiet)
         });
     }
@@ -829,6 +843,7 @@ impl ChatApp {
     pub(super) fn render_history_command(&mut self, raw_input: &str, limit: usize) {
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.to_owned();
         self.enqueue_pending_command(command_label(raw_input), Some(raw.clone()), async move {
             let response = client
@@ -836,7 +851,7 @@ impl ChatApp {
                 .await
                 .map_err(|error| error.to_string())?;
             let output = render_turn_history_output(&response.turns, limit);
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::Quiet)
         });
     }
@@ -844,6 +859,7 @@ impl ChatApp {
     pub(super) fn render_inspect_tool_command(&mut self, raw_input: &str, call_id: ToolCallId) {
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.to_owned();
         self.enqueue_pending_command(command_label(raw_input), Some(raw.clone()), async move {
             let response = client
@@ -851,7 +867,7 @@ impl ChatApp {
                 .await
                 .map_err(|error| error.to_string())?;
             let output = render_tool_call_inspection_output(&response.inspection);
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::Quiet)
         });
     }
@@ -871,7 +887,7 @@ impl ChatApp {
                 &response.model_id,
                 response.compaction.as_ref(),
             );
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::Quiet)
         });
     }
@@ -879,6 +895,7 @@ impl ChatApp {
     pub(super) fn render_execution_command(&mut self, raw_input: &str, limit: usize) {
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.to_owned();
         self.enqueue_pending_command(command_label(raw_input), Some(raw.clone()), async move {
             let response = client
@@ -886,7 +903,7 @@ impl ChatApp {
                 .await
                 .map_err(|error| error.to_string())?;
             let output = render_execution_output(&response.inspection, limit);
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::Quiet)
         });
     }
@@ -916,7 +933,15 @@ impl ChatApp {
             ) {
                 Ok(turn) => turn,
                 Err(message) => {
-                    record_slash_command(&client, session_id, &raw, message.clone(), false).await?;
+                    record_slash_command(
+                        &client,
+                        session_id,
+                        branch_id,
+                        &raw,
+                        message.clone(),
+                        false,
+                    )
+                    .await?;
                     return Ok(CommandOutcome::Notice(message));
                 }
             };
@@ -948,7 +973,7 @@ impl ChatApp {
                     )
                 }
             };
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::Quiet)
         });
     }
@@ -956,6 +981,7 @@ impl ChatApp {
     pub(super) fn render_usage_command(&mut self, raw_input: &str, limit: usize) {
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.to_owned();
         self.enqueue_pending_command(command_label(raw_input), Some(raw.clone()), async move {
             let response = client
@@ -963,7 +989,7 @@ impl ChatApp {
                 .await
                 .map_err(|error| error.to_string())?;
             let output = render_usage_output(&response.inspection, limit);
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::Quiet)
         });
     }
@@ -971,6 +997,7 @@ impl ChatApp {
     pub(super) fn render_queue_command(&mut self, raw_input: &str) {
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.to_owned();
         self.enqueue_pending_command(command_label(raw_input), Some(raw.clone()), async move {
             let response = client
@@ -978,7 +1005,7 @@ impl ChatApp {
                 .await
                 .map_err(|error| error.to_string())?;
             let output = render_queue_output(&response.inspection);
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::Quiet)
         });
     }
@@ -991,6 +1018,7 @@ impl ChatApp {
         }
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.to_owned();
         self.enqueue_pending_command(command_label(raw_input), Some(raw.clone()), async move {
             let response = client
@@ -998,7 +1026,7 @@ impl ChatApp {
                 .await
                 .map_err(|error| error.to_string())?;
             let output = render_queue_clear_output(&response);
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::QueueCleared {
                 dropped_submissions: dropped_pending_submissions,
             })
@@ -1008,6 +1036,7 @@ impl ChatApp {
     pub(super) fn render_branches_command(&mut self, raw_input: &str) {
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.to_owned();
         self.enqueue_pending_command(command_label(raw_input), Some(raw.clone()), async move {
             let response = client
@@ -1016,7 +1045,7 @@ impl ChatApp {
                 .map_err(|error| error.to_string())?;
             let output =
                 render_branches_output(response.active_branch_id.as_ref(), &response.branches);
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::Quiet)
         });
     }
@@ -1024,6 +1053,7 @@ impl ChatApp {
     pub(super) fn render_tree_command(&mut self, raw_input: &str) {
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.to_owned();
         self.enqueue_pending_command(command_label(raw_input), Some(raw.clone()), async move {
             let response = client
@@ -1031,7 +1061,7 @@ impl ChatApp {
                 .await
                 .map_err(|error| error.to_string())?;
             let output = render_tree_output(&response.inspection);
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::Quiet)
         });
     }
@@ -1039,6 +1069,7 @@ impl ChatApp {
     pub(super) fn render_lineage_command(&mut self, raw_input: &str) {
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.to_owned();
         self.enqueue_pending_command(command_label(raw_input), Some(raw.clone()), async move {
             let response = client
@@ -1046,7 +1077,7 @@ impl ChatApp {
                 .await
                 .map_err(|error| error.to_string())?;
             let output = render_lineage_output(&response.inspection);
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::Quiet)
         });
     }
@@ -1054,6 +1085,7 @@ impl ChatApp {
     pub(super) fn render_workflow_command(&mut self, raw_input: &str) {
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.to_owned();
         self.enqueue_pending_command(command_label(raw_input), Some(raw.clone()), async move {
             let response = client
@@ -1061,7 +1093,7 @@ impl ChatApp {
                 .await
                 .map_err(|error| error.to_string())?;
             let output = render_workflow_output(&response.inspection);
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::Quiet)
         });
     }
@@ -1072,8 +1104,10 @@ impl ChatApp {
         format: &str,
         output_path: &str,
     ) {
+        self.clear_notice();
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let format = format.to_owned();
         let path = self.resolve_export_output_path(output_path);
         let raw = raw_input.to_owned();
@@ -1095,7 +1129,7 @@ impl ChatApp {
                 &response.content,
                 Some(&path_label),
             );
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::Quiet)
         });
     }
@@ -1125,6 +1159,7 @@ impl ChatApp {
     ) {
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.to_owned();
         self.enqueue_pending_command(command_label(raw_input), Some(raw.clone()), async move {
             let response = client
@@ -1140,7 +1175,7 @@ impl ChatApp {
                 .await
                 .map_err(|error| error.to_string())?;
             let output = render_otlp_push_output(&response);
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::Quiet)
         });
     }
@@ -1163,7 +1198,8 @@ impl ChatApp {
             };
             let notice = if let Some(raw) = raw.as_deref() {
                 let message = "Refreshed session state.".to_owned();
-                record_slash_command(&client, session_id, raw, message.clone(), true).await?;
+                record_slash_command(&client, session_id, branch_id, raw, message.clone(), true)
+                    .await?;
                 Some(message)
             } else {
                 None
@@ -1175,11 +1211,13 @@ impl ChatApp {
     pub(super) fn enqueue_detach_command(&mut self, raw_input: &str) {
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.to_owned();
         self.enqueue_pending_command(command_label(raw_input), Some(raw.clone()), async move {
             record_slash_command(
                 &client,
                 session_id,
+                branch_id,
                 &raw,
                 "Detached from the current TUI session.".to_owned(),
                 true,

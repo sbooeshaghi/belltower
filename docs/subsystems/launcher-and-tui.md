@@ -215,11 +215,18 @@ This behavior should explicitly match Codex-style interaction.
 - The default slash surface is intentionally narrow and centered on frequent operator flows:
   - `/help`, `/use`, `/status`, `/defaults`, `/session`, `/inspect`, `/history`, `/usage`, `/new`, `/branch`, `/cancel`, `/mcp`, `/models [connection]`, `/connection`, and `/compact`
 - `/connection` and `/use` are the primary session-local provider/model controls.
+- `/compact` is queued through the same non-blocking command path as other
+  network-backed operator work and asks the server/runtime to compact the
+  active branch. A reduction records canonical `context.compacted` evidence;
+  an ineffective attempt returns a visible no-op and records no false
+  compaction fact. Command history keeps the human-readable result;
+  `/execution` remains the detailed evidence view.
 - `/use` commits the session-local connection/model through the server
   settings path and returns immediately from that durable mutation. It must
   not synchronously block on full provider readiness or remote model inventory;
   `/status`, `/models`, and `/doctor` are the explicit readiness/model
-  inspection surfaces.
+  inspection surfaces. The queued request snapshots the invocation branch, so
+  a later UI branch change cannot misattribute `session.settings.updated`.
 - `/defaults` is the global-defaults surface for future sessions and writes `~/.config/belltower/config.toml`.
 - persisted default models should be validated against the canonical discoverable model inventory for that connection when discovery is available, rather than accepting arbitrary catalog or typed model ids.
 - Approval resolution is contextual rather than slash-first:
@@ -287,6 +294,11 @@ That means:
 - session state comes from server/client behavior
 - control actions like approvals and branch switches are protocol operations, not local-only hacks
 - message submission outcome comes from the server, not local TUI guesswork
+- cancel, steer, operator shell, and ordinary slash-command audit writes carry
+  the branch captured when the operator invoked them; asynchronous completion
+  must not retarget the write to whichever branch is visible later
+- branch-changing commands record on their resulting branch (`/branch`) or
+  resulting session branch (`/new`, `/resume`) rather than the branch they left
 - launcher readiness, setup follow-up checks, and `doctor` output should render from the shared `bt-readiness` inspection surface rather than maintaining a second launcher-local probing contract
 - readiness ordering, labels, and blocked-vs-ready decisions should come from structured readiness state in shared inspection DTOs, not from local string parsing or ad hoc `probe_ready` heuristics
 - launcher-owned local bootstrap behavior should stay distinct from the baseline remote-client contract; see [`../development/consumer-modes.md`](../development/consumer-modes.md)

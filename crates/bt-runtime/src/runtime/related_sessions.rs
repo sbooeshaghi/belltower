@@ -77,6 +77,13 @@ impl BelltowerRuntime {
                 "related-session message cannot be empty".to_owned(),
             ));
         }
+        let destination_branch_id = self.resolve_related_session_destination_branch(
+            source_session_id,
+            source_branch_id,
+            destination_session_id,
+            destination_branch_id,
+            in_reply_to,
+        )?;
         let (message, sent, received) = Self::related_session_message_events(
             source_session_id,
             source_branch_id,
@@ -175,6 +182,64 @@ impl BelltowerRuntime {
             .lock()
             .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?
             .load_related_session_messages(session_id)
+    }
+
+    /// Resolve the destination branch for a new related-session message.
+    ///
+    /// New conversations must name their destination branch explicitly. A
+    /// reply instead derives the exact reverse edge from the immutable
+    /// received message; an explicit branch may confirm that edge but cannot
+    /// redirect it after a session's default branch changes.
+    fn resolve_related_session_destination_branch(
+        &self,
+        source_session_id: SessionId,
+        source_branch_id: BranchId,
+        destination_session_id: SessionId,
+        requested_destination_branch_id: BranchId,
+        in_reply_to: Option<RelatedSessionMessageId>,
+    ) -> Result<BranchId> {
+        let destination_branch_id = match in_reply_to {
+            Some(reply_id) => {
+                let original = self
+                    .related_session_messages(source_session_id)?
+                    .into_iter()
+                    .find(|record| {
+                        record.direction == RelatedSessionMessageDirection::Received
+                            && record.message.message_id == reply_id
+                    })
+                    .ok_or_else(|| {
+                        bt_core::BelltowerError::Protocol(
+                            "related-session reply target was not received by the sender"
+                                .to_owned(),
+                        )
+                    })?
+                    .message;
+                if original.destination_session_id != source_session_id
+                    || original.destination_branch_id != source_branch_id
+                    || original.source_session_id != destination_session_id
+                {
+                    return Err(bt_core::BelltowerError::Protocol(
+                        "related-session reply must reverse the original session and branch edge"
+                            .to_owned(),
+                    ));
+                }
+                if requested_destination_branch_id != original.source_branch_id {
+                    return Err(bt_core::BelltowerError::Protocol(
+                        "target_branch_id conflicts with the original related-session message"
+                            .to_owned(),
+                    ));
+                }
+                original.source_branch_id
+            }
+            None => requested_destination_branch_id,
+        };
+        self.load_branch(destination_session_id, destination_branch_id)?
+            .ok_or_else(|| {
+                bt_core::BelltowerError::NotFound(format!(
+                    "branch `{destination_branch_id}` in session `{destination_session_id}`"
+                ))
+            })?;
+        Ok(destination_branch_id)
     }
 
     pub fn pending_related_session_messages(

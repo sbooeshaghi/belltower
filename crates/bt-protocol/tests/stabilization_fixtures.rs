@@ -17,14 +17,15 @@ use bt_core::{
     WorkflowRuntimeCounts, WorkflowSessionNode, WorkflowStatusCounts, default_settings_revision_id,
 };
 use bt_protocol::{
-    ConnectionModelsResponse, ConnectionsResponse, CreateSessionRequest, CreateSessionResponse,
-    ErrorEnvelope, ExportFormat, HealthResponse, McpInventoryResponse, McpServersResponse,
-    McpToolsResponse, ModelBackendsResponse, ModelRecommendationsResponse, PushOtlpExportRequest,
-    PushOtlpExportResponse, RawSseEnvelope, SendMessageRequest, ServerCapabilities,
-    ServerInfoResponse, SessionEventsResponse, SessionExecutionResponse, SessionExportResponse,
+    CancelSessionRequest, ConnectionModelsResponse, ConnectionsResponse, CreateSessionRequest,
+    CreateSessionResponse, ErrorEnvelope, ExportFormat, HealthResponse, McpInventoryResponse,
+    McpServersResponse, McpToolsResponse, ModelBackendsResponse, ModelRecommendationsResponse,
+    PushOtlpExportRequest, PushOtlpExportResponse, RawSseEnvelope, RecordOperatorCommandRequest,
+    RunShellCommandRequest, SendMessageRequest, ServerCapabilities, ServerInfoResponse,
+    SessionEventsResponse, SessionExecutionResponse, SessionExportResponse,
     SessionInspectionResponse, SessionLineageResponse, SessionQueueClearResponse,
     SessionQueueResponse, SessionTreeResponse, SessionTurnsResponse, SessionWorkflowResponse,
-    SpawnSessionRequest, SpawnSessionResponse, StatusInspectionResponse,
+    SpawnSessionRequest, SpawnSessionResponse, StatusInspectionResponse, SteerSessionRequest,
     UpdateSessionBudgetRequest, UpdateSessionRequest,
 };
 use camino::Utf8PathBuf;
@@ -46,6 +47,10 @@ struct SessionControlFixtures {
     create_session_response: CreateSessionResponse,
     update_session_request: UpdateSessionRequest,
     update_session_budget_request: UpdateSessionBudgetRequest,
+    cancel_session_request: CancelSessionRequest,
+    steer_session_request: SteerSessionRequest,
+    record_operator_command_request: RecordOperatorCommandRequest,
+    run_shell_command_request: RunShellCommandRequest,
     send_message_request: SendMessageRequest,
     spawn_session_request: SpawnSessionRequest,
     spawn_session_response: SpawnSessionResponse,
@@ -182,13 +187,36 @@ fn session_control_fixtures() -> SessionControlFixtures {
             branch: branch_record(),
         },
         update_session_request: UpdateSessionRequest {
+            branch_id: branch_id(),
             connection_id: Some(connection_id("local")),
             model_id: Some("qwen2.5-coder:7b".to_owned()),
             tool_mode: Some(SessionToolMode::Standard),
             reset_model_to_default: false,
         },
         update_session_budget_request: UpdateSessionBudgetRequest {
+            branch_id: branch_id(),
             budget: sample_budget_config(),
+        },
+        cancel_session_request: CancelSessionRequest {
+            branch_id: branch_id(),
+            reason: Some("operator requested cancellation".to_owned()),
+        },
+        steer_session_request: SteerSessionRequest {
+            branch_id: branch_id(),
+            message: "Focus on the event-log invariant.".to_owned(),
+        },
+        record_operator_command_request: RecordOperatorCommandRequest {
+            branch_id: branch_id(),
+            command_type: "slash_command".to_owned(),
+            raw_input: "/status".to_owned(),
+            output: "runtime ready".to_owned(),
+            success: true,
+        },
+        run_shell_command_request: RunShellCommandRequest {
+            branch_id: branch_id(),
+            raw_input: "!git status --short".to_owned(),
+            command: "git status --short".to_owned(),
+            timeout_seconds: Some(30),
         },
         send_message_request: SendMessageRequest {
             branch_id: branch_id(),

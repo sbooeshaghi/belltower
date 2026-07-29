@@ -246,6 +246,19 @@ opaque admitted-turn capability used by direct and queued work.
 
 **Owners:** `bt-runtime`, `bt-agent`, provider/tool adapters
 
+**Partial status (2026-07-28):** branch attribution and active-turn ownership
+are complete. Cancel/steer/operator-command/operator-shell requests now require
+an explicit branch. Runtime validates active ownership and appends the control
+event under one serialized store boundary; protocol, restart, branch-history,
+shell-lifecycle, and TUI invocation-snapshot tests cover the cutover. Threading
+live cancellation through every provider/tool adapter remains open.
+
+The same event-attribution pass now covers session settings and budget policy:
+their projections remain session-scoped, but request DTOs require the invoking
+branch and canonical events never infer the default branch. Related-session
+messages likewise require an explicit destination branch, with exact reverse-
+edge reply enforcement in runtime and the atomic store transaction.
+
 **Change:** thread a runtime cancellation capability through provider streams,
 built-in tools, and MCP calls. Shell cancellation terminates the child process
 group. MCP calls have bounded timeouts and truthful degraded state.

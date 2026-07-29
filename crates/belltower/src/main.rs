@@ -139,6 +139,9 @@ struct SessionExportArgs {
 }
 
 #[derive(Clone, Debug, ValueEnum)]
+// The shared domain enum deliberately uses these full trace-mode names; keep
+// the CLI values aligned instead of inventing shorter aliases here.
+#[allow(clippy::enum_variant_names)]
 enum SessionExportModeArg {
     TraceOnly,
     TracePlusPatches,

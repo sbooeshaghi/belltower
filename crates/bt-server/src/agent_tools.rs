@@ -1,4 +1,4 @@
-//! Model-facing tools for durable parent-child session coordination.
+//! Model-facing tools for durable same-lineage session coordination.
 //!
 //! These executors adapt the canonical runtime/session graph to the agent tool
 //! loop. They do not own lineage, mailbox, admission, or turn semantics.
@@ -242,13 +242,17 @@ impl ToolExecutor for SendAgentMessageTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "send_agent_message".to_owned(),
-            description: "Send a durable typed message to any agent in this session tree (parent, child, or sibling). notify records context for a future turn; wake also requests an idle destination turn without interrupting active work. Parents are not copied on peer messages; use list_agents to inspect a related session's mailbox.".to_owned(),
+            description: "Send a durable typed message to any agent in this session tree (parent, child, or sibling). Every call requires target_branch_id; list_agents reports each session's active_branch_id. For replies, in_reply_to is authoritative and target_session_id plus target_branch_id must match its exact reverse edge. notify records context for a future turn; wake also requests an idle destination turn without interrupting active work. Parents are not copied on peer messages; use list_agents to inspect a related session's mailbox.".to_owned(),
             parameters_schema: json!({
                 "type": "object",
-                "required": ["target_session_id", "text", "call_id"],
+                "required": ["target_session_id", "target_branch_id", "text", "call_id"],
                 "properties": {
                     "call_id": {"type": "string"},
                     "target_session_id": {"type": "string"},
+                    "target_branch_id": {
+                        "type": "string",
+                        "description": "Explicit destination branch. For a reply, it must equal the original message's source branch."
+                    },
                     "text": {"type": "string"},
                     "kind": {
                         "type": "string",
@@ -258,7 +262,10 @@ impl ToolExecutor for SendAgentMessageTool {
                         "type": "string",
                         "enum": ["notify", "wake"]
                     },
-                    "in_reply_to": {"type": "string"}
+                    "in_reply_to": {
+                        "type": "string",
+                        "description": "Message received by this exact source branch; its immutable reverse edge determines the reply destination branch."
+                    }
                 },
                 "additionalProperties": false
             }),
@@ -289,17 +296,14 @@ impl ToolExecutor for SendAgentMessageTool {
             let call_id = ToolCallId::new(required_string(&arguments, "call_id")?);
             let target_session_id = parse_session_id(&arguments, "target_session_id")?;
             ensure_same_lineage(&self.state.runtime, self.session_id, target_session_id)?;
-            let target_branch = self
-                .state
-                .runtime
-                .default_branch(target_session_id)?
-                .ok_or_else(|| BelltowerError::NotFound("target session branch".to_owned()))?;
             let kind = parse_message_kind(optional_string(&arguments, "kind").as_deref())?;
             let delivery_mode =
                 parse_delivery_mode(optional_string(&arguments, "delivery_mode").as_deref())?;
             let in_reply_to = optional_string(&arguments, "in_reply_to")
                 .map(|value| parse_related_message_id(&value))
                 .transpose()?;
+            let target_branch_id =
+                parse_branch_id_value(&required_string(&arguments, "target_branch_id")?)?;
             let caused_by_turn_id = Some(active_turn_id(
                 &self.state.runtime,
                 self.session_id,
@@ -310,7 +314,7 @@ impl ToolExecutor for SendAgentMessageTool {
                 self.branch_id,
                 caused_by_turn_id,
                 target_session_id,
-                target_branch.branch_id,
+                target_branch_id,
                 kind,
                 delivery_mode,
                 in_reply_to,
@@ -333,7 +337,7 @@ impl ToolExecutor for SendAgentMessageTool {
                 is_error: false,
                 output: json!({
                     "target_session_id": target_session_id,
-                    "target_branch_id": target_branch.branch_id,
+                    "target_branch_id": target_branch_id,
                     "message_id": receipt.message_id,
                     "status": receipt.status,
                     "dispatched": dispatched
@@ -765,6 +769,11 @@ fn parse_session_id_value(value: &str) -> Result<SessionId> {
         .map_err(|error| BelltowerError::Tool(format!("invalid session id `{value}`: {error}")))
 }
 
+fn parse_branch_id_value(value: &str) -> Result<BranchId> {
+    BranchId::from_str(value)
+        .map_err(|error| BelltowerError::Tool(format!("invalid branch id `{value}`: {error}")))
+}
+
 fn parse_related_message_id(value: &str) -> Result<RelatedSessionMessageId> {
     RelatedSessionMessageId::from_str(value).map_err(|error| {
         BelltowerError::Tool(format!(
@@ -814,6 +823,10 @@ fn parse_delivery_mode(raw: Option<&str>) -> Result<RelatedSessionDeliveryMode> 
 }
 
 #[cfg(test)]
+#[path = "agent_tools_branch_tests.rs"]
+mod branch_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use bt_core::{BelltowerConfig, RelatedSessionMessageStatus, Role, SessionToolMode};
@@ -822,6 +835,7 @@ mod tests {
     fn context() -> ToolContext {
         ToolContext {
             project_root: "/tmp/project".into(),
+            cancellation: None,
         }
     }
 
@@ -903,12 +917,15 @@ mod tests {
             .expect_err("shared workspace consent is required");
         assert!(error.to_string().contains("allow_shared_workspace=true"));
 
+        let send = registry.get("send_agent_message").expect("send tool");
         assert_eq!(
-            registry
-                .get("send_agent_message")
-                .expect("send tool")
-                .approval_requirement(&json!({})),
+            send.approval_requirement(&json!({})),
             ApprovalRequirement::Never
+        );
+        assert!(
+            send.spec().parameters_schema["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!("target_branch_id")))
         );
     }
 
@@ -1006,6 +1023,7 @@ mod tests {
                 json!({
                     "call_id": "call-question",
                     "target_session_id": child.session_id,
+                    "target_branch_id": child_branch.branch_id,
                     "kind": "question",
                     "delivery_mode": "notify",
                     "text": "What is the smallest counterexample?"
@@ -1026,6 +1044,7 @@ mod tests {
                 json!({
                     "call_id": "call-answer",
                     "target_session_id": parent.session_id,
+                    "target_branch_id": parent_branch.branch_id,
                     "kind": "answer",
                     "delivery_mode": "notify",
                     "in_reply_to": question_id,
@@ -1165,7 +1184,7 @@ mod tests {
     #[tokio::test]
     async fn agent_message_is_bound_to_the_active_sender_turn() {
         let (state, parent, parent_branch, _file) = fixture();
-        let (child, _child_branch) = state
+        let (child, child_branch) = state
             .runtime
             .spawn_child_session(
                 parent.session_id,
@@ -1196,6 +1215,7 @@ mod tests {
                 json!({
                     "call_id": "call-causal",
                     "target_session_id": child.session_id,
+                    "target_branch_id": child_branch.branch_id,
                     "text": "check the induction step"
                 }),
                 context(),
@@ -1224,7 +1244,7 @@ mod tests {
     #[tokio::test]
     async fn agent_message_requires_an_active_sender_turn() {
         let (state, parent, parent_branch, _file) = fixture();
-        let (child, _child_branch) = state
+        let (child, child_branch) = state
             .runtime
             .spawn_child_session(
                 parent.session_id,
@@ -1244,6 +1264,7 @@ mod tests {
                 json!({
                     "call_id": "call-without-turn",
                     "target_session_id": child.session_id,
+                    "target_branch_id": child_branch.branch_id,
                     "text": "this must retain caller provenance"
                 }),
                 context(),
@@ -1295,7 +1316,7 @@ mod tests {
     #[tokio::test]
     async fn agent_message_tool_rejects_unrelated_sessions() {
         let (state, session, branch, _file) = fixture();
-        let (unrelated, _unrelated_branch) = state
+        let (unrelated, unrelated_branch) = state
             .runtime
             .create_session(
                 "/tmp/project".into(),
@@ -1314,6 +1335,7 @@ mod tests {
                 json!({
                     "call_id": "call-send",
                     "target_session_id": unrelated.session_id,
+                    "target_branch_id": unrelated_branch.branch_id,
                     "text": "cross the lineage boundary"
                 }),
                 context(),

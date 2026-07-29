@@ -3,23 +3,6 @@ use super::support::*;
 use super::*;
 
 impl BelltowerRuntime {
-    pub fn cancel_session(
-        &self,
-        session_id: SessionId,
-        branch_id: bt_core::BranchId,
-        reason: impl Into<String>,
-    ) -> Result<i64> {
-        let event = EventEnvelope::new(
-            session_id,
-            branch_id,
-            SpanKind::Agent,
-            EventPayload::SessionCancelled {
-                reason: reason.into(),
-            },
-        );
-        self.append_event(event)
-    }
-
     pub fn steer_session(
         &self,
         session_id: SessionId,
@@ -36,7 +19,33 @@ impl BelltowerRuntime {
                 settings_revision_id,
             },
         );
-        self.append_event(event)
+        self.append_branch_owned_control_event(event)
+    }
+
+    /// Commit a control event only when its branch owns the active turn.
+    ///
+    /// The active-turn projection and event append share the runtime's store
+    /// mutex, so a turn cannot finish (or another branch claim the session)
+    /// between validation and the canonical write. Idle controls remain valid
+    /// and retain their explicitly requested branch provenance.
+    fn append_branch_owned_control_event(&self, event: EventEnvelope) -> Result<i64> {
+        self.ensure_session_started_for(event.session_id, event.branch_id)?;
+        self.take_store_append_fault_for_test()?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
+        if let Some((active_branch_id, _)) = store.active_turn_claim(event.session_id)?
+            && active_branch_id != event.branch_id
+        {
+            return Err(bt_core::BelltowerError::Protocol(format!(
+                "branch {} does not own the active turn on branch {}",
+                event.branch_id, active_branch_id
+            )));
+        }
+        let seq_id = store.append_event(&event)?;
+        self.publish_committed_event(event, seq_id);
+        Ok(seq_id)
     }
 
     pub fn record_operator_command(
@@ -161,44 +170,6 @@ impl BelltowerRuntime {
         Ok(())
     }
 
-    pub fn record_tool_request_transition(
-        &self,
-        session_id: SessionId,
-        branch_id: bt_core::BranchId,
-        turn_id: TurnId,
-        call_id: ToolCallId,
-        tool_name: String,
-        arguments: serde_json::Value,
-        operation: bt_core::ToolOperationContext,
-        message: Message,
-    ) -> Result<()> {
-        self.append_active_turn_events(
-            session_id,
-            branch_id,
-            turn_id,
-            tool_request_events(
-                session_id, branch_id, turn_id, call_id, tool_name, arguments, operation, message,
-            ),
-        )?;
-        Ok(())
-    }
-
-    pub fn record_tool_operation_request_transition(
-        &self,
-        session_id: SessionId,
-        branch_id: bt_core::BranchId,
-        call_id: ToolCallId,
-        tool_name: String,
-        arguments: serde_json::Value,
-        operation: bt_core::ToolOperationContext,
-        turn_id: Option<TurnId>,
-    ) -> Result<()> {
-        self.append_events(tool_operation_request_events(
-            session_id, branch_id, call_id, tool_name, arguments, operation, turn_id,
-        ))?;
-        Ok(())
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn record_operator_tool_terminal_transition(
         &self,
@@ -268,7 +239,31 @@ impl BelltowerRuntime {
         error: &bt_core::BelltowerError,
         latency_ms: u64,
     ) -> Result<()> {
-        self.record_turn_failure_transition_with_reason(
+        self.record_turn_failure_transition_with_outcome(
+            session_id,
+            branch_id,
+            provider,
+            model_id,
+            turn_id,
+            terminal_results,
+            error,
+            latency_ms,
+        )
+        .map(|_| ())
+    }
+
+    pub fn record_turn_failure_transition_with_outcome(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        provider: &str,
+        model_id: &str,
+        turn_id: TurnId,
+        terminal_results: Vec<ToolResultEnvelope>,
+        error: &bt_core::BelltowerError,
+        latency_ms: u64,
+    ) -> Result<ActiveTurnFinishOutcome> {
+        self.record_turn_failure_transition_with_reason_outcome(
             session_id,
             branch_id,
             provider,
@@ -293,6 +288,33 @@ impl BelltowerRuntime {
         finish_reason: &str,
         latency_ms: u64,
     ) -> Result<()> {
+        self.record_turn_failure_transition_with_reason_outcome(
+            session_id,
+            branch_id,
+            provider,
+            model_id,
+            turn_id,
+            terminal_results,
+            error,
+            finish_reason,
+            latency_ms,
+        )
+        .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_turn_failure_transition_with_reason_outcome(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        provider: &str,
+        model_id: &str,
+        turn_id: TurnId,
+        terminal_results: Vec<ToolResultEnvelope>,
+        error: &bt_core::BelltowerError,
+        finish_reason: &str,
+        latency_ms: u64,
+    ) -> Result<ActiveTurnFinishOutcome> {
         let terminal_at = time::OffsetDateTime::now_utc();
         let mut events = terminal_results
             .into_iter()
@@ -364,14 +386,7 @@ impl BelltowerRuntime {
                 serde_json::Value::String(finish_reason.to_owned()),
             ),
         );
-        self.commit_active_turn_terminal_events(
-            session_id,
-            branch_id,
-            turn_id,
-            terminal_at,
-            events,
-        )?;
-        Ok(())
+        self.commit_active_turn_terminal_events(session_id, branch_id, turn_id, terminal_at, events)
     }
 
     /// Records the terminal outcome when an approved, resumed tool call cannot execute.
@@ -385,7 +400,7 @@ impl BelltowerRuntime {
         tool_call: &bt_core::ToolCall,
         error: &bt_core::BelltowerError,
         latency_ms: u64,
-    ) -> Result<()> {
+    ) -> Result<ActiveTurnFinishOutcome> {
         let result = ToolResultEnvelope {
             call_id: ToolCallId::new(tool_call.call_id.clone()),
             tool_name: tool_call.tool_name.clone(),
@@ -400,7 +415,7 @@ impl BelltowerRuntime {
             }),
             duration_ms: Some(latency_ms),
         };
-        self.record_turn_failure_transition(
+        self.record_turn_failure_transition_with_outcome(
             session.session_id,
             branch.branch_id,
             &connection.provider,
@@ -1246,12 +1261,6 @@ impl BelltowerRuntime {
             }
         }
     }
-
-    pub fn is_cancelled(&self, session_id: SessionId) -> Result<bool> {
-        Ok(self
-            .load_session_control(session_id)?
-            .is_some_and(|state| state.cancel_requested))
-    }
 }
 
 fn require_resumed_continuation_claim(outcome: ContinuationClaim) -> Result<()> {
@@ -1289,77 +1298,6 @@ fn tool_terminal_events(
                 EventPayload::MessageAppended { message },
             ),
             Some(turn_id),
-        ),
-    ]
-}
-
-fn tool_request_events(
-    session_id: SessionId,
-    branch_id: bt_core::BranchId,
-    turn_id: TurnId,
-    call_id: ToolCallId,
-    tool_name: String,
-    arguments: serde_json::Value,
-    operation: bt_core::ToolOperationContext,
-    message: Message,
-) -> Vec<EventEnvelope> {
-    let mut events = tool_operation_request_events(
-        session_id,
-        branch_id,
-        call_id,
-        tool_name,
-        arguments,
-        operation,
-        Some(turn_id),
-    );
-    events.push(apply_turn_id(
-        EventEnvelope::new(
-            session_id,
-            branch_id,
-            SpanKind::Agent,
-            EventPayload::MessageAppended { message },
-        ),
-        Some(turn_id),
-    ));
-    events
-}
-
-#[allow(clippy::too_many_arguments)]
-fn tool_operation_request_events(
-    session_id: SessionId,
-    branch_id: bt_core::BranchId,
-    call_id: ToolCallId,
-    tool_name: String,
-    arguments: serde_json::Value,
-    operation: bt_core::ToolOperationContext,
-    turn_id: Option<TurnId>,
-) -> Vec<EventEnvelope> {
-    vec![
-        apply_turn_id(
-            EventEnvelope::new(
-                session_id,
-                branch_id,
-                SpanKind::Tool,
-                EventPayload::ToolOperationRecorded {
-                    call_id: call_id.clone(),
-                    tool_name: tool_name.clone(),
-                    operation,
-                },
-            ),
-            turn_id,
-        ),
-        apply_turn_id(
-            EventEnvelope::new(
-                session_id,
-                branch_id,
-                SpanKind::Tool,
-                EventPayload::ToolCallRequested {
-                    call_id,
-                    tool_name,
-                    arguments,
-                },
-            ),
-            turn_id,
         ),
     ]
 }

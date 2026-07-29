@@ -186,10 +186,12 @@ provider, and `bt-tui` in a fixed-size tmux pane. It then drives:
 - `/doctor`
 - `/use local bt-tui-mock`
 - a configurable long-session prompt loop
+- a held provider turn followed by `/cancel`
+- a held provider turn followed by `/steer` and its queued turn
 - an approval-producing mock turn
 - `/inspect session`
 - `/compact`
-- `/export jsonl exports/acceptance.jsonl`
+- `/export jsonl` into the temporary acceptance root
 
 By default the scripted tmux gate sends 12 long-session turns so local developer
 acceptance stays fast. To run the M4.1 stress variant:
@@ -202,15 +204,23 @@ Scope:
 
 - validates that the TUI can operate as the primary interface against a real
   server process and a streaming provider
-- validates that slash/operator commands are durable operator-visible history
-  rather than local-only UI output
-- validates that approval, inspection, compaction, and export remain reachable
-  through the full-screen interface
+- exercises server-backed slash/operator output through the same command path
+  used for durable operator history; this smoke does not reload that history
+- validates that approval, inspection, `/compact`, and export remain reachable
+  through the full-screen interface. The `/compact` step is a reachability and
+  visible-result smoke: it accepts either rendered reduction output or a
+  rendered no-op. It does not prove event persistence or restart-stable
+  replacement-context reconstruction
+- validates the exported canonical log: exactly one cancelled terminal turn
+  follows the cancel event and no same-turn assistant message appears after it
+- removes the exact tmux session, mock/server children, and temporary files on
+  normal completion and early failure
 
 Not covered:
 
 - live OpenAI/Anthropic/local-model quality
 - every terminal emulator's modified-key encoding
+- compaction checkpoint reconstruction after process restart
 - one-week dogfood friction evidence
 
 ## 6. Human Milestone Recipes
@@ -307,6 +317,12 @@ Expected:
 - queued follow-up messages do not auto-dispatch after the cancelled turn completes
 - `/steer ...` is accepted while a turn is active or paused on approval
 - the next model turn reflects the steering message instead of ignoring it
+- the resulting cancel/steer events carry the active turn's branch, including
+  when that branch is a non-default child
+- a stale control request naming another branch is rejected and leaves no
+  cancel/steer event in canonical history
+- an ordinary slash command queued on one branch remains recorded there even
+  if branch navigation completes before its background request does
 
 ## Session model switching
 
@@ -323,6 +339,9 @@ Expected:
 
 - subsequent status and inspection surfaces reflect the new connection and model truthfully
 - subsequent prompts run on the selected session-local provider/model
+- queued settings changes retain the branch from which `/connection` or
+  `/model` was invoked, even if the visible branch changes before the HTTP
+  request completes
 
 ## Tool inspection
 

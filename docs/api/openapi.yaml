@@ -240,6 +240,9 @@
       "CancelSessionRequest": {
         "additionalProperties": false,
         "properties": {
+          "branch_id": {
+            "type": "string"
+          },
           "reason": {
             "anyOf": [
               {
@@ -251,7 +254,9 @@
             ]
           }
         },
-        "required": [],
+        "required": [
+          "branch_id"
+        ],
         "type": "object"
       },
       "CompactSessionRequest": {
@@ -501,6 +506,9 @@
             "type": "boolean"
           },
           "from_branch_id": {
+            "type": "string"
+          },
+          "from_event_id": {
             "type": "string"
           }
         },
@@ -952,6 +960,9 @@
       "RecordOperatorCommandRequest": {
         "additionalProperties": false,
         "properties": {
+          "branch_id": {
+            "type": "string"
+          },
           "command_type": {
             "type": "string"
           },
@@ -966,6 +977,7 @@
           }
         },
         "required": [
+          "branch_id",
           "command_type",
           "raw_input",
           "output",
@@ -1009,6 +1021,9 @@
       "RunShellCommandRequest": {
         "additionalProperties": false,
         "properties": {
+          "branch_id": {
+            "type": "string"
+          },
           "command": {
             "type": "string"
           },
@@ -1027,6 +1042,7 @@
           }
         },
         "required": [
+          "branch_id",
           "raw_input",
           "command"
         ],
@@ -1630,11 +1646,15 @@
       "SteerSessionRequest": {
         "additionalProperties": false,
         "properties": {
+          "branch_id": {
+            "type": "string"
+          },
           "message": {
             "type": "string"
           }
         },
         "required": [
+          "branch_id",
           "message"
         ],
         "type": "object"
@@ -1697,11 +1717,15 @@
       "UpdateSessionBudgetRequest": {
         "additionalProperties": false,
         "properties": {
+          "branch_id": {
+            "type": "string"
+          },
           "budget": {
             "$ref": "#/components/schemas/BudgetConfig"
           }
         },
         "required": [
+          "branch_id",
           "budget"
         ],
         "type": "object"
@@ -1709,6 +1733,9 @@
       "UpdateSessionRequest": {
         "additionalProperties": false,
         "properties": {
+          "branch_id": {
+            "type": "string"
+          },
           "connection_id": {
             "anyOf": [
               {
@@ -1744,6 +1771,7 @@
           }
         },
         "required": [
+          "branch_id",
           "reset_model_to_default"
         ],
         "type": "object"
@@ -2328,7 +2356,7 @@
             "BearerAuth": []
           }
         ],
-        "summary": "Update session settings.",
+        "summary": "Update session settings with explicit branch provenance.",
         "tags": [
           "sessions"
         ]
@@ -2951,7 +2979,7 @@
             "BearerAuth": []
           }
         ],
-        "summary": "Configure session budget limits.",
+        "summary": "Configure session budget limits with explicit branch provenance.",
         "tags": [
           "control"
         ]
@@ -2999,7 +3027,7 @@
             "BearerAuth": []
           }
         ],
-        "summary": "Request session cancellation.",
+        "summary": "Request cancellation for a session branch.",
         "tags": [
           "control"
         ]
@@ -3047,7 +3075,7 @@
             "BearerAuth": []
           }
         ],
-        "summary": "Record a durable operator command.",
+        "summary": "Record a durable operator command on a branch.",
         "tags": [
           "operator"
         ]
@@ -3095,7 +3123,7 @@
             "BearerAuth": []
           }
         ],
-        "summary": "Run and record an operator shell command.",
+        "summary": "Run and record an operator shell command on a branch.",
         "tags": [
           "operator"
         ]
@@ -3821,7 +3849,7 @@
             "BearerAuth": []
           }
         ],
-        "summary": "Queue steering input for a session.",
+        "summary": "Queue steering input for a session branch.",
         "tags": [
           "control"
         ]

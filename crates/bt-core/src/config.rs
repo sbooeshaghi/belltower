@@ -519,6 +519,11 @@ impl BelltowerConfig {
 
         if let Some(approval) = partial.approval {
             if let Some(timeout) = approval.shell_timeout_seconds {
+                if timeout == 0 {
+                    return Err(BelltowerError::Config(
+                        "approval.shell_timeout_seconds must be greater than zero".to_owned(),
+                    ));
+                }
                 self.approval.shell_timeout_seconds = timeout;
             }
             if let Some(patterns) = approval.auto_approve_patterns {
@@ -1487,6 +1492,20 @@ summarizer_model = "qwen3:0.6b"
             .apply_overrides("[context]\ncompaction_trigger_fraction = 1.5\n")
             .expect_err("fraction above one must be rejected");
         assert!(error.to_string().contains("compaction_trigger_fraction"));
+    }
+
+    #[test]
+    fn shell_timeout_override_must_be_greater_than_zero() {
+        let mut config = BelltowerConfig::from_embedded().expect("embedded config");
+        let error = config
+            .apply_overrides("[approval]\nshell_timeout_seconds = 0\n")
+            .expect_err("zero shell timeout must be rejected");
+        assert!(error.to_string().contains("shell_timeout_seconds"));
+
+        config
+            .apply_overrides("[approval]\nshell_timeout_seconds = 7\n")
+            .expect("positive shell timeout");
+        assert_eq!(config.approval.shell_timeout_seconds, 7);
     }
 
     #[test]

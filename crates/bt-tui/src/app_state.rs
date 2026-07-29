@@ -342,6 +342,11 @@ impl ChatApp {
         self.transient_status_until = Some(Instant::now() + COMMAND_NOTICE_TTL);
     }
 
+    pub(super) fn clear_notice(&mut self) {
+        self.transient_status = None;
+        self.transient_status_until = None;
+    }
+
     pub(super) fn set_task_status(&mut self, header: impl Into<String>, detail: Option<String>) {
         self.task_status = Some(TaskStatusState {
             header: header.into(),

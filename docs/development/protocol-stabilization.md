@@ -2,8 +2,15 @@
 
 Belltower's protocol is now under stabilization for the initial release path.
 
-This is not a claim of permanent backward compatibility.
-It is an internal development rule so the rest of the product can move quickly without accidental control-plane drift.
+The `0.1.x` line is a preview protocol, not the first stable compatibility
+line. Patch releases in that line preserve compatible route, DTO, replay, and
+typed-error behavior. An intentional incompatible preview change requires a
+minor-version bump, fixture updates, compatibility-test updates, and an
+operator-facing migration note. The eventual first stable protocol will make
+a stronger compatibility promise before release.
+
+This rule lets the rest of the product move quickly without accidental
+control-plane drift while making the current preview boundary explicit.
 
 ## What Is Stabilized
 
@@ -42,3 +49,18 @@ This is why the stabilization harness exists:
 
 - so TUI, auth/models, MCP, and export work can keep moving
 - without re-litigating the core control plane every time
+
+## Intentional Pre-Release Cutovers
+
+Operator/control writes no longer infer a session's default branch.
+`UpdateSessionRequest`, `UpdateSessionBudgetRequest`,
+`CancelSessionRequest`, `SteerSessionRequest`,
+`RecordOperatorCommandRequest`, and `RunShellCommandRequest` require
+`branch_id`. This is an intentional narrow pre-release DTO cutover: preserving
+omission would preserve ambiguous event attribution. Golden session-control
+fixtures, generated OpenAPI, client call sites, and protocol-path tests pin the
+new contract together.
+
+The model-only `send_agent_message` contract makes the same cutover without an
+OpenAPI DTO: `target_branch_id` is required for new messages, and replies must
+reverse the immutable session-and-branch edge named by `in_reply_to`.

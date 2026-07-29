@@ -463,15 +463,16 @@ fn derive_otlp_turns(events: &[EventEnvelope]) -> BTreeMap<TurnId, OtlpTurnSpan>
                 );
                 span.end = event.occurred_at;
                 span.events.push(span_event.clone());
-                if let EventPayload::ToolApprovalRequested { snapshot, .. } = &event.payload {
-                    if let Some(snapshot) = snapshot {
-                        span.approval_request_fingerprint =
-                            Some(snapshot.request_fingerprint.clone());
-                        span.approval_arguments_hash = Some(snapshot.arguments_hash.clone());
-                        span.approval_surface = Some(snapshot.surface.clone());
-                        span.approval_risk_class =
-                            Some(format!("{:?}", snapshot.tool_metadata.risk_class));
-                    }
+                if let EventPayload::ToolApprovalRequested {
+                    snapshot: Some(snapshot),
+                    ..
+                } = &event.payload
+                {
+                    span.approval_request_fingerprint = Some(snapshot.request_fingerprint.clone());
+                    span.approval_arguments_hash = Some(snapshot.arguments_hash.clone());
+                    span.approval_surface = Some(snapshot.surface.clone());
+                    span.approval_risk_class =
+                        Some(format!("{:?}", snapshot.tool_metadata.risk_class));
                 }
                 if let EventPayload::ToolApprovalResolved {
                     decision,

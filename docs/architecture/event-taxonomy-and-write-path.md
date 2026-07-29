@@ -195,21 +195,30 @@ The control-plane rule is now explicit:
   crash-consistent. Broadcast-after-commit is the invariant that keeps the
   event log canonical — no client may observe an event that is not in the log
 - queued follow-up input is canonical runtime state, not a server-local queue
-- cancellation is a durable request that stays pending until runtime clears it
-- steer messages are durable queued control inputs that runtime later applies or drops
+- cancellation is a durable, branch-addressed request that stays pending until runtime clears it
+- steer messages are durable, branch-addressed queued control inputs that runtime later applies or drops
+- when a turn is active, cancel and steer validate that the event branch owns
+  the active-turn projection and append under the same serialized store
+  boundary; a mismatched branch produces no event or projection mutation
 - queue and steer continuation claims compare exact durable source event ids
   and append their resolution plus resumed `turn.started` transition in one
   write transaction
 - `session.settings.updated` advances a durable `settings_revision_id` allocated
   inside the append transaction; the event carries the complete connection,
   model, and tool-mode snapshot rather than a patch, and runtime control events
-  capture the revision they should later run under
+  capture the revision they should later run under. Its projection is session-
+  scoped, while its canonical event uses the request's explicit invocation
+  branch
 - `session.queued_message.enqueued` and `session.steered` capture a settings revision, and runtime resolves the matching historical settings snapshot before it starts the follow-up turn
 - `turn.started` records the settings revision actually used for that turn, so paused turns can resume under their original model/connection
-- `operator.command.recorded` is audit/output context only, not the source of truth for queue or control state
+- `operator.command.recorded` is branch-addressed audit/output context only,
+  not the source of truth for queue or control state; operator shell lifecycle
+  events use that same requested branch
 - `budget.configured` is the sole canonical owner of session autonomy limits;
   `budget.checkpoint` carries only restart-safe used-so-far counters and cannot
-  overwrite newer policy
+  overwrite newer policy. Budget policy is session-scoped, but configuration
+  events use the request's explicit invocation branch rather than the current
+  default branch
 - budget policy changes are idle-boundary operations. The store rejects
   `budget.configured` while a turn owns the active slot; when an idle update is
   already exhausted by persisted counters, the configuration and resulting
@@ -262,7 +271,10 @@ The control-plane rule is now explicit:
   the source and destination sessions atomically. The source session,
   destination session, and message id form the delivery identity: an exact
   retry returns the existing receipt, while conflicting content under that
-  identity fails. Resolution projection updates use that same exact endpoint
+  identity fails. Each canonical copy carries the explicit source and
+  destination branch. A reply must reverse the received message's exact
+  session-and-branch edge; neither runtime nor the store may infer a later
+  default branch. Resolution projection updates use that same exact endpoint
   pair and cannot mutate an unrelated lineage that happens to reuse an id.
   A terminal `Result` or `Error` reply and the recipient-local settlement event
   commit in one transaction. The settlement names the exact obligation, reply,

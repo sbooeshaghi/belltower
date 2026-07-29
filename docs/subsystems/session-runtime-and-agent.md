@@ -139,7 +139,12 @@ Important design rules:
 - each settings revision identifies one immutable, self-contained connection,
   model, and tool-mode snapshot; the store allocates the next revision inside
   the same write transaction that appends `session.settings.updated`, and replay
-  may only reassert identical contents
+  may only reassert identical contents. The settings projection is session-
+  scoped, while the update event records the explicitly addressed invocation
+  branch as provenance
+- budget policy is also a session-scoped projection, but every
+  `budget.configured` event records the operator's explicit invocation branch;
+  neither settings nor budget updates infer the default branch
 - canonical events are committed before any SSE or tracing projection is emitted
 - if the canonical store is unavailable, canonical turn progression stops rather than silently degrading into a non-durable mode
 
@@ -391,8 +396,11 @@ The clean model is:
 - composition is a chain, not a stack: the previous summary (from the last
   `context.compacted` event, plus any marker-prefixed summary message
   found in history) is folded into the new summarization input and never
-  retained alongside the new summary. Manual `/compact` keeps working on
-  the synchronous path with the deterministic digest
+  retained alongside the new summary. Manual `/compact` uses the synchronous
+  deterministic-digest path. It records `context.compacted` only when the
+  replacement reduces Belltower's estimated normalized context footprint;
+  otherwise it returns the normalized original context as a no-op, with no
+  false success event
 - provider/auth/model preflight happens before runtime records model-visible
   context mutations such as `context.compacted`; a provider path that cannot
   execute records a durable failure instead of leaving a successful compaction
@@ -476,6 +484,14 @@ The runtime must own:
 
 These are runtime/session concerns, not TUI-local features.
 
+Cancel and steer are explicitly branch-addressed. Runtime validates an active
+turn's branch ownership and appends the control event while holding the same
+serialized store boundary, so turn completion or a new claim cannot race
+between validation and commit. A cross-branch request is rejected without
+changing projections or appending misleading evidence. When the session is
+idle, an explicitly addressed control remains valid and preserves that branch
+as its provenance.
+
 The clean budget split is:
 
 - `bt-agent` stays pure and emits the typed turn outputs that budget
@@ -511,6 +527,15 @@ delivery or claim. A `wake` message starts work through the same admitted-turn
 path as other continuations, and queued wakes are considered after cancel and
 steer but before ordinary queued user follow-ups. `notify` messages remain
 durable context for a later turn.
+
+Every new related-session message names its destination branch explicitly.
+The model-facing tool obtains that identity from `list_agents`; runtime never
+silently substitutes the destination session's default branch. For a reply,
+the received `in_reply_to` message is the authoritative route: the reply must
+reverse the original source/destination session and branch edge exactly.
+Runtime rejects conflicting input before append, and `bt-session` enforces the
+same rule in the atomic delivery transaction so a concurrent default-branch
+change cannot redirect durable evidence.
 
 `wait_agent` is an observation and consumption boundary. When the calling turn
 observes pending `wake` messages, `bt-session` atomically resolves those exact

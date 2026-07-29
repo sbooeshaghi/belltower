@@ -37,6 +37,7 @@ impl BelltowerRuntime {
             )),
             approvals,
             event_bus,
+            active_cancellations: Mutex::new(HashMap::new()),
         };
         trace.mark("registries.construct.done");
         trace.mark("turn_recovery.start");
@@ -127,8 +128,7 @@ impl BelltowerRuntime {
             // approval/input continuation of the claimed work.
             let terminal = turns[original_index..]
                 .iter()
-                .filter(|turn| turn.branch_id == obligation.message.destination_branch_id)
-                .next_back()
+                .rfind(|turn| turn.branch_id == obligation.message.destination_branch_id)
                 .expect("the original turn is on the obligation branch");
             match terminal.status.as_deref() {
                 None | Some("awaiting_approval" | "awaiting_input") => {}

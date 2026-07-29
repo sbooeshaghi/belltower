@@ -548,6 +548,106 @@ fn related_session_delivery_is_atomic_idempotent_and_lineage_scoped() {
 }
 
 #[test]
+fn related_session_reply_must_reverse_the_exact_branch_edge_atomically() {
+    let mut store = SqliteSessionStore::open_in_memory().expect("store");
+    let (parent, parent_branch) = sample_session();
+    let (child, child_branch) = child_session(&parent, &parent_branch);
+    for (session, branch) in [(&parent, &parent_branch), (&child, &child_branch)] {
+        store
+            .create_session(session, branch)
+            .expect("create session");
+    }
+    let alternate_parent_branch = BranchRecord {
+        branch_id: bt_core::BranchId::new(),
+        session_id: parent.session_id,
+        parent_branch_id: Some(parent_branch.branch_id),
+        parent_event_id: None,
+        head_event_id: None,
+        summary: Some("alternate parent destination".to_owned()),
+        created_at: OffsetDateTime::now_utc(),
+        is_default: false,
+    };
+    store
+        .create_branch(&alternate_parent_branch)
+        .expect("create alternate parent branch");
+
+    let question_id = RelatedSessionMessageId::new();
+    let (question_sent, question_received) = related_message_events(
+        &parent,
+        &parent_branch,
+        &child,
+        &child_branch,
+        question_id,
+        "which branch received this?",
+        RelatedSessionDeliveryMode::Notify,
+    );
+    store
+        .commit_related_session_message(&question_sent, &question_received)
+        .expect("commit question");
+
+    let child_turn_id = TurnId::new();
+    store
+        .append_event(&turn_started_event(&child, &child_branch, child_turn_id))
+        .expect("start causal child turn");
+    let (_, reply_sent, reply_received) = related_reply_events(
+        &child,
+        &child_branch,
+        &parent,
+        &alternate_parent_branch,
+        child_turn_id,
+        question_id,
+        RelatedSessionMessageKind::Answer,
+        "a forged redirect",
+    );
+    let parent_event_count = store
+        .load_events_after(parent.session_id, None, usize::MAX)
+        .expect("parent events before rejection")
+        .len();
+    let child_event_count = store
+        .load_events_after(child.session_id, None, usize::MAX)
+        .expect("child events before rejection")
+        .len();
+
+    let error = store
+        .commit_related_session_message(&reply_sent, &reply_received)
+        .expect_err("reply must not redirect to another branch");
+    assert!(matches!(error, BelltowerError::Protocol(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("reverse the original session and branch edge")
+    );
+    assert_eq!(
+        store
+            .load_events_after(parent.session_id, None, usize::MAX)
+            .expect("parent events after rejection")
+            .len(),
+        parent_event_count
+    );
+    assert_eq!(
+        store
+            .load_events_after(child.session_id, None, usize::MAX)
+            .expect("child events after rejection")
+            .len(),
+        child_event_count
+    );
+    assert_eq!(
+        store
+            .load_related_session_messages(parent.session_id)
+            .expect("parent mailbox")
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .load_related_session_messages(child.session_id)
+            .expect("child mailbox")
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn related_session_terminal_reply_settlement_is_atomic_and_idempotent() {
     let mut store = SqliteSessionStore::open_in_memory().expect("store");
     let (parent, parent_branch) = sample_session();
@@ -5017,7 +5117,7 @@ fn portable_session_bundle_validation_rejects_tampered_events() {
     let (bundle_dir, _) = export_portable_bundle_fixture();
     let events_path = bundle_dir.path().join(SESSION_BT_EVENTS);
     let mut events = fs::read_to_string(&events_path).expect("events jsonl");
-    events.push_str("\n");
+    events.push('\n');
     fs::write(&events_path, events).expect("tamper events");
 
     let error = validate_session_bundle_directory(bundle_dir.path()).expect_err("invalid bundle");

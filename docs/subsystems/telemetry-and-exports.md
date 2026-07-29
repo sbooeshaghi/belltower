@@ -172,8 +172,8 @@ The current `bt-otel` export now maps the canonical store into richer OpenInfere
   - operation metadata and artifact refs when present in canonical events
 - OTLP span events include payload previews and mirrored event attributes so the event stream is useful inside Phoenix instead of only showing bare event names
 - related-session mailbox events mirror message direction, peer session,
-  delivery mode, kind, status, terminal settlement, and message/turn
-  correlation; the canonical
+  source/destination branch, delivery mode, kind, status, terminal settlement,
+  and message/turn correlation; the canonical
   paired session events remain the source of truth. Turnless destination
   `session.related_message.recorded` and `session.related_message.resolved`
   events export as session-trace `CHAIN` spans keyed by their canonical event

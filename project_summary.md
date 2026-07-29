@@ -1,18 +1,23 @@
 # Belltower - Project Summary
 
 ## Overview
-**Belltower** is a standalone Rust agent harness with a canonical HTTP/SSE protocol boundary, providing a complete framework for building and running AI agents.
+**Belltower** is a standalone Rust agent harness whose typed SQLite event log
+is the source of truth behind a canonical HTTP/SSE protocol boundary. The goal
+is a reproducible, shareable, extensible execution record rather than a UI-local
+chat transcript.
 
 ## Core Identity
 - **Language**: Rust (edition 2024)
 - **Architecture**: Workspace-based multi-crate project
 - **Storage**: SQLite-backed local storage (rusqlite)
 - **Telemetry**: OpenInference-aligned with OpenTelemetry export
+- **Primary evidence**: committed typed events; telemetry and UI state are derived consumers
 
 ## Workspace Structure
 The project contains 18 crates in `/crates/`:
 
 ### Foundation Crates
+- `belltower` - User-facing launcher and operator CLI
 - `bt-core` - Core foundation
 - `bt-protocol` - Protocol definitions
 - `bt-client` - HTTP client layer
@@ -47,8 +52,9 @@ The project contains 18 crates in `/crates/`:
 - **Protocol Normalization**: Standardized HTTP/SSE boundary
 - **Event Taxonomy**: Structured event model for telemetry
 - **Tool System**: Normalized tool interfaces
-- **Subagent Architecture**: Session graphs and multi-agent workflows
-- **Telemetry**: OpenInference-aligned exports
+- **Subagent Architecture**: same-lineage session graphs, explicit branch-routed durable messaging, exact reply edges, and per-child connection/model selection
+- **Telemetry**: OpenInference-aligned exports derived from canonical events
+- **Replay and Sharing**: portable session bundles, branching, inspection, and restart reconstruction
 - **TUI Interface**: Terminal-based user interface
 - **Authentication**: Built-in auth management (`belltower login`, `belltower logout`)
 
@@ -75,5 +81,5 @@ belltower status                   # System status
 - [`docs/subsystems/`](docs/subsystems/) - Subsystem specifications
 
 ## Repository
-- GitHub: https://github.com/sbooeshaghi/frollo
-- License: MIT
+- GitHub: https://github.com/sbooeshaghi/belltower
+- License: [`MIT`](LICENSE)

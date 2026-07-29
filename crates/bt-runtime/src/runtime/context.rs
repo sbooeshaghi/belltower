@@ -269,7 +269,7 @@ impl BelltowerRuntime {
             return Ok(None);
         };
         let count = 1 + compactions.clone().count() as u64;
-        let last = compactions.last().unwrap_or_else(|| first.clone());
+        let last = compactions.next_back().unwrap_or_else(|| first.clone());
         Ok(Some(PreviousCompactionState {
             count,
             last_compaction_id: last.0,
@@ -330,6 +330,10 @@ impl BelltowerRuntime {
         })
     }
 
+    // This is the runtime's resolved context boundary: keeping the typed
+    // provider, turn, settings, and compaction inputs explicit makes caller
+    // ownership clearer than hiding them in a loosely scoped options bag.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_turn_context_for_resolved_settings(
         &self,
         session: &SessionRecord,

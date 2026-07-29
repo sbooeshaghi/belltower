@@ -102,7 +102,7 @@ The protocol must make the following things explicit:
 
 - session creation and lookup
 - canonical session budget DTO shapes for creation and later control updates
-- message submission
+- branch-addressed message submission and operator/control mutations
 - approval actions, including durable request snapshots and separate
   resolution evidence in inspection/event DTOs
 - branch creation and switching, including optional event-boundary forks via
@@ -184,6 +184,18 @@ terminalizes turns interrupted by a crash. Clients that need the outcome
 synchronously (headless runs, tests) use
 `BelltowerClient::wait_for_session_settle`.
 
+Branch identity is part of the write contract, not server-side ambient state.
+`UpdateSessionRequest`, `UpdateSessionBudgetRequest`,
+`CancelSessionRequest`, `SteerSessionRequest`,
+`RecordOperatorCommandRequest`, and `RunShellCommandRequest` require a
+`branch_id`, just as message and compaction requests do. Handlers validate that
+the branch belongs to the path session and pass the same identity into runtime
+events. Settings and budget remain session-scoped projections; their branch is
+canonical provenance for the operator invocation. While a turn is active,
+cancel and steer additionally require the requested branch to own that turn; a
+mismatch returns a protocol error before any event is appended. This keeps the
+canonical event branch equal to the work that was actually controlled.
+
 Extended-tool sessions also register four server-hosted model tools over the
 same runtime/store boundary:
 
@@ -193,8 +205,10 @@ same runtime/store boundary:
   contract: the objective is delivered as a wake instruction and the child
   starts immediately; `dispatch: false` opts into a prepared-but-idle child
 - `send_agent_message` records a typed message to any session in the same
-  lineage tree (parent, child, or sibling) and may wake an idle destination;
-  parents are not copied on peer traffic
+  lineage tree (parent, child, sibling, or deeper relative) and may wake an
+  idle destination; `target_branch_id` is required, and replies must name the
+  exact branch from the immutable reverse message edge; parents are not copied
+  on peer traffic
 - `list_agents` returns canonical workflow lineage plus recent mailbox
   records, optionally for another same-tree session via `target_session_id`
 - `wait_agent` performs a bounded mailbox wait without joining or cancelling

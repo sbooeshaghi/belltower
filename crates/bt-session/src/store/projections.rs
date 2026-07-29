@@ -273,9 +273,8 @@ impl SqliteSessionStore {
                     } else {
                         "delivered"
                     };
-                let (status, resulting_turn_id, resolved_at) = resolved_pair
-                    .map(|(status, turn_id, resolved_at)| (status, turn_id, resolved_at))
-                    .unwrap_or_else(|| (default_status.to_owned(), None, None));
+                let (status, resulting_turn_id, resolved_at) =
+                    resolved_pair.unwrap_or_else(|| (default_status.to_owned(), None, None));
                 tx.execute(
                     "INSERT INTO related_session_message_projection (
                         session_id, message_id, direction, event_id, counterpart_event_id,

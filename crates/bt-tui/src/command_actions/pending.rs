@@ -116,6 +116,7 @@ pub(crate) fn command_label(raw_input: &str) -> String {
 pub(crate) async fn record_slash_command(
     client: &BelltowerClient,
     session_id: SessionId,
+    branch_id: BranchId,
     raw_input: &str,
     output: String,
     success: bool,
@@ -124,6 +125,7 @@ pub(crate) async fn record_slash_command(
         .record_operator_command(
             session_id,
             &RecordOperatorCommandRequest {
+                branch_id,
                 command_type: "slash_command".to_owned(),
                 raw_input: raw_input.to_owned(),
                 output,
@@ -187,10 +189,19 @@ impl ChatApp {
         };
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.to_owned();
         let label = command_label(raw_input);
         self.enqueue_pending_command(label, Some(raw.clone()), async move {
-            record_slash_command(&client, session_id, &raw, output.clone(), success).await?;
+            record_slash_command(
+                &client,
+                session_id,
+                branch_id,
+                &raw,
+                output.clone(),
+                success,
+            )
+            .await?;
             Ok(CommandOutcome::Notice(output))
         });
     }
@@ -200,10 +211,11 @@ impl ChatApp {
     pub(crate) fn enqueue_recorded_command_output(&mut self, raw_input: &str, output: String) {
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.to_owned();
         let label = command_label(raw_input);
         self.enqueue_pending_command(label, Some(raw.clone()), async move {
-            record_slash_command(&client, session_id, &raw, output, true).await?;
+            record_slash_command(&client, session_id, branch_id, &raw, output, true).await?;
             Ok(CommandOutcome::Quiet)
         });
     }

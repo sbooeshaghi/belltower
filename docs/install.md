@@ -4,19 +4,27 @@ Belltower's user entrypoint is `belltower`. The current runtime also
 needs the `bt-server` and `bt-tui` helper binaries available next to
 `belltower` or somewhere on `PATH`.
 
-## Option 1: Cargo
+## Option 1: Cargo From A Source Checkout
 
 Use this when you have a Rust toolchain:
 
 ```bash
-cargo install bt-server bt-tui belltower
+cargo install --path crates/bt-server
+cargo install --path crates/bt-tui
+cargo install --path crates/belltower
 belltower --version
 belltower doctor
 ```
 
-This installs the helper binaries and the launcher into Cargo's bin
-directory. Ensure that directory is on `PATH`; Cargo usually prints it
-after installation.
+Run those commands from the Belltower repository root. They install the helper
+binaries and launcher into Cargo's bin directory. Ensure that directory is on
+`PATH`; Cargo usually prints it after installation.
+
+Version 0.1 deliberately does not publish workspace crates to crates.io.
+Use a GitHub release archive or this source-checkout path instead. The
+workspace crates are implementation details rather than a public Rust crate
+API; this also avoids conflating Belltower with unrelated registry packages
+that already use the `belltower` and `bt-runtime` names.
 
 ## Option 2: Release Archive
 
@@ -35,7 +43,7 @@ remove the quarantine attribute after you have verified the download:
 xattr -dr com.apple.quarantine ~/bin/belltower
 ```
 
-## Option 3: Source Checkout
+## Development From A Source Checkout
 
 Use this when developing Belltower:
 
@@ -97,9 +105,10 @@ text as structured output.
 
 ## Troubleshooting
 
-- `could not resolve bt-server` or `could not resolve bt-tui`: install
-  the helper binaries with `cargo install bt-server bt-tui belltower`,
-  or keep all three release-archive binaries in the same directory.
+- `could not resolve bt-server` or `could not resolve bt-tui`: install the
+  helper binaries from a source checkout using the three `cargo install
+  --path` commands above, or keep all three release-archive binaries in the
+  same directory.
 - `belltower doctor` reports missing auth: run `belltower login
   <connection>` for the connection you want to use.
 - The local server port is busy: stop the existing Belltower server, or

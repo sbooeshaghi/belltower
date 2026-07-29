@@ -196,26 +196,31 @@ impl ContextAssembler {
                 tokens_before,
                 options.observed_context_tokens,
             );
-            compact_messages(
-                normalized_messages,
+            let (candidate_messages, candidate_compaction) = compact_messages(
+                normalized_messages.clone(),
                 effective_budget.saturating_sub(system_tokens),
                 trigger,
                 self.config.context.compaction_user_message_budget_tokens,
                 options.previous_summary.as_deref(),
                 options.summary_override.as_deref(),
-            )
+            );
+            let candidate_tokens =
+                estimate_messages_tokens(&candidate_messages).saturating_add(system_tokens);
+            match candidate_compaction {
+                Some(mut compaction)
+                    if trigger != ContextCompactionTrigger::Forced
+                        || candidate_tokens < tokens_before =>
+                {
+                    compaction.tokens_before = tokens_before;
+                    compaction.tokens_after = candidate_tokens;
+                    compaction.messages_after = candidate_messages.len() as u32;
+                    (candidate_messages, Some(compaction))
+                }
+                _ => (normalized_messages, None),
+            }
         } else {
             (normalized_messages, None)
         };
-
-        let tokens_after =
-            estimate_messages_tokens(&selected_messages).saturating_add(system_tokens);
-        let compaction = compaction.map(|mut compaction| {
-            compaction.tokens_before = tokens_before;
-            compaction.tokens_after = tokens_after;
-            compaction.messages_after = selected_messages.len() as u32;
-            compaction
-        });
         let thinking = effective_thinking_config(
             &connection_id,
             provider,
@@ -453,8 +458,7 @@ fn default_anthropic_thinking_budget(reserve_tokens: u64) -> u64 {
     } else {
         reserve_tokens
             .saturating_sub(1_024)
-            .max(1_024)
-            .min(32_768)
+            .clamp(1_024, 32_768)
             .min(upper)
     }
 }
@@ -804,7 +808,7 @@ fn resolve_retention_selection(
     let (mut folded_summaries, messages) = extract_summary_messages(messages);
     if let Some(previous) = previous_summary {
         let body = normalize_summary_body(previous);
-        if !body.is_empty() && !folded_summaries.iter().any(|existing| *existing == body) {
+        if !body.is_empty() && !folded_summaries.contains(&body) {
             folded_summaries.insert(0, body);
         }
     }
@@ -1990,11 +1994,11 @@ mod tests {
     }
 
     #[test]
-    fn forced_compaction_summarizes_even_when_context_fits() {
+    fn forced_compaction_summarizes_when_it_reduces_context() {
         let config = bt_core::BelltowerConfig::from_embedded().expect("config");
         let assembler = ContextAssembler::new(config).expect("assembler");
         let messages = vec![
-            Message::text(Role::User, "first task context"),
+            Message::text(Role::User, "first task context ".repeat(1_000)),
             Message::text(Role::Assistant, "acknowledged"),
             Message::text(Role::User, "latest request"),
         ];
@@ -2020,6 +2024,34 @@ mod tests {
                 .contains("Earlier conversation compacted")
         );
         assert!(output.request.messages.len() <= 3);
+    }
+
+    #[test]
+    fn forced_compaction_is_a_noop_when_summary_would_grow_context() {
+        let config = bt_core::BelltowerConfig::from_embedded().expect("config");
+        let assembler = ContextAssembler::new(config).expect("assembler");
+        let messages = vec![
+            Message::text(Role::User, "first task context"),
+            Message::text(Role::Assistant, "acknowledged"),
+            Message::text(Role::User, "latest request"),
+        ];
+
+        let output = assembler.build_request_with_options(
+            ConnectionId::new("local"),
+            "openai-compatible",
+            "qwen3:latest",
+            None,
+            messages.clone(),
+            Vec::new(),
+            None,
+            super::ContextBuildOptions {
+                force_compaction: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(output.compaction.is_none());
+        assert_eq!(output.request.messages, messages);
     }
 
     fn compaction_options(
@@ -2203,7 +2235,7 @@ mod tests {
             "the newest user message within budget is retained verbatim"
         );
         assert!(
-            !texts.iter().any(|text| *text == old_long_user),
+            !texts.contains(&old_long_user),
             "the older user message over budget is summarized, not retained"
         );
     }
@@ -2296,7 +2328,7 @@ mod tests {
         let config = bt_core::BelltowerConfig::from_embedded().expect("config");
         let assembler = ContextAssembler::new(config).expect("assembler");
         let messages = vec![
-            Message::text(Role::User, "first task context"),
+            Message::text(Role::User, "first task context ".repeat(1_000)),
             Message::text(Role::Assistant, "acknowledged"),
             Message::text(Role::User, "latest request"),
         ];
@@ -2340,7 +2372,7 @@ mod tests {
         config.context.compaction_trigger_fraction = 0.95;
         let assembler = ContextAssembler::new(config).expect("assembler");
         let messages = vec![
-            Message::text(Role::User, "first task context"),
+            Message::text(Role::User, "first task context ".repeat(1_000)),
             Message::text(Role::Assistant, "acknowledged"),
             Message::text(Role::User, "latest request"),
         ];

@@ -12,8 +12,8 @@ use crate::{
     PostTurnControlAction,
 };
 use bt_agent::{
-    ToolLifecycleObserver, TurnApproval, TurnApprovalRequest, TurnLoop, TurnRequest,
-    TurnToolCallRequest,
+    ToolCallRequestDisposition, ToolLifecycleObserver, TurnApproval, TurnApprovalRequest, TurnLoop,
+    TurnRequest, TurnToolCallRequest,
 };
 use bt_context::{SystemPromptBuilder, SystemPromptInput};
 use bt_core::{
@@ -127,8 +127,8 @@ impl ToolLifecycleObserver for RuntimeToolLifecycleObserver<'_> {
         &mut self,
         request: &TurnToolCallRequest,
         message: &bt_core::Message,
-    ) -> Result<()> {
-        self.runtime.record_tool_request_transition(
+    ) -> Result<ToolCallRequestDisposition> {
+        let recorded = self.runtime.record_tool_request_transition(
             self.session_id,
             self.branch_id,
             self.turn_id,
@@ -144,7 +144,11 @@ impl ToolLifecycleObserver for RuntimeToolLifecycleObserver<'_> {
             },
             message.clone(),
         )?;
-        Ok(())
+        Ok(if recorded {
+            ToolCallRequestDisposition::Recorded
+        } else {
+            ToolCallRequestDisposition::Cancelled
+        })
     }
 
     fn tool_approval_requested(&mut self, request: &TurnApprovalRequest) -> Result<()> {
@@ -213,14 +217,20 @@ impl BelltowerRuntime {
         let awaiting_approval = !approval_requests.is_empty();
         let finish_reason_label = format!("{finish_reason:?}");
 
-        for message in messages
+        let messages = messages
             .into_iter()
             .filter(|message| message.tool_call().is_none() && message.tool_result().is_none())
-        {
-            self.append_raw_message(session, branch, message, Some(turn_id))?;
-        }
+            .collect();
+        let cancelled = self.append_turn_result_messages_unless_cancelled(
+            session.session_id,
+            branch.branch_id,
+            turn_id,
+            messages,
+        )?;
 
-        let persistence = if awaiting_input {
+        let persistence = if cancelled {
+            TurnResultPersistenceStatus::Completed
+        } else if awaiting_input {
             TurnResultPersistenceStatus::AwaitingInput
         } else if awaiting_approval {
             TurnResultPersistenceStatus::AwaitingApproval
@@ -229,14 +239,20 @@ impl BelltowerRuntime {
         };
         Ok(PersistedTurnResult {
             persistence,
-            status: if awaiting_input {
+            status: if cancelled {
+                "cancelled".to_owned()
+            } else if awaiting_input {
                 "awaiting_input".to_owned()
             } else if awaiting_approval {
                 "awaiting_approval".to_owned()
             } else {
                 "completed".to_owned()
             },
-            finish_reason: finish_reason_label,
+            finish_reason: if cancelled {
+                "Cancelled".to_owned()
+            } else {
+                finish_reason_label
+            },
         })
     }
 }
@@ -251,6 +267,36 @@ struct CollectedSummarization {
 }
 
 impl TurnOrchestrator<'_> {
+    fn finish_cancelled_turn(
+        &self,
+        session: &SessionRecord,
+        branch: &BranchRecord,
+        turn_id: TurnId,
+        provider: String,
+        model: String,
+        latency_ms: u64,
+    ) -> Result<()> {
+        self.runtime
+            .record_active_turn_finished_with_cancel_precedence(
+                session.session_id,
+                branch.branch_id,
+                turn_id,
+                provider,
+                model,
+                "cancelled".to_owned(),
+                Some("Cancelled".to_owned()),
+                latency_ms,
+            )?;
+        self.runtime.record_related_turn_outcome(
+            session.session_id,
+            branch.branch_id,
+            turn_id,
+            TurnRunStopReason::Cancelled,
+        )?;
+        self.runtime.consume_post_turn_controls(session, branch)?;
+        Ok(())
+    }
+
     /// Runs the planned compaction summarization (when any) via the normal
     /// provider seam and returns the compaction inputs for the final context
     /// build. Provider failures fall back to the deterministic digest —
@@ -264,21 +310,27 @@ impl TurnOrchestrator<'_> {
         branch: &BranchRecord,
         turn_id: TurnId,
         plan: &TurnContextPlan,
-    ) -> Result<TurnContextCompactionInputs> {
+        cancellation: &bt_core::CancellationSignal,
+    ) -> Result<Option<TurnContextCompactionInputs>> {
         let observed_context_tokens =
             ObservedContextTokensInput::Provided(plan.observed_context_tokens);
         let Some(summarization) = &plan.summarization else {
-            return Ok(TurnContextCompactionInputs {
+            return Ok(Some(TurnContextCompactionInputs {
                 observed_context_tokens,
                 summary_override: None,
                 reason_suffix: None,
-            });
+            }));
         };
 
-        match self
-            .collect_summarization_stream(provider, connection, summarization)
-            .await
-        {
+        let collection = collect_summarization_with_cancel_precedence(
+            cancellation,
+            self.collect_summarization_stream(provider, connection, summarization),
+        )
+        .await;
+        let Some(collection) = collection else {
+            return Ok(None);
+        };
+        match collection {
             Ok(collected) => {
                 let summary_text = collected.summary_text.clone();
                 self.record_summarization_completion(
@@ -290,14 +342,14 @@ impl TurnOrchestrator<'_> {
                     summarization,
                     collected,
                 )?;
-                Ok(TurnContextCompactionInputs {
+                Ok(Some(TurnContextCompactionInputs {
                     observed_context_tokens,
                     summary_override: Some(summary_text),
                     reason_suffix: Some(format!(
                         "summary=model:{}",
                         summarization.summarizer_model
                     )),
-                })
+                }))
             }
             Err(error) => {
                 tracing::warn!(
@@ -308,14 +360,14 @@ impl TurnOrchestrator<'_> {
                     error = %error,
                     "compaction summarization failed; falling back to deterministic digest"
                 );
-                Ok(TurnContextCompactionInputs {
+                Ok(Some(TurnContextCompactionInputs {
                     observed_context_tokens,
                     summary_override: None,
                     reason_suffix: Some(format!(
                         "summary=fallback_digest; summarizer_error={}",
                         error.code()
                     )),
-                })
+                }))
             }
         }
     }
@@ -430,7 +482,7 @@ impl TurnOrchestrator<'_> {
         turn_id: TurnId,
         settings_revision_id: u64,
         error: &BelltowerError,
-    ) -> Result<()> {
+    ) -> Result<crate::ActiveTurnFinishOutcome> {
         let (provider, model) = self
             .runtime
             .resolve_turn_settings(session.session_id, settings_revision_id)
@@ -444,7 +496,7 @@ impl TurnOrchestrator<'_> {
                         .unwrap_or_else(|| "unknown".to_owned()),
                 )
             });
-        self.runtime.record_turn_failure_transition(
+        self.runtime.record_turn_failure_transition_with_outcome(
             session.session_id,
             branch_id,
             &provider,
@@ -475,14 +527,21 @@ impl TurnOrchestrator<'_> {
                     BelltowerError::InvalidState("admitted turn id missing".to_owned())
                 })?;
                 let settings_revision_id = next_settings_revision_id;
+                let cancellation_guard = self.runtime.begin_active_turn_cancellation(
+                    request.session.session_id,
+                    current_branch.branch_id,
+                    turn_id,
+                )?;
+                let cancellation = cancellation_guard.signal();
 
-                let preflight = async {
+                let preflight_future = async {
                     let turn_session = self
                         .runtime
                         .session_for_settings_revision(&request.session, settings_revision_id)?;
-                    let tools = adapters
-                        .build_tool_registry(&turn_session, current_branch.branch_id)
-                        .await?;
+                    let tools = tokio::select! {
+                        tools = adapters.build_tool_registry(&turn_session, current_branch.branch_id) => tools?,
+                        () = wait_for_cancellation(&cancellation) => return Ok(None),
+                    };
                     let instructions = self
                         .runtime
                         .resolve_instructions(Some(&turn_session.project_root))?;
@@ -500,7 +559,10 @@ impl TurnOrchestrator<'_> {
                     let (connection, model_id) = self
                         .runtime
                         .resolve_turn_settings(turn_session.session_id, settings_revision_id)?;
-                    let provider = adapters.provider_for_connection(&connection).await?;
+                    let provider = tokio::select! {
+                        provider = adapters.provider_for_connection(&connection) => provider?,
+                        () = wait_for_cancellation(&cancellation) => return Ok(None),
+                    };
                     // Compaction check point: runs for the initial pre-turn
                     // preflight and for every continuation dispatch
                     // (steer/queued/related-session follow-ups), since each
@@ -524,8 +586,15 @@ impl TurnOrchestrator<'_> {
                             &current_branch,
                             turn_id,
                             &context_plan,
+                            &cancellation,
                         )
                         .await?;
+                    let Some(compaction_inputs) = compaction_inputs else {
+                        return Ok(None);
+                    };
+                    if cancellation.is_cancelled() {
+                        return Ok(None);
+                    }
                     let prepared = self.runtime.prepare_turn_context_for_resolved_settings(
                         &turn_session,
                         &current_branch,
@@ -543,7 +612,7 @@ impl TurnOrchestrator<'_> {
                     let model_id = prepared.model_id;
                     let context_compaction = prepared.compaction.clone();
                     let completion_request = prepared.request;
-                    Ok((
+                    Ok(Some((
                         turn_session,
                         tools,
                         instructions,
@@ -554,9 +623,19 @@ impl TurnOrchestrator<'_> {
                         model_id,
                         completion_request,
                         provider,
-                    ))
-                }
-                .await;
+                    )))
+                };
+                let preflight = tokio::select! {
+                    biased;
+                    () = wait_for_cancellation(&cancellation) => Ok(None),
+                    preflight = preflight_future => {
+                        if cancellation.is_cancelled() {
+                            Ok(None)
+                        } else {
+                            preflight
+                        }
+                    },
+                };
                 let (
                     turn_session,
                     tools,
@@ -569,15 +648,48 @@ impl TurnOrchestrator<'_> {
                     completion_request,
                     provider,
                 ) = match preflight {
-                    Ok(preflight) => preflight,
+                    Ok(Some(preflight)) => preflight,
+                    Ok(None) => {
+                        let (connection, model_id) = self
+                            .runtime
+                            .resolve_turn_settings(request.session.session_id, settings_revision_id)?;
+                        self.finish_cancelled_turn(
+                            &request.session,
+                            &current_branch,
+                            turn_id,
+                            connection.provider,
+                            model_id,
+                            0,
+                        )?;
+                        return Ok(TurnRunOutcome {
+                            session_id: request.session.session_id,
+                            final_branch_id: current_branch.branch_id,
+                            stop_reason: TurnRunStopReason::Cancelled,
+                        });
+                    }
                     Err(error) => {
-                        self.record_pre_turn_failure(
+                        let finish = self.record_pre_turn_failure(
                             &request.session,
                             current_branch.branch_id,
                             turn_id,
                             settings_revision_id,
                             &error,
                         )?;
+                        if finish.cancelled {
+                            self.runtime.record_related_turn_outcome(
+                                request.session.session_id,
+                                current_branch.branch_id,
+                                turn_id,
+                                TurnRunStopReason::Cancelled,
+                            )?;
+                            self.runtime
+                                .consume_post_turn_controls(&request.session, &current_branch)?;
+                            return Ok(TurnRunOutcome {
+                                session_id: request.session.session_id,
+                                final_branch_id: current_branch.branch_id,
+                                stop_reason: TurnRunStopReason::Cancelled,
+                            });
+                        }
                         self.runtime.record_related_turn_failure(
                             request.session.session_id,
                             current_branch.branch_id,
@@ -621,7 +733,7 @@ impl TurnOrchestrator<'_> {
                         pending_terminal: None,
                     };
                     let result = match turn_loop
-                        .run_turn_with_tool_observer(
+                        .run_turn_with_tool_observer_and_cancellation(
                             TurnRequest {
                                 session_id: turn_session.session_id,
                                 project_root: turn_session.project_root.clone(),
@@ -669,6 +781,9 @@ impl TurnOrchestrator<'_> {
                                 Ok(())
                             },
                             |chunk| {
+                                if cancellation.is_cancelled() {
+                                    return Ok(());
+                                }
                                 self.runtime.record_live_completion_chunk(
                                     &turn_session,
                                     &current_branch,
@@ -690,13 +805,16 @@ impl TurnOrchestrator<'_> {
                                 Ok(())
                             },
                             &mut tool_lifecycle,
+                            Some(cancellation.clone()),
                         )
                         .await
                     {
                         Ok(result) => result,
                         Err(error) => {
                             let latency_ms = started.elapsed().as_millis() as u64;
-                            self.runtime.record_turn_failure_transition(
+                            let finish = self
+                                .runtime
+                                .record_turn_failure_transition_with_outcome(
                                 turn_session.session_id,
                                 current_branch.branch_id,
                                 &connection.provider,
@@ -706,6 +824,22 @@ impl TurnOrchestrator<'_> {
                                 &error,
                                 latency_ms,
                             )?;
+                            if finish.cancelled {
+                                self.runtime.record_related_turn_outcome(
+                                    turn_session.session_id,
+                                    current_branch.branch_id,
+                                    turn_id,
+                                    TurnRunStopReason::Cancelled,
+                                )?;
+                                self.runtime.consume_post_turn_controls(
+                                    &turn_session,
+                                    &current_branch,
+                                )?;
+                                return Ok((
+                                    PostTurnControlAction::Stop,
+                                    TurnRunStopReason::Cancelled,
+                                ));
+                            }
                             self.runtime.record_related_turn_failure(
                                 turn_session.session_id,
                                 current_branch.branch_id,
@@ -723,7 +857,9 @@ impl TurnOrchestrator<'_> {
                         turn_id,
                         result,
                     )?;
-                    let budget_outcome = self.runtime.record_active_turn_finished(
+                    let finish_outcome = self
+                        .runtime
+                        .record_active_turn_finished_with_cancel_precedence(
                         turn_session.session_id,
                         current_branch.branch_id,
                         turn_id,
@@ -734,7 +870,20 @@ impl TurnOrchestrator<'_> {
                         latency_ms,
                     )?;
 
-                    if budget_outcome == BudgetEnforcementOutcome::Exhausted {
+                    if finish_outcome.cancelled {
+                        self.runtime.record_related_turn_outcome(
+                            turn_session.session_id,
+                            current_branch.branch_id,
+                            turn_id,
+                            TurnRunStopReason::Cancelled,
+                        )?;
+                        self.runtime.consume_post_turn_controls(
+                            &turn_session,
+                            &current_branch,
+                        )?;
+                        return Ok((PostTurnControlAction::Stop, TurnRunStopReason::Cancelled));
+                    }
+                    if finish_outcome.budget == BudgetEnforcementOutcome::Exhausted {
                         self.runtime.record_related_turn_outcome(
                             turn_session.session_id,
                             current_branch.branch_id,
@@ -771,12 +920,7 @@ impl TurnOrchestrator<'_> {
                         }
                         return Ok((PostTurnControlAction::Stop, stop_reason));
                     }
-                    let was_cancelled = self.runtime.is_cancelled(turn_session.session_id)?;
-                    let stop_reason = if was_cancelled {
-                        TurnRunStopReason::Cancelled
-                    } else {
-                        TurnRunStopReason::Complete
-                    };
+                    let stop_reason = TurnRunStopReason::Complete;
                     self.runtime.record_related_turn_outcome(
                         turn_session.session_id,
                         current_branch.branch_id,
@@ -832,6 +976,58 @@ impl TurnOrchestrator<'_> {
         }
         .instrument(session_span)
         .await
+    }
+}
+
+async fn wait_for_cancellation(signal: &bt_core::CancellationSignal) {
+    while !signal.is_cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+async fn collect_summarization_with_cancel_precedence<F>(
+    cancellation: &bt_core::CancellationSignal,
+    collection: F,
+) -> Option<Result<CollectedSummarization>>
+where
+    F: Future<Output = Result<CollectedSummarization>>,
+{
+    tokio::select! {
+        biased;
+        () = wait_for_cancellation(cancellation) => None,
+        collected = collection => {
+            if cancellation.is_cancelled() {
+                None
+            } else {
+                Some(collected)
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::{CollectedSummarization, collect_summarization_with_cancel_precedence};
+    use bt_core::CancellationSignal;
+
+    #[tokio::test]
+    async fn ready_cancellation_beats_a_ready_compaction_result() {
+        let cancellation = CancellationSignal::new();
+        cancellation.cancel();
+        let collected = CollectedSummarization {
+            chunks: Vec::new(),
+            summary_text: "must not be recorded".to_owned(),
+            usage: None,
+            latency_ms: 0,
+        };
+
+        let result = collect_summarization_with_cancel_precedence(
+            &cancellation,
+            std::future::ready(Ok(collected)),
+        )
+        .await;
+
+        assert!(result.is_none(), "canonical cancellation must win the tie");
     }
 }
 

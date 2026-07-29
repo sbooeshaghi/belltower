@@ -375,7 +375,7 @@ fn render_prompt(messages: &[Message]) -> String {
         for part in &message.parts {
             match part {
                 MessagePart::Text { text } if !text.trim().is_empty() => {
-                    prompt.push_str("\n");
+                    prompt.push('\n');
                     prompt.push_str(label);
                     prompt.push_str(": ");
                     prompt.push_str(text);

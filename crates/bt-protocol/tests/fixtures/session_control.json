@@ -86,18 +86,41 @@
     }
   },
   "update_session_request": {
+    "branch_id": "20000000-0000-0000-0000-000000000001",
     "connection_id": "local",
     "model_id": "qwen2.5-coder:7b",
     "tool_mode": "standard",
     "reset_model_to_default": false
   },
   "update_session_budget_request": {
+    "branch_id": "20000000-0000-0000-0000-000000000001",
     "budget": {
       "max_wall_clock_seconds": 300,
       "max_tokens": 120000,
       "max_turns": 12,
       "max_cost_usd": 8.5
     }
+  },
+  "cancel_session_request": {
+    "branch_id": "20000000-0000-0000-0000-000000000001",
+    "reason": "operator requested cancellation"
+  },
+  "steer_session_request": {
+    "branch_id": "20000000-0000-0000-0000-000000000001",
+    "message": "Focus on the event-log invariant."
+  },
+  "record_operator_command_request": {
+    "branch_id": "20000000-0000-0000-0000-000000000001",
+    "command_type": "slash_command",
+    "raw_input": "/status",
+    "output": "runtime ready",
+    "success": true
+  },
+  "run_shell_command_request": {
+    "branch_id": "20000000-0000-0000-0000-000000000001",
+    "raw_input": "!git status --short",
+    "command": "git status --short",
+    "timeout_seconds": 30
   },
   "send_message_request": {
     "branch_id": "20000000-0000-0000-0000-000000000001",

@@ -44,17 +44,21 @@ During coherence passes, treat these as the primary comparison surfaces:
 - session, branch, workflow, and raw-chunk inspection
 - atomic user ingress, active-turn ownership, and queued/control continuation
   admission
+- explicit branch identity for operator/control writes and owner-checked active
+  cancel/steer commits
 - immutable transaction-allocated settings revisions and budget-aware
-  executable-work claims
-- idle-boundary budget policy updates and session/branch-scoped admitted-turn
-  capabilities
+  executable-work claims, with explicit invocation-branch provenance for
+  session-scoped settings updates
+- idle-boundary session-scoped budget policy updates with explicit invocation-
+  branch provenance, and session/branch-scoped admitted-turn capabilities
 - monotonic owner-checked budget accounting, owner-checked live tool
   lifecycle transitions, and atomic terminal checkpoint/cancel/finish
   transitions
 - exact request-sequence claims for approval/input resume and atomic
   parent/child session-spawn lineage
 - atomic paired related-session messages, FIFO wake claims, mixed-model child
-  settings, and model-facing subagent tool adapters
+  settings, explicit message destination branches, exact reverse-edge replies,
+  and model-facing subagent tool adapters
 - telemetry and export behavior
 
 ## Expected Outcomes

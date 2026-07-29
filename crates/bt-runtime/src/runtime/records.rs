@@ -38,6 +38,52 @@ impl BelltowerRuntime {
         self.append_optional_active_turn_event(event, turn_id)
     }
 
+    /// Appends all non-tool result messages only if the exact turn still owns
+    /// the session and no canonical cancellation has won serialization.
+    /// Returns `true` when cancellation won and no messages were appended.
+    pub(crate) fn append_turn_result_messages_unless_cancelled(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        turn_id: TurnId,
+        messages: Vec<Message>,
+    ) -> Result<bool> {
+        let events = messages
+            .into_iter()
+            .map(|message| {
+                apply_turn_id(
+                    EventEnvelope::new(
+                        session_id,
+                        branch_id,
+                        SpanKind::Agent,
+                        EventPayload::MessageAppended { message },
+                    ),
+                    Some(turn_id),
+                )
+            })
+            .collect::<Vec<_>>();
+        if events.is_empty() {
+            return self.is_cancelled(session_id);
+        }
+        self.ensure_session_started_for(session_id, branch_id)?;
+        self.take_store_append_fault_for_test()?;
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
+        if store
+            .load_session_control(session_id)?
+            .is_some_and(|control| control.cancel_requested)
+        {
+            return Ok(true);
+        }
+        let seq_ids = store.commit_active_turn_events(session_id, branch_id, turn_id, &events)?;
+        for (event, seq_id) in events.into_iter().zip(seq_ids.iter().copied()) {
+            self.publish_committed_event(event, seq_id);
+        }
+        Ok(false)
+    }
+
     pub fn record_session_spawn_requested(
         &self,
         session_id: SessionId,

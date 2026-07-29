@@ -70,6 +70,7 @@ impl ChatApp {
             .record_operator_command(
                 self.session_id,
                 &RecordOperatorCommandRequest {
+                    branch_id: self.branch_id,
                     command_type: "slash_command".to_owned(),
                     raw_input: raw_input.to_owned(),
                     output,
@@ -117,6 +118,7 @@ impl ChatApp {
 
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.map(str::to_owned);
         let label = raw_input.map_or_else(|| "cancel".to_owned(), command_label);
         self.enqueue_pending_command(label, raw.clone(), async move {
@@ -124,6 +126,7 @@ impl ChatApp {
                 .cancel_session(
                     session_id,
                     &CancelSessionRequest {
+                        branch_id,
                         reason: Some("cancelled from bt-tui".to_owned()),
                     },
                 )
@@ -131,7 +134,8 @@ impl ChatApp {
                 .map_err(|error| error.to_string())?;
             let notice = "Cancellation requested for the current turn.".to_owned();
             if let Some(raw) = raw.as_deref() {
-                record_slash_command(&client, session_id, raw, notice.clone(), true).await?;
+                record_slash_command(&client, session_id, branch_id, raw, notice.clone(), true)
+                    .await?;
             }
             Ok(CommandOutcome::TurnCancelled { notice })
         });
@@ -149,16 +153,18 @@ impl ChatApp {
 
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.map(str::to_owned);
         let label = raw_input.map_or_else(|| "steer".to_owned(), command_label);
         self.enqueue_pending_command(label, raw.clone(), async move {
             client
-                .steer_session(session_id, &SteerSessionRequest { message })
+                .steer_session(session_id, &SteerSessionRequest { branch_id, message })
                 .await
                 .map_err(|error| error.to_string())?;
             let notice = "Steering the current turn.".to_owned();
             if let Some(raw) = raw.as_deref() {
-                record_slash_command(&client, session_id, raw, notice.clone(), true).await?;
+                record_slash_command(&client, session_id, branch_id, raw, notice.clone(), true)
+                    .await?;
             }
             Ok(CommandOutcome::Notice(notice))
         });
@@ -185,7 +191,9 @@ impl ChatApp {
 
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let request = UpdateSessionRequest {
+            branch_id,
             connection_id,
             model_id,
             tool_mode,
@@ -219,6 +227,7 @@ impl ChatApp {
 
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.map(str::to_owned);
         let label = raw_input.map_or_else(|| "defaults".to_owned(), command_label);
         self.enqueue_pending_command(label, raw.clone(), async move {
@@ -235,7 +244,8 @@ impl ChatApp {
                 connection_id, model
             );
             if let Some(raw) = raw.as_deref() {
-                record_slash_command(&client, session_id, raw, message.clone(), true).await?;
+                record_slash_command(&client, session_id, branch_id, raw, message.clone(), true)
+                    .await?;
             }
             Ok(CommandOutcome::Notice(message))
         });
@@ -267,6 +277,7 @@ impl ChatApp {
 
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.map(str::to_owned);
         let label = raw_input.map_or_else(|| "defaults".to_owned(), command_label);
         self.enqueue_pending_command(label, raw.clone(), async move {
@@ -278,7 +289,14 @@ impl ChatApp {
             match validate_default_model(&inventories, &connection_id, &model_id) {
                 Err(message) => {
                     if let Some(raw) = raw.as_deref() {
-                        record_slash_command(&client, session_id, raw, message.clone(), false)
+                        record_slash_command(
+                            &client,
+                            session_id,
+                            branch_id,
+                            raw,
+                            message.clone(),
+                            false,
+                        )
                             .await?;
                     }
                     Ok(CommandOutcome::InventoryMerged {
@@ -294,7 +312,14 @@ impl ChatApp {
                         model_id, connection_id
                     );
                     if let Some(raw) = raw.as_deref() {
-                        record_slash_command(&client, session_id, raw, message.clone(), true)
+                        record_slash_command(
+                            &client,
+                            session_id,
+                            branch_id,
+                            raw,
+                            message.clone(),
+                            true,
+                        )
                             .await?;
                     }
                     Ok(CommandOutcome::InventoryMerged {
@@ -323,6 +348,7 @@ impl ChatApp {
 
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         let raw = raw_input.map(str::to_owned);
         let label = raw_input.map_or_else(|| "defaults".to_owned(), command_label);
         self.enqueue_pending_command(label, raw.clone(), async move {
@@ -335,7 +361,14 @@ impl ChatApp {
                     validate_default_model(&fetched.connections, &connection_id, model_id)
                 {
                     if let Some(raw) = raw.as_deref() {
-                        record_slash_command(&client, session_id, raw, message.clone(), false)
+                        record_slash_command(
+                            &client,
+                            session_id,
+                            branch_id,
+                            raw,
+                            message.clone(),
+                            false,
+                        )
                             .await?;
                     }
                     return Ok(CommandOutcome::InventoryMerged {
@@ -365,7 +398,8 @@ impl ChatApp {
                 connection_id, model
             );
             if let Some(raw) = raw.as_deref() {
-                record_slash_command(&client, session_id, raw, message.clone(), true).await?;
+                record_slash_command(&client, session_id, branch_id, raw, message.clone(), true)
+                    .await?;
             }
             match inventories {
                 Some(connections) => Ok(CommandOutcome::InventoryMerged {
@@ -574,7 +608,8 @@ impl ChatApp {
                 short_id_string(&previous_branch.to_string())
             );
             if let Some(raw) = raw.as_deref() {
-                record_slash_command(&client, session_id, raw, notice.clone(), true).await?;
+                record_slash_command(&client, session_id, branch_id, raw, notice.clone(), true)
+                    .await?;
             }
             Ok(CommandOutcome::BranchCreated { branch_id, notice })
         });

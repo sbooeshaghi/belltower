@@ -6,17 +6,22 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-publish = true
+publish = false
 
 [dependencies]
 bt-core = { version = "0.1.0", path = "../bt-core" }
 camino.workspace = true
 ignore.workspace = true
-nix.workspace = true
+processkit.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The shell writes a temporary .cmd file so cmd.exe parses user syntax instead of
+# Rust's incompatible CommandLineToArgvW quoting. The file is removed on drop.
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -247,6 +247,7 @@ mod tests {
                 json!({"call_id": "call-1", "query": "trace"}),
                 ToolContext {
                     project_root: camino::Utf8PathBuf::from("."),
+                    cancellation: None,
                 },
             )
             .await

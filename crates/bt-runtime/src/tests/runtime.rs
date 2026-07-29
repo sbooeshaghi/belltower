@@ -4,17 +4,19 @@ use super::{
     UserMessageAdmission,
 };
 use crate::{TurnAdapterFuture, TurnExecutionAdapters, TurnRunRequest};
+use bt_core::traits::{BoxFuture, BoxStream, Provider};
 use bt_core::{
     ApprovalDecision, ApprovalDecisionSource, ApprovalRequest, ApprovalRequirement, ApprovalScope,
     BelltowerConfig, BelltowerError, BudgetConfig, CompletionRequest, CompletionSummary,
-    ConnectionDescriptor, ConnectionId, ContextCompactionPhase, ContextCompactionStatus,
-    ContextCompactionTrigger, ContextManifest, ContextMessageSourceRef, EventEnvelope,
-    EventPayload, FinishReason, InstructionDocument, Message, MessagePart, PlanItem, PlanStatus,
-    RelatedSessionDeliveryMode, RelatedSessionMessageDirection, RelatedSessionMessageKind,
-    RelatedSessionMessageStatus, Role, SessionRuntimeState, SessionToolMode, SpanKind, TokenUsage,
-    ToolCall, ToolCallId, ToolDisplayGroup, ToolExecutionMode, ToolInterruptBehavior, ToolMetadata,
-    ToolOperationContext, ToolOperationInitiator, ToolResultEnvelope, ToolRiskClass, TurnId,
-    TurnInstructionProvenance, TurnStartSource,
+    ConnectionDescriptor, ConnectionId, ConnectionStatus, ContextCompactionPhase,
+    ContextCompactionStatus, ContextCompactionTrigger, ContextManifest, ContextMessageSourceRef,
+    EventEnvelope, EventPayload, FinishReason, InstructionDocument, Message, MessagePart, PlanItem,
+    PlanStatus, RelatedSessionDeliveryMode, RelatedSessionMessageDirection,
+    RelatedSessionMessageKind, RelatedSessionMessageStatus, Role, SessionRuntimeState,
+    SessionToolMode, SpanKind, TokenUsage, ToolCall, ToolCallId, ToolDisplayGroup,
+    ToolExecutionMode, ToolInterruptBehavior, ToolMetadata, ToolOperationContext,
+    ToolOperationInitiator, ToolResultEnvelope, ToolRiskClass, TurnId, TurnInstructionProvenance,
+    TurnStartSource,
 };
 use bt_session::SqliteSessionStore;
 use bt_tools::BuiltInToolRegistry;
@@ -116,6 +118,63 @@ fn concurrent_runtime_commits_publish_in_canonical_sequence_order() {
 }
 
 struct FailingProviderPreflightAdapters;
+
+struct CancelThenErrorProvider {
+    runtime: Arc<BelltowerRuntime>,
+    session_id: bt_core::SessionId,
+    branch_id: bt_core::BranchId,
+}
+
+impl Provider for CancelThenErrorProvider {
+    fn provider_id(&self) -> &str {
+        "cancel-then-error"
+    }
+
+    fn validate(&self) -> BoxFuture<'_, bt_core::Result<ConnectionStatus>> {
+        Box::pin(async { Ok(ConnectionStatus::Healthy) })
+    }
+
+    fn stream_completion(
+        &self,
+        _request: CompletionRequest,
+    ) -> BoxFuture<'_, bt_core::Result<BoxStream<bt_core::Result<bt_core::CompletionChunk>>>> {
+        let runtime = Arc::clone(&self.runtime);
+        let session_id = self.session_id;
+        let branch_id = self.branch_id;
+        Box::pin(async move {
+            runtime.cancel_session(session_id, branch_id, "provider error race")?;
+            Err(BelltowerError::Provider(
+                "provider failed after canonical cancellation".to_owned(),
+            ))
+        })
+    }
+
+    fn pricing(&self, _model: &str) -> Option<bt_core::ModelPricing> {
+        None
+    }
+}
+
+struct CancelThenErrorAdapters {
+    provider: Arc<CancelThenErrorProvider>,
+}
+
+impl TurnExecutionAdapters for CancelThenErrorAdapters {
+    fn build_tool_registry<'a>(
+        &'a self,
+        _session: &'a bt_core::SessionRecord,
+        _branch_id: bt_core::BranchId,
+    ) -> TurnAdapterFuture<'a, BuiltInToolRegistry> {
+        Box::pin(async { Ok(BuiltInToolRegistry::default()) })
+    }
+
+    fn provider_for_connection<'a>(
+        &'a self,
+        _connection: &'a ConnectionDescriptor,
+    ) -> TurnAdapterFuture<'a, Arc<dyn Provider>> {
+        let provider: Arc<dyn Provider> = self.provider.clone();
+        Box::pin(async move { Ok(provider) })
+    }
+}
 
 impl TurnExecutionAdapters for FailingProviderPreflightAdapters {
     fn build_tool_registry<'a>(
@@ -253,6 +312,397 @@ fn runtime_creates_session_and_records_controls() {
         .expect("listed sessions after activity");
     assert_eq!(listed_sessions.len(), 1);
     assert_eq!(listed_sessions[0].session_id, session.session_id);
+}
+
+#[test]
+fn active_turn_controls_reject_cross_branch_attribution_before_append() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (session, root) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("branch-owned-controls".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    let child = runtime
+        .create_branch(session.session_id, root.branch_id, None, false, None)
+        .expect("child branch");
+    let turn_id = TurnId::new();
+    runtime
+        .record_turn_started(
+            session.session_id,
+            root.branch_id,
+            turn_id,
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            1,
+            session.settings_revision_id,
+            TurnStartSource::UserMessage,
+            None,
+        )
+        .expect("root turn started");
+    let event_count = runtime
+        .all_events(session.session_id)
+        .expect("events before rejected controls")
+        .len();
+
+    let steer_error = runtime
+        .steer_session(
+            session.session_id,
+            child.branch_id,
+            "misattributed steer".to_owned(),
+        )
+        .expect_err("child cannot steer root-owned active turn");
+    assert!(matches!(steer_error, BelltowerError::Protocol(_)));
+    let cancel_error = runtime
+        .cancel_session(
+            session.session_id,
+            child.branch_id,
+            "misattributed cancellation",
+        )
+        .expect_err("child cannot cancel root-owned active turn");
+    assert!(matches!(cancel_error, BelltowerError::Protocol(_)));
+    assert_eq!(
+        runtime
+            .all_events(session.session_id)
+            .expect("events after rejected controls")
+            .len(),
+        event_count,
+        "rejected controls must not enter the source-of-truth log"
+    );
+    assert_eq!(
+        runtime
+            .active_turn_claim(session.session_id)
+            .expect("active claim"),
+        Some((root.branch_id, turn_id))
+    );
+
+    runtime
+        .steer_session(
+            session.session_id,
+            root.branch_id,
+            "correctly attributed steer".to_owned(),
+        )
+        .expect("owner steer");
+    runtime
+        .cancel_session(session.session_id, root.branch_id, "owner cancellation")
+        .expect("owner cancellation");
+    let events = runtime
+        .all_events(session.session_id)
+        .expect("events after accepted controls");
+    assert!(events.iter().any(|event| {
+        event.branch_id == root.branch_id
+            && matches!(event.payload, EventPayload::SessionSteered { .. })
+    }));
+    assert!(events.iter().any(|event| {
+        event.branch_id == root.branch_id
+            && matches!(event.payload, EventPayload::SessionCancelled { .. })
+    }));
+}
+
+#[test]
+fn cancellation_race_never_appends_assistant_output_after_cancel_and_wins_terminal_status() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = Arc::new(BelltowerRuntime::open(config, file.path()).expect("runtime"));
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("cancel-race".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    let admitted = match runtime
+        .admit_user_message(
+            &session,
+            &branch,
+            Message::text(Role::User, "race cancellation"),
+        )
+        .expect("turn admission")
+    {
+        UserMessageAdmission::Started(admitted) => admitted,
+        UserMessageAdmission::Queued { .. } => panic!("idle session must start"),
+    };
+    let cancellation = runtime
+        .begin_active_turn_cancellation(session.session_id, branch.branch_id, admitted.turn_id())
+        .expect("register exact cancellation");
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+
+    let cancel_runtime = Arc::clone(&runtime);
+    let cancel_barrier = Arc::clone(&barrier);
+    let cancel_session = session.clone();
+    let cancel_branch = branch.clone();
+    let cancel_thread = thread::spawn(move || {
+        cancel_barrier.wait();
+        cancel_runtime
+            .cancel_session(
+                cancel_session.session_id,
+                cancel_branch.branch_id,
+                "race winner",
+            )
+            .expect("canonical cancel")
+    });
+    let append_runtime = Arc::clone(&runtime);
+    let append_barrier = Arc::clone(&barrier);
+    let append_session_id = session.session_id;
+    let append_branch_id = branch.branch_id;
+    let turn_id = admitted.turn_id();
+    let append_thread = thread::spawn(move || {
+        append_barrier.wait();
+        append_runtime
+            .append_turn_result_messages_unless_cancelled(
+                append_session_id,
+                append_branch_id,
+                turn_id,
+                vec![Message::text(Role::Assistant, "must not follow cancel")],
+            )
+            .expect("serialized result append")
+    });
+
+    let cancel_seq = cancel_thread.join().expect("cancel thread");
+    let cancellation_won_append = append_thread.join().expect("append thread");
+    assert!(cancellation.signal().is_cancelled());
+    let finish = runtime
+        .record_active_turn_finished_with_cancel_precedence(
+            session.session_id,
+            branch.branch_id,
+            admitted.turn_id(),
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            "completed".to_owned(),
+            Some("Stop".to_owned()),
+            1,
+        )
+        .expect("terminal commit");
+    assert!(finish.cancelled);
+
+    let events = runtime
+        .all_events(session.session_id)
+        .expect("canonical events");
+    let late_assistant = events.iter().any(|event| {
+        event.seq_id.is_some_and(|seq| seq > cancel_seq)
+            && matches!(
+                &event.payload,
+                EventPayload::MessageAppended { message }
+                    if message.role == Role::Assistant
+            )
+    });
+    assert!(
+        !late_assistant,
+        "assistant output cannot follow winning cancel"
+    );
+    if cancellation_won_append {
+        assert!(!events.iter().any(|event| matches!(
+            &event.payload,
+            EventPayload::MessageAppended { message }
+                if message.role == Role::Assistant
+                    && matches!(
+                        message.parts.as_slice(),
+                        [MessagePart::Text { text }] if text == "must not follow cancel"
+                    )
+        )));
+    }
+    let terminal = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            EventPayload::TurnFinished { status, .. } => Some(status.as_str()),
+            _ => None,
+        })
+        .expect("terminal turn event");
+    assert_eq!(terminal, "cancelled");
+}
+
+#[test]
+fn canonical_cancel_wins_before_tool_request_and_prevents_execution_admission() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("cancel-tool-request-race".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    let admitted = match runtime
+        .admit_user_message(
+            &session,
+            &branch,
+            Message::text(Role::User, "do not run the tool after cancellation"),
+        )
+        .expect("turn admission")
+    {
+        UserMessageAdmission::Started(admitted) => admitted,
+        UserMessageAdmission::Queued { .. } => panic!("idle session must start"),
+    };
+    let _cancellation = runtime
+        .begin_active_turn_cancellation(session.session_id, branch.branch_id, admitted.turn_id())
+        .expect("register cancellation");
+    runtime
+        .cancel_session(
+            session.session_id,
+            branch.branch_id,
+            "cancel before tool request",
+        )
+        .expect("canonical cancel");
+    let call_id = ToolCallId::new("call-cancel-request-race");
+    let recorded = runtime
+        .record_tool_request_transition(
+            session.session_id,
+            branch.branch_id,
+            admitted.turn_id(),
+            call_id.clone(),
+            "read".to_owned(),
+            json!({"path": "README.md"}),
+            ToolOperationContext::default(),
+            Message::from_part(
+                Role::Assistant,
+                MessagePart::ToolCall {
+                    call: ToolCall {
+                        tool_name: "read".to_owned(),
+                        call_id: call_id.to_string(),
+                        arguments: json!({"path": "README.md"}),
+                    },
+                },
+            ),
+        )
+        .expect("serialized request boundary");
+    assert!(!recorded, "cancelled work must not become a tool request");
+    let finish = runtime
+        .record_active_turn_finished_with_cancel_precedence(
+            session.session_id,
+            branch.branch_id,
+            admitted.turn_id(),
+            "openai-compatible".to_owned(),
+            "o4-mini".to_owned(),
+            "completed".to_owned(),
+            Some("ToolUse".to_owned()),
+            0,
+        )
+        .expect("cancelled terminal");
+    assert!(finish.cancelled);
+    runtime
+        .consume_post_turn_controls(&session, &branch)
+        .expect("consume cancellation");
+
+    let events = runtime
+        .all_events(session.session_id)
+        .expect("canonical events");
+    assert!(!events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::ToolCallRequested { call_id: recorded, .. } if *recorded == call_id
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::ToolExecutionFinished { call_id: recorded, .. } if *recorded == call_id
+    )));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                &event.payload,
+                EventPayload::TurnFinished { status, .. } if status == "cancelled"
+            ))
+            .count(),
+        1
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::SessionCancelCleared { .. }))
+    );
+}
+
+#[tokio::test]
+async fn canonical_cancel_wins_a_provider_error_race_and_clears_control_state() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = Arc::new(BelltowerRuntime::open(config, file.path()).expect("runtime"));
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("cancel-provider-error-race".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    let admitted = match runtime
+        .admit_user_message(
+            &session,
+            &branch,
+            Message::text(Role::User, "cancel as the provider errors"),
+        )
+        .expect("turn admission")
+    {
+        UserMessageAdmission::Started(admitted) => admitted,
+        UserMessageAdmission::Queued { .. } => panic!("idle session must start"),
+    };
+    let adapters = CancelThenErrorAdapters {
+        provider: Arc::new(CancelThenErrorProvider {
+            runtime: Arc::clone(&runtime),
+            session_id: session.session_id,
+            branch_id: branch.branch_id,
+        }),
+    };
+
+    let outcome = runtime
+        .turn_orchestrator()
+        .run_session_turns(
+            &adapters,
+            TurnRunRequest::new(session.clone(), branch.clone(), admitted).expect("turn request"),
+        )
+        .await
+        .expect("canonical cancellation wins provider error");
+    assert_eq!(outcome.stop_reason, crate::TurnRunStopReason::Cancelled);
+
+    let events = runtime
+        .all_events(session.session_id)
+        .expect("canonical events");
+    let cancel_seq = events
+        .iter()
+        .find(|event| matches!(event.payload, EventPayload::SessionCancelled { .. }))
+        .and_then(|event| event.seq_id)
+        .expect("session cancellation");
+    let terminals = events
+        .iter()
+        .filter(|event| matches!(event.payload, EventPayload::TurnFinished { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1);
+    assert!(terminals[0].seq_id.is_some_and(|seq| seq > cancel_seq));
+    assert!(matches!(
+        &terminals[0].payload,
+        EventPayload::TurnFinished { status, .. } if status == "cancelled"
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::SessionError { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::SessionCancelCleared { .. }))
+    );
+    assert!(
+        !runtime
+            .inspect_queue(session.session_id)
+            .expect("queue inspection")
+            .expect("session queue")
+            .cancel_requested
+    );
 }
 
 #[test]
@@ -783,7 +1233,7 @@ fn runtime_round_trips_raw_chunks() {
     let file = NamedTempFile::new().expect("tempfile");
     let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
 
-    let (session, _branch) = runtime
+    let (session, branch) = runtime
         .create_session(
             "/tmp/project".into(),
             ConnectionId::new("local"),
@@ -797,7 +1247,7 @@ fn runtime_round_trips_raw_chunks() {
     let chunk_id = runtime
         .append_raw_chunk(
             session.session_id,
-            _branch.branch_id,
+            branch.branch_id,
             None,
             "openai-compatible",
             "completion",
@@ -811,7 +1261,7 @@ fn runtime_round_trips_raw_chunks() {
         .raw_chunks(session.session_id, 10)
         .expect("raw chunks");
     assert_eq!(chunks.len(), 1);
-    assert_eq!(chunks[0].branch_id, Some(_branch.branch_id));
+    assert_eq!(chunks[0].branch_id, Some(branch.branch_id));
     assert_eq!(chunks[0].provider, "openai-compatible");
     assert_eq!(chunks[0].stream_name, "completion");
     assert_eq!(chunks[0].content, b"{\"delta\":\"hello\"}");
@@ -1137,7 +1587,7 @@ fn runtime_updates_session_connection_and_model() {
     let file = NamedTempFile::new().expect("tempfile");
     let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
 
-    let (session, _branch) = runtime
+    let (session, branch) = runtime
         .create_session(
             "/tmp/project".into(),
             ConnectionId::new("local"),
@@ -1151,6 +1601,7 @@ fn runtime_updates_session_connection_and_model() {
     let updated = runtime
         .update_session_settings(
             session.session_id,
+            branch.branch_id,
             Some(ConnectionId::new("openai")),
             Some(Some("o4-mini".to_owned())),
             None,
@@ -1160,7 +1611,7 @@ fn runtime_updates_session_connection_and_model() {
     assert_eq!(updated.model_id.as_deref(), Some("o4-mini"));
 
     let reset = runtime
-        .update_session_settings(session.session_id, None, Some(None), None)
+        .update_session_settings(session.session_id, branch.branch_id, None, Some(None), None)
         .expect("reset model");
     assert_eq!(reset.connection_id, ConnectionId::new("openai"));
     assert_eq!(reset.model_id, None);
@@ -1172,7 +1623,7 @@ fn runtime_rejects_unconfigured_connection_before_settings_update() {
     let file = NamedTempFile::new().expect("tempfile");
     let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
 
-    let (session, _branch) = runtime
+    let (session, branch) = runtime
         .create_session(
             "/tmp/project".into(),
             ConnectionId::new("local"),
@@ -1186,6 +1637,7 @@ fn runtime_rejects_unconfigured_connection_before_settings_update() {
     let error = runtime
         .update_session_settings(
             session.session_id,
+            branch.branch_id,
             Some(ConnectionId::new("missing")),
             Some(Some("ghost-model".to_owned())),
             None,
@@ -1222,8 +1674,9 @@ fn compact_branch_context_is_runtime_owned_and_records_event() {
             None,
         )
         .expect("session creation");
+    let first_context = "first task context ".repeat(1_000);
     runtime
-        .append_message(&session, &branch, Role::User, "first task context")
+        .append_message(&session, &branch, Role::User, &first_context)
         .expect("first message");
     runtime
         .append_message(&session, &branch, Role::Assistant, "acknowledged")
@@ -1299,6 +1752,47 @@ fn compact_branch_context_is_runtime_owned_and_records_event() {
         }
         _ => unreachable!("matched context compacted event"),
     }
+}
+
+#[test]
+fn compact_branch_context_does_not_record_an_ineffective_compaction() {
+    let config = BelltowerConfig::from_embedded().expect("config");
+    let file = NamedTempFile::new().expect("tempfile");
+    let runtime = BelltowerRuntime::open(config, file.path()).expect("runtime");
+
+    let (session, branch) = runtime
+        .create_session(
+            "/tmp/project".into(),
+            ConnectionId::new("openai"),
+            Some("o4-mini".to_owned()),
+            SessionToolMode::Extended,
+            Some("compact-noop".to_owned()),
+            None,
+        )
+        .expect("session creation");
+    runtime
+        .append_message(&session, &branch, Role::User, "first task context")
+        .expect("first message");
+    runtime
+        .append_message(&session, &branch, Role::Assistant, "acknowledged")
+        .expect("assistant message");
+    runtime
+        .append_message(&session, &branch, Role::User, "latest request")
+        .expect("latest message");
+
+    let prepared = runtime
+        .compact_branch_context(&session, &branch, None, Vec::new(), None)
+        .expect("compact branch context");
+
+    assert!(prepared.compaction.is_none());
+    let events = runtime
+        .all_events(session.session_id)
+        .expect("events after no-op");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.payload, EventPayload::ContextCompacted { .. }))
+    );
 }
 
 #[tokio::test]
@@ -1862,6 +2356,7 @@ fn queued_follow_up_keeps_enqueued_settings_revision_after_later_change() {
     let updated = runtime
         .update_session_settings(
             session.session_id,
+            branch.branch_id,
             Some(ConnectionId::new("local")),
             None,
             None,
@@ -2057,6 +2552,7 @@ fn resumed_approval_turn_keeps_paused_settings_revision_after_later_change() {
     let updated = runtime
         .update_session_settings(
             session.session_id,
+            branch.branch_id,
             Some(ConnectionId::new("local")),
             None,
             None,
@@ -4196,6 +4692,54 @@ fn related_session_wake_uses_child_settings_and_enters_model_context() {
         })
     }));
 
+    let alternate_parent_branch = runtime
+        .create_branch(
+            parent.session_id,
+            parent_branch.branch_id,
+            None,
+            true,
+            Some("later parent default".to_owned()),
+        )
+        .expect("activate a later parent default");
+    let parent_event_count = runtime
+        .all_events(parent.session_id)
+        .expect("parent events before conflicting reply")
+        .len();
+    let child_event_count = runtime
+        .all_events(child.session_id)
+        .expect("child events before conflicting reply")
+        .len();
+    let error = runtime
+        .send_related_session_message(
+            child.session_id,
+            child_branch.branch_id,
+            Some(admitted.turn_id()),
+            parent.session_id,
+            alternate_parent_branch.branch_id,
+            RelatedSessionMessageKind::Progress,
+            RelatedSessionDeliveryMode::Notify,
+            Some(receipt.message_id),
+            "Do not redirect this reply to the later default.".to_owned(),
+            Vec::new(),
+        )
+        .expect_err("reply target must retain the original branch edge");
+    assert!(matches!(error, BelltowerError::Protocol(_)));
+    assert!(error.to_string().contains("target_branch_id conflicts"));
+    assert_eq!(
+        runtime
+            .all_events(parent.session_id)
+            .expect("parent events after conflicting reply")
+            .len(),
+        parent_event_count
+    );
+    assert_eq!(
+        runtime
+            .all_events(child.session_id)
+            .expect("child events after conflicting reply")
+            .len(),
+        child_event_count
+    );
+
     runtime
         .send_related_session_message(
             child.session_id,
@@ -5556,6 +6100,7 @@ fn model_downshift_triggers_pre_turn_compaction_under_new_window() {
     let updated = runtime
         .update_session_settings(
             session.session_id,
+            branch.branch_id,
             None,
             Some(Some("qwen3:latest".to_owned())),
             None,

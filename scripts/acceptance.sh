@@ -62,6 +62,7 @@ run_exact bt-server tests::control_persistence_survives_restart_via_protocol_pat
 # Scope: built-in tool execution, approval pause/resume, operator-command durability.
 # Not covered: arbitrary third-party tool policies.
 run_exact bt-server tests::approval_round_trip_executes_tool_and_continues_turn
+run_exact bt-server tests::operator_commands_are_recorded_in_session_events
 run_exact bt-server tests::operator_shell_commands_record_tool_and_command_events
 run_exact bt-server tests::inspection_contract_min_reconstructs_canonical_session_truth
 
@@ -74,12 +75,16 @@ run_exact bt-server tests::event_stream_recovers_from_broadcast_lag_by_replaying
 # Scope: branch continuity and child-session lineage surfaces.
 # Not covered: large branch trees or collaborative multi-user editing.
 run_exact bt-server tests::branch_create_and_activate_preserve_handoff_context
+run_exact bt-server tests::settings_and_budget_updates_preserve_explicit_branch_provenance_across_restart
 run_exact bt-server tests::spawn_route_creates_child_session_with_lineage_and_events
 run_exact bt-server tests::workflow_route_reports_parent_child_runtime_state
+run_exact bt-server agent_tools::branch_tests::agent_reply_retains_the_original_branch_edge_after_default_changes
+run_exact bt-session store::tests::related_session_reply_must_reverse_the_exact_branch_edge_atomically
 
 # Scope: runtime-owned compaction route smoke.
 # Not covered: semantic quality of compressed context in a live model turn.
 run_exact bt-server tests::compact_route_runs_runtime_owned_compaction
+run_exact bt-server tests::compact_route_returns_truthful_noop_without_compaction_event
 
 # Scope: MCP inventory/reload/degraded behavior and MCP-as-tool inspection parity.
 # Not covered: arbitrary external MCP servers or transport-specific stress tests.

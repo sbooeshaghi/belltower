@@ -202,17 +202,24 @@ pub fn openapi_schema_components() -> OpenApiSchemaMap {
         "UpdateSessionRequest".to_owned(),
         object_schema(
             [
+                ("branch_id", string_schema()),
                 ("connection_id", nullable(string_schema())),
                 ("model_id", nullable(string_schema())),
                 ("tool_mode", nullable(ref_schema("SessionToolMode"))),
                 ("reset_model_to_default", boolean_schema()),
             ],
-            ["reset_model_to_default"],
+            ["branch_id", "reset_model_to_default"],
         ),
     );
     schemas.insert(
         "UpdateSessionBudgetRequest".to_owned(),
-        object_schema([("budget", ref_schema("BudgetConfig"))], ["budget"]),
+        object_schema(
+            [
+                ("branch_id", string_schema()),
+                ("budget", ref_schema("BudgetConfig")),
+            ],
+            ["branch_id", "budget"],
+        ),
     );
     schemas.insert(
         "SendMessageRequest".to_owned(),
@@ -362,33 +369,50 @@ pub fn openapi_schema_components() -> OpenApiSchemaMap {
     );
     schemas.insert(
         "CancelSessionRequest".to_owned(),
-        object_schema([("reason", nullable(string_schema()))], []),
+        object_schema(
+            [
+                ("branch_id", string_schema()),
+                ("reason", nullable(string_schema())),
+            ],
+            ["branch_id"],
+        ),
     );
     schemas.insert(
         "SteerSessionRequest".to_owned(),
-        object_schema([("message", string_schema())], ["message"]),
+        object_schema(
+            [("branch_id", string_schema()), ("message", string_schema())],
+            ["branch_id", "message"],
+        ),
     );
     schemas.insert(
         "RecordOperatorCommandRequest".to_owned(),
         object_schema(
             [
+                ("branch_id", string_schema()),
                 ("command_type", string_schema()),
                 ("raw_input", string_schema()),
                 ("output", string_schema()),
                 ("success", boolean_schema()),
             ],
-            ["command_type", "raw_input", "output", "success"],
+            [
+                "branch_id",
+                "command_type",
+                "raw_input",
+                "output",
+                "success",
+            ],
         ),
     );
     schemas.insert(
         "RunShellCommandRequest".to_owned(),
         object_schema(
             [
+                ("branch_id", string_schema()),
                 ("raw_input", string_schema()),
                 ("command", string_schema()),
                 ("timeout_seconds", nullable(integer_schema())),
             ],
-            ["raw_input", "command"],
+            ["branch_id", "raw_input", "command"],
         ),
     );
     schemas.insert(

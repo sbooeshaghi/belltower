@@ -13,7 +13,7 @@ is_overridden() {
 
 while IFS= read -r file; do
   rel="${file#"$root"/}"
-  if [[ "$rel" == */src/tests.rs ]]; then
+  if [[ "$rel" == */tests.rs ]]; then
     continue
   fi
   lines="$(wc -l < "$file" | tr -d '[:space:]')"

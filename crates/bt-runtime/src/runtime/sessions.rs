@@ -117,6 +117,32 @@ impl BelltowerRuntime {
         finish_reason: Option<String>,
         latency_ms: u64,
     ) -> Result<BudgetEnforcementOutcome> {
+        Ok(self
+            .record_active_turn_finished_with_cancel_precedence(
+                session_id,
+                branch_id,
+                turn_id,
+                provider,
+                model,
+                status,
+                finish_reason,
+                latency_ms,
+            )?
+            .budget)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_active_turn_finished_with_cancel_precedence(
+        &self,
+        session_id: SessionId,
+        branch_id: bt_core::BranchId,
+        turn_id: TurnId,
+        provider: String,
+        model: String,
+        status: String,
+        finish_reason: Option<String>,
+        latency_ms: u64,
+    ) -> Result<ActiveTurnFinishOutcome> {
         self.commit_active_turn_terminal_events(
             session_id,
             branch_id,
@@ -174,7 +200,7 @@ impl BelltowerRuntime {
         turn_id: TurnId,
         terminal_at: time::OffsetDateTime,
         terminal_events: Vec<EventEnvelope>,
-    ) -> Result<BudgetEnforcementOutcome> {
+    ) -> Result<ActiveTurnFinishOutcome> {
         let Some((checkpoint, cancellation)) = self.budget_checkpoint_transition_at(
             session_id,
             branch_id,
@@ -187,6 +213,8 @@ impl BelltowerRuntime {
             let mut store = self.store.lock().map_err(|_| {
                 bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned())
             })?;
+            let mut terminal_events = terminal_events;
+            let cancelled = apply_cancel_precedence(&store, session_id, &mut terminal_events)?;
             let seq_ids = store.commit_turn_terminal_transition(
                 session_id,
                 branch_id,
@@ -197,13 +225,18 @@ impl BelltowerRuntime {
                 self.publish_committed_event(event, seq_id);
             }
             drop(store);
-            return Ok(BudgetEnforcementOutcome::NotConfigured);
+            return Ok(ActiveTurnFinishOutcome {
+                budget: BudgetEnforcementOutcome::NotConfigured,
+                cancelled,
+            });
         };
         self.take_store_append_fault_for_test()?;
         let mut store = self
             .store
             .lock()
             .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
+        let mut terminal_events = terminal_events;
+        let cancelled = apply_cancel_precedence(&store, session_id, &mut terminal_events)?;
         let committed = store.commit_budget_terminal_transition(
             &checkpoint,
             &cancellation,
@@ -222,9 +255,15 @@ impl BelltowerRuntime {
         drop(store);
 
         if committed.exhausted {
-            Ok(BudgetEnforcementOutcome::Exhausted)
+            Ok(ActiveTurnFinishOutcome {
+                budget: BudgetEnforcementOutcome::Exhausted,
+                cancelled,
+            })
         } else {
-            Ok(BudgetEnforcementOutcome::WithinBudget)
+            Ok(ActiveTurnFinishOutcome {
+                budget: BudgetEnforcementOutcome::WithinBudget,
+                cancelled,
+            })
         }
     }
 
@@ -540,13 +579,11 @@ impl BelltowerRuntime {
     pub fn update_session_settings(
         &self,
         session_id: SessionId,
+        branch_id: bt_core::BranchId,
         connection_id: Option<ConnectionId>,
         model_id: Option<Option<String>>,
         tool_mode: Option<SessionToolMode>,
     ) -> Result<SessionRecord> {
-        let branch = self.default_branch(session_id)?.ok_or_else(|| {
-            bt_core::BelltowerError::InvalidState("default branch not found".to_owned())
-        })?;
         let target_connection_id = match connection_id.as_ref() {
             Some(connection_id) => connection_id.clone(),
             None => {
@@ -558,7 +595,7 @@ impl BelltowerRuntime {
             }
         };
         self.ensure_connection_configured(&target_connection_id)?;
-        self.ensure_session_started_for(session_id, branch.branch_id)?;
+        self.ensure_session_started_for(session_id, branch_id)?;
         self.take_store_append_fault_for_test()?;
         let mut store = self
             .store
@@ -566,7 +603,7 @@ impl BelltowerRuntime {
             .map_err(|_| bt_core::BelltowerError::InvalidState("store lock poisoned".to_owned()))?;
         let committed = store.commit_session_settings_update(
             session_id,
-            branch.branch_id,
+            branch_id,
             connection_id,
             model_id,
             tool_mode,
@@ -726,4 +763,39 @@ impl BelltowerRuntime {
         );
         self.append_event(event)
     }
+}
+
+fn apply_cancel_precedence(
+    store: &SqliteSessionStore,
+    session_id: SessionId,
+    terminal_events: &mut [EventEnvelope],
+) -> Result<bool> {
+    let cancelled = store
+        .load_session_control(session_id)?
+        .is_some_and(|control| control.cancel_requested);
+    if !cancelled {
+        return Ok(false);
+    }
+    let Some(finish) = terminal_events.last_mut() else {
+        return Ok(false);
+    };
+    let EventPayload::TurnFinished {
+        status,
+        finish_reason,
+        ..
+    } = &mut finish.payload
+    else {
+        return Ok(false);
+    };
+    *status = "cancelled".to_owned();
+    *finish_reason = Some("Cancelled".to_owned());
+    finish.attributes.insert(
+        "turn.status".to_owned(),
+        serde_json::Value::String("cancelled".to_owned()),
+    );
+    finish.attributes.insert(
+        "turn.finish_reason".to_owned(),
+        serde_json::Value::String("Cancelled".to_owned()),
+    );
+    Ok(true)
 }

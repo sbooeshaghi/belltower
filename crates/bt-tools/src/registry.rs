@@ -41,7 +41,7 @@ impl BuiltInToolRegistry {
         registry.register(EditTool);
         registry.register(ListTool);
         registry.register(SearchTool);
-        registry.register(ShellTool);
+        registry.register(ShellTool::new(config.approval.shell_timeout_seconds));
         if mode.is_extended() {
             registry.register(WebSearchTool::new_with_credentials(
                 config.web.clone(),

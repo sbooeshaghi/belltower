@@ -111,16 +111,24 @@ pub(crate) fn resolve_binary(name: &str, fresh_helpers: bool) -> Option<PathBuf>
     if let Some(path) = sibling_binary(name) {
         return Some(path);
     }
-    if command_in_path(name) {
-        return Some(PathBuf::from(name));
+    if let Some(path) = binary_in_path(name) {
+        return Some(path);
     }
     None
+}
+
+fn binary_filename(name: &str) -> String {
+    binary_filename_for_suffix(name, std::env::consts::EXE_SUFFIX)
+}
+
+pub(crate) fn binary_filename_for_suffix(name: &str, suffix: &str) -> String {
+    format!("{name}{suffix}")
 }
 
 fn sibling_binary(name: &str) -> Option<PathBuf> {
     let current = std::env::current_exe().ok()?;
     let dir = current.parent()?;
-    let candidate = dir.join(name);
+    let candidate = dir.join(binary_filename(name));
     if candidate.exists() {
         Some(candidate)
     } else {
@@ -274,12 +282,12 @@ fn latest_path_edit(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
 
-fn command_in_path(name: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| {
-            let candidate = dir.join(name);
-            candidate.exists()
-        })
+fn binary_in_path(name: &str) -> Option<PathBuf> {
+    let filename = binary_filename(name);
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(&filename))
+            .find(|candidate| candidate.exists())
     })
 }
 
@@ -521,7 +529,7 @@ pub(crate) fn binary_resolution_message(target: BinaryTarget) -> String {
     if sibling_binary(name).is_some() {
         return "resolved next to the launcher binary".to_owned();
     }
-    if command_in_path(name) {
+    if binary_in_path(name).is_some() {
         return "resolved from PATH".to_owned();
     }
     if workspace_root().is_some() {

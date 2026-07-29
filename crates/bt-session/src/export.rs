@@ -2331,13 +2331,13 @@ fn validate_event_records(
         }
         let content_refs = record.event.payload.raw_chunk_content_refs();
         for content_ref in &content_refs {
-            if !manifest_content_hashes.contains(&content_ref) {
+            if !manifest_content_hashes.contains(content_ref) {
                 return Err(invalid_bundle(format!(
                     "event {} references raw chunk content {} missing from manifest contents",
                     record.bundle_event_ordinal, content_ref
                 )));
             }
-            if !raw_chunk_content_hashes.contains(&content_ref) {
+            if !raw_chunk_content_hashes.contains(content_ref) {
                 return Err(invalid_bundle(format!(
                     "event {} references raw chunk content {} missing from raw_chunk_refs",
                     record.bundle_event_ordinal, content_ref

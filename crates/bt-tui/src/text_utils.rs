@@ -361,6 +361,45 @@ fn wrap_logical_line(
     }
 }
 
+pub(crate) fn next_stream_retry_delay(attempt: u8) -> Duration {
+    match attempt {
+        0 => Duration::from_secs(1),
+        1 => Duration::from_secs(2),
+        2 => Duration::from_secs(4),
+        _ => EVENT_STREAM_RETRY_MAX_DELAY,
+    }
+}
+
+pub(crate) fn short_id_string(raw: &str) -> String {
+    raw.chars().take(8).collect()
+}
+
+pub(crate) fn parse_tool_mode(raw: &str) -> Result<SessionToolMode, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "standard" => Ok(SessionToolMode::Standard),
+        "extended" => Ok(SessionToolMode::Extended),
+        _ => Err("unknown tool mode".to_owned()),
+    }
+}
+
+pub(crate) fn render_tool_mode(mode: SessionToolMode) -> &'static str {
+    match mode {
+        SessionToolMode::Standard => "standard",
+        SessionToolMode::Extended => "extended",
+    }
+}
+
+pub(crate) fn truncate_detail(raw: &str) -> String {
+    let limit = 28usize;
+    let mut chars = raw.chars();
+    let truncated = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,44 +448,5 @@ mod tests {
         assert_eq!(wrap_composer_input("hello ", 80), vec!["hello ".to_owned()]);
         assert_eq!(wrapped_composer_cursor_position("hello ", 6, 80), (6, 0));
         assert_eq!(wrapped_composer_cursor_position("hello  ", 7, 80), (7, 0));
-    }
-}
-
-pub(crate) fn next_stream_retry_delay(attempt: u8) -> Duration {
-    match attempt {
-        0 => Duration::from_secs(1),
-        1 => Duration::from_secs(2),
-        2 => Duration::from_secs(4),
-        _ => EVENT_STREAM_RETRY_MAX_DELAY,
-    }
-}
-
-pub(crate) fn short_id_string(raw: &str) -> String {
-    raw.chars().take(8).collect()
-}
-
-pub(crate) fn parse_tool_mode(raw: &str) -> Result<SessionToolMode, String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "standard" => Ok(SessionToolMode::Standard),
-        "extended" => Ok(SessionToolMode::Extended),
-        _ => Err("unknown tool mode".to_owned()),
-    }
-}
-
-pub(crate) fn render_tool_mode(mode: SessionToolMode) -> &'static str {
-    match mode {
-        SessionToolMode::Standard => "standard",
-        SessionToolMode::Extended => "extended",
-    }
-}
-
-pub(crate) fn truncate_detail(raw: &str) -> String {
-    let limit = 28usize;
-    let mut chars = raw.chars();
-    let truncated = chars.by_ref().take(limit).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        truncated
     }
 }

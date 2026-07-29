@@ -83,11 +83,16 @@ Planned:
 
 ## Install
 
-- Cargo: `cargo install bt-server bt-tui belltower`
+- Cargo from a source checkout: `cargo install --path crates/bt-server && cargo install --path crates/bt-tui && cargo install --path crates/belltower`
 - Release archive: download the matching `belltower-<version>-<target>` archive
   from GitHub Releases and keep `belltower`, `bt-server`, and `bt-tui` in the
   same directory on your `PATH`.
 - Source checkout: `cargo run -p belltower --`
+
+Version 0.1 deliberately does not publish workspace crates to crates.io.
+The supported distribution paths are GitHub release archives and a source
+checkout; the workspace crates are implementation details, not a public Rust
+crate API.
 
 See [`docs/install.md`](./docs/install.md) for platform notes and verification
 steps.
@@ -122,4 +127,4 @@ Workspace conventions:
 
 ## License
 
-MIT
+[MIT](./LICENSE)

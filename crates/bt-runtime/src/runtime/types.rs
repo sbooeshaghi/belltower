@@ -102,6 +102,12 @@ pub enum UserMessageAdmission {
     Queued { position: usize },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActiveTurnFinishOutcome {
+    pub budget: BudgetEnforcementOutcome,
+    pub cancelled: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueuedDispatch {
     pub branch_id: bt_core::BranchId,

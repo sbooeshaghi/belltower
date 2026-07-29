@@ -106,9 +106,10 @@ This stays feature-gated and outside the initial compatibility promise:
 - trainer- and RL-specific integrations on top of canonical trajectory datasets
 
 Belltower now has bounded child-session execution with explicit lineage,
-per-child provider/model settings, and typed durable parent-child messages.
+per-child provider/model settings, and typed durable same-lineage messages.
 Autonomous model-facing spawn is approval-gated; manual spawn remains an
-explicit authenticated operator action that does not start child execution.
+explicit authenticated operator action. Its default wake delivery starts the
+child immediately, while `dispatch: false` explicitly prepares an idle child.
 This is not a general workflow scheduler. Delegated coding at scale still
 requires isolated worktrees, and broader recursion or role policy must land in
 a separate composition layer only when real workloads justify it.
@@ -309,14 +310,15 @@ The following requirements are the implementation target.
   - explicit parent session, branch, and turn origin
   - their own queue, approvals, cancel, and steer state
   - their own canonical session log and their own turn-scoped exported traces
-- Parent-child messages must use typed durable mailbox events with explicit
+- Same-lineage messages must use typed durable mailbox events with explicit
   delivery and resolution state, not transcript reconstruction or hidden
   process-local state.
 - Until isolated worktrees land, shared-project-root execution must be explicit
   and described truthfully. Model-facing autonomous spawn must be
-  approval-gated; manual spawn is an authenticated operator action that creates
-  but does not execute a child. Delegated coding at scale should use isolated
-  worktrees by default.
+  approval-gated; manual spawn is an authenticated operator action whose
+  default wake delivery dispatches immediately. The protocol's `dispatch:
+  false` mode intentionally creates an idle child. Delegated coding at scale
+  should use isolated worktrees by default.
 - Higher-order scheduling, role systems, and recursive delegation policy are
   outside the per-session runtime contract.
 

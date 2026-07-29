@@ -63,8 +63,9 @@ use crate::operator_routes::{
 };
 use crate::session_tools::try_build_ask_response;
 use crate::tool_execution::{
-    ServerTurnAdapters, build_tool_registry, execute_tool_call, format_shell_command_output,
-    resolve_tool_after_approval, session_scope_span, tool_execution_error_result,
+    ServerTurnAdapters, build_tool_registry, cancelled_tool_result, execute_tool_call,
+    format_shell_command_output, resolve_tool_after_approval, session_scope_span,
+    tool_execution_error_result,
 };
 
 const DEFAULT_TRANSCRIPT_PAGE_LIMIT: usize = 200;
@@ -285,18 +286,48 @@ fn build_app(state: AppState) -> Router {
         .with_state(state)
 }
 
+#[cfg(unix)]
+fn write_auth_token(path: impl AsRef<std::path::Path>, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("auth-token");
+    let temporary = parent.join(format!(".{filename}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        if let Ok(directory) = fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(not(unix))]
 fn write_auth_token(path: impl AsRef<std::path::Path>, token: &str) -> std::io::Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, token)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    fs::write(path, token)
 }
 
 fn not_found_error(resource: &str) -> bt_core::BelltowerError {
@@ -320,15 +351,6 @@ fn require_branch(
         .runtime
         .load_branch(session_id, branch_id)?
         .ok_or_else(|| not_found_error(label).into())
-}
-
-fn require_default_branch(
-    state: &AppState,
-    session_id: SessionId,
-) -> Result<BranchRecord, ApiError> {
-    state.runtime.default_branch(session_id)?.ok_or_else(|| {
-        bt_core::BelltowerError::InvalidState("default branch not found".to_owned()).into()
-    })
 }
 
 async fn create_session(
@@ -400,8 +422,10 @@ async fn update_session(
     ApiJson(request): ApiJson<UpdateSessionRequest>,
 ) -> Result<Json<CreateSessionResponse>, ApiError> {
     let _ = require_session(&state, session_id)?;
+    let _ = require_branch(&state, session_id, request.branch_id, "branch")?;
     let session = state.runtime.update_session_settings(
         session_id,
+        request.branch_id,
         request.connection_id,
         if request.reset_model_to_default {
             Some(None)
@@ -410,7 +434,7 @@ async fn update_session(
         },
         request.tool_mode,
     )?;
-    let branch = require_default_branch(&state, session_id)?;
+    let branch = require_branch(&state, session_id, request.branch_id, "branch")?;
     Ok(Json(CreateSessionResponse { session, branch }))
 }
 
@@ -420,10 +444,10 @@ async fn update_session_budget(
     ApiJson(request): ApiJson<UpdateSessionBudgetRequest>,
 ) -> Result<Json<SessionInspectionResponse>, ApiError> {
     let _ = require_session(&state, session_id)?;
-    let branch = require_default_branch(&state, session_id)?;
+    let _ = require_branch(&state, session_id, request.branch_id, "branch")?;
     state
         .runtime
-        .configure_session_budget(session_id, branch.branch_id, request.budget)?;
+        .configure_session_budget(session_id, request.branch_id, request.budget)?;
     let inspection = state
         .runtime
         .inspect_session(session_id)?
@@ -678,94 +702,16 @@ async fn approve_tool(
             turn_session.session_id,
             branch.branch_id,
             resumed.turn_id(),
-            async move {
-                let state = work_state;
-                let started = Instant::now();
-                let tool_result = match resolve_tool_after_approval(
-                    &state,
-                    &turn_session,
-                    branch.branch_id,
-                    Some(resumed.turn_id()),
-                    &resumable.tool_call,
-                    decision,
-                )
-                .await
-                {
-                    Ok(tool_result) => tool_result,
-                    Err(error) => {
-                        let latency_ms = started.elapsed().as_millis() as u64;
-                        state.runtime.record_resumed_tool_failure(
-                            &turn_session,
-                            &branch,
-                            &connection,
-                            &model_id,
-                            resumed.turn_id(),
-                            &resumable.tool_call,
-                            &error.0,
-                            latency_ms,
-                        )?;
-                        return Err(error);
-                    }
-                };
-                let tool_result_message = bt_core::Message::from_part(
-                    bt_core::Role::Tool,
-                    bt_core::MessagePart::ToolResult {
-                        result: tool_result.clone(),
-                    },
-                );
-                if let Err(persistence_error) = state.runtime.record_tool_terminal_transition(
-                    turn_session.session_id,
-                    branch.branch_id,
-                    resumed.turn_id(),
-                    tool_result.clone(),
-                    tool_result_message,
-                ) {
-                    let latency_ms = started.elapsed().as_millis() as u64;
-                    state.runtime.record_turn_failure_transition(
-                        turn_session.session_id,
-                        branch.branch_id,
-                        &connection.provider,
-                        &model_id,
-                        resumed.turn_id(),
-                        vec![tool_result],
-                        &persistence_error,
-                        latency_ms,
-                    )?;
-                    return Err(ApiError(persistence_error));
-                }
-                if state
-                    .runtime
-                    .has_pending_approvals_on_branch(turn_session.session_id, branch.branch_id)?
-                {
-                    let latency_ms = started.elapsed().as_millis() as u64;
-                    state.runtime.record_active_turn_finished(
-                        turn_session.session_id,
-                        branch.branch_id,
-                        resumed.turn_id(),
-                        connection.provider.clone(),
-                        model_id.clone(),
-                        "awaiting_approval".to_owned(),
-                        Some("tool_calls".to_owned()),
-                        latency_ms,
-                    )?;
-                    if let Err(error) = state.runtime.record_related_turn_outcome(
-                        turn_session.session_id,
-                        branch.branch_id,
-                        resumed.turn_id(),
-                        bt_runtime::TurnRunStopReason::AwaitingApproval,
-                    ) {
-                        tracing::warn!(
-                            session_id = %turn_session.session_id,
-                            turn_id = %resumed.turn_id(),
-                            %error,
-                            "failed to record nonterminal related-session progress"
-                        );
-                    }
-                    return Ok(());
-                }
-                run_session_turn(&state, &turn_session, &branch, resumed).await?;
-                Ok(())
-            }
+            run_resumed_approval_turn(
+                work_state,
+                turn_session,
+                branch,
+                connection,
+                model_id,
+                resumed,
+                resumable,
+                decision,
+            )
             .instrument(resumed_turn_span),
         );
 
@@ -773,6 +719,163 @@ async fn approve_tool(
     }
     .instrument(session_span)
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_resumed_approval_turn(
+    state: AppState,
+    turn_session: SessionRecord,
+    branch: BranchRecord,
+    connection: bt_core::ConnectionDescriptor,
+    model_id: String,
+    resumed: bt_runtime::AdmittedTurn,
+    resumable: bt_runtime::ResumableToolCall,
+    decision: bt_core::ApprovalDecision,
+) -> Result<(), ApiError> {
+    let cancellation_guard = state.runtime.begin_active_turn_cancellation(
+        turn_session.session_id,
+        branch.branch_id,
+        resumed.turn_id(),
+    )?;
+    let cancellation = cancellation_guard.signal();
+    let started = Instant::now();
+    let tool_result =
+        if cancellation.is_cancelled() || state.runtime.is_cancelled(turn_session.session_id)? {
+            cancelled_tool_result(&resumable.tool_call)
+        } else {
+            match resolve_tool_after_approval(
+                &state,
+                &turn_session,
+                branch.branch_id,
+                Some(resumed.turn_id()),
+                &resumable.tool_call,
+                decision,
+            )
+            .await
+            {
+                Ok(tool_result) => tool_result,
+                Err(error) => {
+                    let latency_ms = started.elapsed().as_millis() as u64;
+                    let finish = state.runtime.record_resumed_tool_failure(
+                        &turn_session,
+                        &branch,
+                        &connection,
+                        &model_id,
+                        resumed.turn_id(),
+                        &resumable.tool_call,
+                        &error.0,
+                        latency_ms,
+                    )?;
+                    if finish.cancelled {
+                        state.runtime.record_related_turn_outcome(
+                            turn_session.session_id,
+                            branch.branch_id,
+                            resumed.turn_id(),
+                            bt_runtime::TurnRunStopReason::Cancelled,
+                        )?;
+                        state
+                            .runtime
+                            .consume_post_turn_controls(&turn_session, &branch)?;
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+            }
+        };
+    let tool_result_message = bt_core::Message::from_part(
+        bt_core::Role::Tool,
+        bt_core::MessagePart::ToolResult {
+            result: tool_result.clone(),
+        },
+    );
+    if let Err(persistence_error) = state.runtime.record_tool_terminal_transition(
+        turn_session.session_id,
+        branch.branch_id,
+        resumed.turn_id(),
+        tool_result.clone(),
+        tool_result_message,
+    ) {
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let finish = state.runtime.record_turn_failure_transition_with_outcome(
+            turn_session.session_id,
+            branch.branch_id,
+            &connection.provider,
+            &model_id,
+            resumed.turn_id(),
+            vec![tool_result],
+            &persistence_error,
+            latency_ms,
+        )?;
+        if finish.cancelled {
+            state.runtime.record_related_turn_outcome(
+                turn_session.session_id,
+                branch.branch_id,
+                resumed.turn_id(),
+                bt_runtime::TurnRunStopReason::Cancelled,
+            )?;
+            state
+                .runtime
+                .consume_post_turn_controls(&turn_session, &branch)?;
+            return Ok(());
+        }
+        return Err(ApiError(persistence_error));
+    }
+    if cancellation.is_cancelled() || state.runtime.is_cancelled(turn_session.session_id)? {
+        state
+            .runtime
+            .record_active_turn_finished_with_cancel_precedence(
+                turn_session.session_id,
+                branch.branch_id,
+                resumed.turn_id(),
+                connection.provider.clone(),
+                model_id.clone(),
+                "cancelled".to_owned(),
+                Some("Cancelled".to_owned()),
+                started.elapsed().as_millis() as u64,
+            )?;
+        state.runtime.record_related_turn_outcome(
+            turn_session.session_id,
+            branch.branch_id,
+            resumed.turn_id(),
+            bt_runtime::TurnRunStopReason::Cancelled,
+        )?;
+        state
+            .runtime
+            .consume_post_turn_controls(&turn_session, &branch)?;
+        return Ok(());
+    }
+    if state
+        .runtime
+        .has_pending_approvals_on_branch(turn_session.session_id, branch.branch_id)?
+    {
+        let latency_ms = started.elapsed().as_millis() as u64;
+        state.runtime.record_active_turn_finished(
+            turn_session.session_id,
+            branch.branch_id,
+            resumed.turn_id(),
+            connection.provider.clone(),
+            model_id.clone(),
+            "awaiting_approval".to_owned(),
+            Some("tool_calls".to_owned()),
+            latency_ms,
+        )?;
+        if let Err(error) = state.runtime.record_related_turn_outcome(
+            turn_session.session_id,
+            branch.branch_id,
+            resumed.turn_id(),
+            bt_runtime::TurnRunStopReason::AwaitingApproval,
+        ) {
+            tracing::warn!(
+                session_id = %turn_session.session_id,
+                turn_id = %resumed.turn_id(),
+                %error,
+                "failed to record nonterminal related-session progress"
+            );
+        }
+        return Ok(());
+    }
+    run_session_turn(&state, &turn_session, &branch, resumed).await?;
+    Ok(())
 }
 
 async fn answer_tool(

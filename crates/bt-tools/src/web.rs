@@ -11,11 +11,18 @@ use reqwest::{Client, Response, Url};
 use serde_json::{Value, json};
 use std::env;
 use std::future::Future;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::lookup_host;
 
 type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+type ResolverFuture<'a> =
+    Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send + 'a>>;
+
+const WEB_FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const WEB_FETCH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 trait WebSearchBackend: Send + Sync {
     fn name(&self) -> &str;
@@ -225,7 +232,7 @@ impl ToolExecutor for WebFetchTool {
                 .and_then(Value::as_u64)
                 .map(|value| (value as usize).clamp(1024, MAX_TOOL_RESULT_BYTES))
                 .unwrap_or(MAX_TOOL_RESULT_BYTES);
-            let backend = DirectHttpFetchBackend::new()?;
+            let backend = DirectHttpFetchBackend::new();
             let response = backend.fetch(&url, format, max_bytes).await?;
             let is_error = !(200..400).contains(&response.status);
 
@@ -474,17 +481,31 @@ fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+trait HostResolver: Send + Sync {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolverFuture<'a>;
+}
+
+struct SystemHostResolver;
+
+impl HostResolver for SystemHostResolver {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolverFuture<'a> {
+        Box::pin(async move { Ok(lookup_host((host, port)).await?.collect()) })
+    }
+}
+
 struct DirectHttpFetchBackend {
-    client: Client,
+    resolver: Arc<dyn HostResolver>,
+    connect_timeout: Duration,
+    total_timeout: Duration,
 }
 
 impl DirectHttpFetchBackend {
-    fn new() -> Result<Self> {
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(reqwest_error)?;
-        Ok(Self { client })
+    fn new() -> Self {
+        Self {
+            resolver: Arc::new(SystemHostResolver),
+            connect_timeout: WEB_FETCH_CONNECT_TIMEOUT,
+            total_timeout: WEB_FETCH_TOTAL_TIMEOUT,
+        }
     }
 }
 
@@ -501,16 +522,26 @@ impl WebFetchBackend for DirectHttpFetchBackend {
     ) -> BackendFuture<'a, WebFetchResponse> {
         Box::pin(async move {
             let requested = parse_public_http_url(url)?;
-            let mut response = send_with_safe_redirects(&self.client, requested.clone()).await?;
-            let final_url = response.url().to_string();
-            let status = response.status().as_u16();
-            let content_type = response
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(ToOwned::to_owned);
-            let (bytes, truncated_by_bytes) =
-                read_response_body_limited(&mut response, max_bytes).await?;
+            let (final_url, status, content_type, bytes, truncated_by_bytes) =
+                with_fetch_timeout(self.total_timeout, async {
+                    let mut response = send_with_safe_redirects(
+                        self.resolver.as_ref(),
+                        requested.clone(),
+                        self.connect_timeout,
+                    )
+                    .await?;
+                    let final_url = response.url().to_string();
+                    let status = response.status().as_u16();
+                    let content_type = response
+                        .headers()
+                        .get(CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToOwned::to_owned);
+                    let (bytes, truncated_by_bytes) =
+                        read_response_body_limited(&mut response, max_bytes).await?;
+                    Ok((final_url, status, content_type, bytes, truncated_by_bytes))
+                })
+                .await?;
             let raw_text = String::from_utf8_lossy(&bytes).into_owned();
             let title = content_type
                 .as_deref()
@@ -538,6 +569,20 @@ impl WebFetchBackend for DirectHttpFetchBackend {
             })
         })
     }
+}
+
+async fn with_fetch_timeout<T>(
+    total_timeout: Duration,
+    fetch: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(total_timeout, fetch)
+        .await
+        .map_err(|_| {
+            BelltowerError::Tool(format!(
+                "web_fetch timed out after {} milliseconds",
+                total_timeout.as_millis()
+            ))
+        })?
 }
 
 async fn read_response_body_limited(
@@ -584,10 +629,15 @@ fn parse_public_http_url(value: &str) -> Result<Url> {
     Ok(url)
 }
 
-async fn send_with_safe_redirects(client: &Client, initial_url: Url) -> Result<Response> {
+async fn send_with_safe_redirects(
+    resolver: &dyn HostResolver,
+    initial_url: Url,
+    connect_timeout: Duration,
+) -> Result<Response> {
     let mut current = initial_url;
     for _ in 0..=5 {
-        ensure_public_url(&current).await?;
+        let resolved = resolve_public_target(resolver, &current).await?;
+        let client = pinned_client(&resolved, connect_timeout)?;
         let response = client
             .get(current.clone())
             .send()
@@ -602,10 +652,7 @@ async fn send_with_safe_redirects(client: &Client, initial_url: Url) -> Result<R
         let location = location
             .to_str()
             .map_err(|error| BelltowerError::Tool(format!("invalid redirect location: {error}")))?;
-        current = current.join(location).map_err(|error| {
-            BelltowerError::Tool(format!("invalid redirect location `{location}`: {error}"))
-        })?;
-        validate_url_host_without_dns(&current)?;
+        current = validated_redirect_url(&current, location)?;
     }
 
     Err(BelltowerError::Tool(
@@ -613,22 +660,37 @@ async fn send_with_safe_redirects(client: &Client, initial_url: Url) -> Result<R
     ))
 }
 
-async fn ensure_public_url(url: &Url) -> Result<()> {
+struct ResolvedTarget {
+    host: String,
+    addrs: Vec<SocketAddr>,
+    override_dns: bool,
+}
+
+async fn resolve_public_target(resolver: &dyn HostResolver, url: &Url) -> Result<ResolvedTarget> {
     validate_url_host_without_dns(url)?;
     let host = url
         .host_str()
         .ok_or_else(|| BelltowerError::Tool("URL must include a host".to_owned()))?;
-    if host.parse::<IpAddr>().is_ok() {
-        return Ok(());
+    let port = url.port_or_known_default().unwrap_or(443);
+    if let Some(ip) = parse_ip_literal(host) {
+        return Ok(ResolvedTarget {
+            host: host.to_owned(),
+            addrs: vec![SocketAddr::new(ip, port)],
+            override_dns: false,
+        });
     }
 
-    let port = url.port_or_known_default().unwrap_or(443);
-    let addrs = lookup_host((host, port)).await.map_err(|error| {
+    let mut addrs = resolver.resolve(host, port).await.map_err(|error| {
         BelltowerError::Tool(format!(
             "failed to resolve web_fetch host `{host}`: {error}"
         ))
     })?;
-    for addr in addrs {
+    if addrs.is_empty() {
+        return Err(BelltowerError::Tool(format!(
+            "web_fetch host `{host}` resolved to no addresses"
+        )));
+    }
+    for addr in &addrs {
         if is_blocked_ip(addr.ip()) {
             return Err(BelltowerError::Tool(format!(
                 "web_fetch blocked non-public resolved address `{}` for host `{host}`",
@@ -636,7 +698,33 @@ async fn ensure_public_url(url: &Url) -> Result<()> {
             )));
         }
     }
-    Ok(())
+    addrs.sort_unstable();
+    addrs.dedup();
+    Ok(ResolvedTarget {
+        host: host.to_owned(),
+        addrs,
+        override_dns: true,
+    })
+}
+
+fn pinned_client(target: &ResolvedTarget, connect_timeout: Duration) -> Result<Client> {
+    let mut builder = Client::builder()
+        // Proxies would move DNS resolution back outside this trust boundary.
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(connect_timeout);
+    if target.override_dns {
+        builder = builder.resolve_to_addrs(&target.host, &target.addrs);
+    }
+    builder.build().map_err(reqwest_error)
+}
+
+fn validated_redirect_url(current: &Url, location: &str) -> Result<Url> {
+    let redirected = current.join(location).map_err(|error| {
+        BelltowerError::Tool(format!("invalid redirect location `{location}`: {error}"))
+    })?;
+    validate_url_host_without_dns(&redirected)?;
+    Ok(redirected)
 }
 
 fn validate_url_host_without_dns(url: &Url) -> Result<()> {
@@ -648,7 +736,7 @@ fn validate_url_host_without_dns(url: &Url) -> Result<()> {
             "web_fetch does not allow localhost URLs".to_owned(),
         ));
     }
-    if let Ok(ip) = host.parse::<IpAddr>()
+    if let Some(ip) = parse_ip_literal(host)
         && is_blocked_ip(ip)
     {
         return Err(BelltowerError::Tool(format!(
@@ -658,25 +746,78 @@ fn validate_url_host_without_dns(url: &Url) -> Result<()> {
     Ok(())
 }
 
+fn parse_ip_literal(host: &str) -> Option<IpAddr> {
+    host.parse::<IpAddr>().ok().or_else(|| {
+        host.strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .and_then(|host| host.parse::<IpAddr>().ok())
+    })
+}
+
 fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(ip) => {
-            ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || ip.octets()[0] == 0
-                || (ip.octets()[0] == 100 && (ip.octets()[1] & 0b1100_0000) == 64)
-        }
+        IpAddr::V4(ip) => !is_globally_routable_ipv4(ip),
         IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-                || ip.is_multicast()
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_blocked_ip(IpAddr::V4(mapped));
+            }
+            !is_globally_routable_ipv6(ip)
         }
     }
+}
+
+fn is_globally_routable_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, d] = ip.octets();
+    !(a == 0
+        || ip.is_private()
+        || (a == 100 && (b & 0b1100_0000) == 0b0100_0000)
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || (a == 192 && b == 0 && c == 0 && d != 9 && d != 10)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || (a == 198 && (b == 18 || b == 19))
+        || (224..=239).contains(&a)
+        || a >= 240)
+}
+
+fn is_globally_routable_ipv6(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    let value = u128::from_be_bytes(ip.octets());
+    let octets = ip.octets();
+    let ietf_protocol_assignment = segments[0] == 0x2001 && segments[1] < 0x0200;
+    let globally_routable_ietf_exception = value == 0x2001_0001_0000_0000_0000_0000_0000_0001
+        || value == 0x2001_0001_0000_0000_0000_0000_0000_0002
+        || value == 0x2001_0001_0000_0000_0000_0000_0000_0003
+        || (segments[0] == 0x2001 && segments[1] == 0x0003)
+        || (segments[0] == 0x2001 && segments[1] == 0x0004 && segments[2] == 0x0112)
+        || (segments[0] == 0x2001 && (0x0020..=0x003f).contains(&segments[1]));
+    let documentation =
+        (segments[0] == 0x2001 && segments[1] == 0x0db8) || (segments[0] & 0xfff0) == 0x3ff0;
+    let deprecated_site_local = (segments[0] & 0xffc0) == 0xfec0;
+    let nat64_embeds_non_public_ipv4 = segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0]
+        && !is_globally_routable_ipv4(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    let ipv6_dummy_prefix = segments[..4] == [0x0100, 0, 0, 1];
+
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || (segments[..6] == [0, 0, 0, 0, 0, 0xffff])
+        || (segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 1)
+        || (segments[..4] == [0x0100, 0, 0, 0])
+        || ipv6_dummy_prefix
+        || nat64_embeds_non_public_ipv4
+        || (ietf_protocol_assignment && !globally_routable_ietf_exception)
+        || segments[0] == 0x2002
+        || documentation
+        || segments[0] == 0x5f00
+        || ip.is_unique_local()
+        || ip.is_unicast_link_local()
+        || deprecated_site_local
+        || ip.is_multicast())
 }
 
 fn extract_html_title(html: &str) -> Option<String> {
@@ -741,11 +882,65 @@ fn json_error(error: serde_json::Error) -> BelltowerError {
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectHttpFetchBackend, WebFetchBackend, WebFetchTool, WebSearchTool, append_limited_bytes,
-        extract_html_title, normalize_exa_response, parse_public_http_url, stable_content_digest,
+        DirectHttpFetchBackend, HostResolver, ResolvedTarget, ResolverFuture, WebFetchBackend,
+        WebFetchTool, WebSearchTool, append_limited_bytes, extract_html_title, is_blocked_ip,
+        normalize_exa_response, parse_public_http_url, pinned_client, read_response_body_limited,
+        reqwest_error, resolve_public_target, send_with_safe_redirects, stable_content_digest,
+        validated_redirect_url, with_fetch_timeout,
     };
     use bt_core::{ApprovalRequirement, ToolRiskClass, traits::ToolExecutor};
     use serde_json::json;
+    use std::collections::VecDeque;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
+
+    struct ScriptedResolver {
+        answers: Mutex<VecDeque<Vec<SocketAddr>>>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedResolver {
+        fn new(answers: impl IntoIterator<Item = Vec<SocketAddr>>) -> Self {
+            Self {
+                answers: Mutex::new(answers.into_iter().collect()),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl HostResolver for ScriptedResolver {
+        fn resolve<'a>(&'a self, _host: &'a str, _port: u16) -> ResolverFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let answer = self
+                .answers
+                .lock()
+                .expect("resolver answers lock")
+                .pop_front()
+                .unwrap_or_default();
+            Box::pin(async move { Ok(answer) })
+        }
+    }
+
+    struct HeldResolver;
+
+    impl HostResolver for HeldResolver {
+        fn resolve<'a>(&'a self, _host: &'a str, _port: u16) -> ResolverFuture<'a> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn public_addr(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), port)
+    }
 
     #[test]
     fn web_tools_are_moderate_risk_and_require_conditional_approval() {
@@ -785,8 +980,311 @@ mod tests {
         assert!(parse_public_http_url("http://localhost/").is_err());
         assert!(parse_public_http_url("http://127.0.0.1/").is_err());
         assert!(parse_public_http_url("http://10.1.2.3/").is_err());
+        assert!(parse_public_http_url("http://[::ffff:127.0.0.1]/").is_err());
         assert!(parse_public_http_url("file:///tmp/data.txt").is_err());
         assert!(parse_public_http_url("https://example.com/").is_ok());
+    }
+
+    #[test]
+    fn web_fetch_allows_only_globally_routable_unicast_addresses() {
+        for blocked in [
+            "192.0.0.8",
+            "192.0.2.1",
+            "192.88.99.2",
+            "198.18.0.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "2001:2::1",
+            "2001:db8::1",
+            "2002::1",
+            "3fff::1",
+            "64:ff9b::7f00:1",
+            "64:ff9b::a9fe:a9fe",
+            "100:0:0:1::1",
+            "5f00::1",
+            "fc00::1",
+            "fe80::1",
+            "fec0::1",
+            "ff02::1",
+        ] {
+            let ip = blocked.parse::<IpAddr>().expect("test IP address");
+            assert!(
+                is_blocked_ip(ip),
+                "{blocked} must not cross the public boundary"
+            );
+        }
+
+        for public in [
+            "93.184.216.34",
+            "192.0.0.9",
+            "2001:1::3",
+            "64:ff9b::808:808",
+            "2606:4700:4700::1111",
+        ] {
+            let ip = public.parse::<IpAddr>().expect("test IP address");
+            assert!(!is_blocked_ip(ip), "{public} should remain fetchable");
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_rejects_special_use_dns_answers() {
+        let url =
+            parse_public_http_url("http://special-use.test/").expect("syntactically public URL");
+        for blocked in ["198.18.0.1:80", "[fec0::1]:80"] {
+            let resolver = ScriptedResolver::new([vec![
+                blocked.parse::<SocketAddr>().expect("special-use address"),
+            ]]);
+            let error = resolve_public_target(&resolver, &url)
+                .await
+                .err()
+                .expect("special-use DNS answer must fail closed");
+            assert!(error.to_string().contains("non-public resolved address"));
+            assert_eq!(resolver.calls(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_total_timeout_bounds_stalled_headers() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("slow header listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("request connection");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client");
+
+        let error = with_fetch_timeout(Duration::from_millis(50), async {
+            client
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .map_err(reqwest_error)?;
+            Ok(())
+        })
+        .await
+        .expect_err("stalled response headers must time out");
+
+        assert!(error.to_string().contains("web_fetch timed out"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn web_fetch_total_timeout_bounds_stalled_dns() {
+        let backend = DirectHttpFetchBackend {
+            resolver: Arc::new(HeldResolver),
+            connect_timeout: Duration::from_secs(1),
+            total_timeout: Duration::from_millis(50),
+        };
+
+        let error = backend
+            .fetch("http://held-dns.test/", bt_core::WebFetchFormat::Text, 1024)
+            .await
+            .expect_err("stalled DNS must time out");
+
+        assert!(error.to_string().contains("web_fetch timed out"));
+    }
+
+    #[tokio::test]
+    async fn web_fetch_total_timeout_bounds_a_dripping_body() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("slow body listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("request connection");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\na")
+                .await
+                .expect("partial response");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client");
+
+        let error = with_fetch_timeout(Duration::from_millis(50), async {
+            let mut response = client
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .map_err(reqwest_error)?;
+            read_response_body_limited(&mut response, 1024).await?;
+            Ok(())
+        })
+        .await
+        .expect_err("dripping response body must time out");
+
+        assert!(error.to_string().contains("web_fetch timed out"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn web_fetch_rejects_mixed_public_and_private_dns_answers() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("private listener");
+        let private_addr = listener.local_addr().expect("listener address");
+        let resolver =
+            ScriptedResolver::new([vec![public_addr(private_addr.port()), private_addr]]);
+        let url = parse_public_http_url(&format!(
+            "http://mixed-answer.test:{}/",
+            private_addr.port()
+        ))
+        .expect("syntactically public URL");
+
+        let error = resolve_public_target(&resolver, &url)
+            .await
+            .err()
+            .expect("mixed answer must fail closed");
+
+        assert!(error.to_string().contains("non-public resolved address"));
+        assert_eq!(resolver.calls(), 1);
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "validation must not contact an address from a mixed DNS answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_rejects_ipv4_mapped_private_dns_answers() {
+        let mapped_private = "[::ffff:127.0.0.1]:80"
+            .parse::<SocketAddr>()
+            .expect("mapped IPv4 address");
+        let resolver = ScriptedResolver::new([vec![mapped_private]]);
+        let url =
+            parse_public_http_url("http://mapped-answer.test/").expect("syntactically public URL");
+
+        let error = resolve_public_target(&resolver, &url)
+            .await
+            .err()
+            .expect("mapped private answer must fail closed");
+
+        assert!(error.to_string().contains("non-public resolved address"));
+        assert_eq!(resolver.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn web_fetch_rejects_nat64_embedded_private_dns_answers() {
+        for blocked in ["[64:ff9b::7f00:1]:80", "[64:ff9b::a9fe:a9fe]:80"] {
+            let resolver = ScriptedResolver::new([vec![
+                blocked.parse::<SocketAddr>().expect("NAT64 address"),
+            ]]);
+            let url = parse_public_http_url("http://nat64-answer.test/")
+                .expect("syntactically public URL");
+
+            let error = resolve_public_target(&resolver, &url)
+                .await
+                .err()
+                .expect("NAT64 address embedding a non-public IPv4 target must fail closed");
+
+            assert!(error.to_string().contains("non-public resolved address"));
+            assert_eq!(resolver.calls(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_pins_the_first_dns_answer_instead_of_rebinding() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("private listener");
+        let private_addr = listener.local_addr().expect("listener address");
+        let resolver = Arc::new(ScriptedResolver::new([
+            vec![public_addr(private_addr.port())],
+            vec![private_addr],
+        ]));
+        let url = parse_public_http_url(&format!("http://rebind.test:{}/", private_addr.port()))
+            .expect("syntactically public URL");
+
+        let result =
+            send_with_safe_redirects(resolver.as_ref(), url, Duration::from_millis(100)).await;
+
+        assert!(
+            result.is_err(),
+            "the pinned public address is not a test server"
+        );
+        assert_eq!(
+            resolver.calls(),
+            1,
+            "the HTTP connector must not perform a second DNS resolution"
+        );
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "a rebinding answer must never reach the private listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_connection_preserves_the_original_http_host() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("test listener");
+        let local_addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("request connection");
+            let mut request = vec![0_u8; 4096];
+            let read = stream.read(&mut request).await.expect("HTTP request");
+            let request = String::from_utf8_lossy(&request[..read]).into_owned();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("HTTP response");
+            request
+        });
+        let target = ResolvedTarget {
+            host: "original-host.test".to_owned(),
+            addrs: vec![local_addr],
+            override_dns: true,
+        };
+        let client = pinned_client(&target, Duration::from_secs(1)).expect("pinned client");
+
+        let response = client
+            .get(format!(
+                "http://original-host.test:{}/resource",
+                local_addr.port()
+            ))
+            .send()
+            .await
+            .expect("pinned request");
+        assert_eq!(response.status(), 200);
+        let request = server.await.expect("server task");
+        assert!(
+            request.lines().any(|line| line
+                .eq_ignore_ascii_case(&format!("host: original-host.test:{}", local_addr.port()))),
+            "request must retain the URL hostname instead of substituting the pinned IP"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_rejects_private_redirect_before_a_followup_request() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("private listener");
+        let private_addr = listener.local_addr().expect("listener address");
+        let current = parse_public_http_url("https://example.com/start").expect("public URL");
+
+        let result = validated_redirect_url(
+            &current,
+            &format!("http://127.0.0.1:{}/secret", private_addr.port()),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "a private redirect target must be rejected before any request"
+        );
     }
 
     #[test]
@@ -823,7 +1321,7 @@ mod tests {
 
     #[test]
     fn direct_http_backend_is_named_for_traceability() {
-        let backend = DirectHttpFetchBackend::new().expect("backend");
+        let backend = DirectHttpFetchBackend::new();
         assert_eq!(backend.name(), "direct_http");
     }
 

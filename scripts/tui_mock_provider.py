@@ -119,10 +119,19 @@ class Handler(BaseHTTPRequestHandler):
             messages = []
         last_user = _last_user_text(messages)
 
+        delay_before_chunks = 0.0
         if _has_tool_result(messages):
             chunks = _text_chunks("Approval accepted. Tool result recorded in history.\n")
         elif "approval" in last_user.lower():
             chunks = _tool_call_chunks()
+        elif "cancel-hold-turn" in last_user:
+            delay_before_chunks = 2.0
+            chunks = _text_chunks("late-cancel-output-must-not-appear\n")
+        elif "steer-hold-turn" in last_user:
+            delay_before_chunks = 0.75
+            chunks = _text_chunks("Initial steer turn completed.\n")
+        elif "steer-follow-up-token" in last_user:
+            chunks = _text_chunks("Steered follow-up completed.\n")
         elif "long-session-turn" in last_user:
             chunks = _text_chunks(f"Mock response for {last_user.strip()}.\n")
         else:
@@ -132,12 +141,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("content-type", "text/event-stream")
         self.send_header("cache-control", "no-cache")
         self.end_headers()
-        for chunk in chunks:
-            self.wfile.write(_sse_event(chunk))
+        if delay_before_chunks:
+            time.sleep(delay_before_chunks)
+        try:
+            for chunk in chunks:
+                self.wfile.write(_sse_event(chunk))
+                self.wfile.flush()
+                time.sleep(0.02)
+            self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
-            time.sleep(0.02)
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            print(f"client disconnected before response for {last_user!r}", file=sys.stderr, flush=True)
 
 
 def main() -> None:
@@ -152,11 +166,18 @@ def main() -> None:
         handle.write(str(server.server_address[1]))
 
     def stop(_signum: int, _frame: object) -> None:
-        server.shutdown()
+        # HTTPServer.shutdown() must be called from a different thread than
+        # serve_forever(); calling it directly from this main-thread signal
+        # handler deadlocks acceptance teardown. Unwind instead and close the
+        # listening socket in the normal finally path.
+        raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

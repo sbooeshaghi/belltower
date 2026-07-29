@@ -708,6 +708,7 @@ async fn control_surface_methods_cover_current_release_candidate_routes() {
         .update_session(
             created.session.session_id,
             &UpdateSessionRequest {
+                branch_id: created.branch.branch_id,
                 connection_id: Some(ConnectionId::new("local")),
                 model_id: Some("qwen2.5-coder:7b".to_owned()),
                 tool_mode: Some(SessionToolMode::Standard),

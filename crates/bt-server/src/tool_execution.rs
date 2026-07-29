@@ -63,17 +63,67 @@ pub(super) async fn execute_tool_call(
         if let Some(result) = validation_preflight_warning(state, session, branch_id, tool_call)? {
             return Ok(result);
         }
-        Ok(tool
-            .execute(
-                tool_call_execution_arguments(tool_call),
-                ToolContext {
-                    project_root: session.project_root.clone(),
-                },
-            )
-            .await?)
+        let cancellation = turn_id
+            .map(|turn_id| {
+                state.runtime.active_turn_cancellation_signal(
+                    session.session_id,
+                    branch_id,
+                    turn_id,
+                )
+            })
+            .transpose()?
+            .flatten();
+        let interrupt_behavior = tool.spec().metadata.interrupt_behavior;
+        if cancellation
+            .as_ref()
+            .is_some_and(bt_core::CancellationSignal::is_cancelled)
+        {
+            return Ok(cancelled_tool_result(tool_call));
+        }
+        let execution = tool.execute(
+            tool_call_execution_arguments(tool_call),
+            ToolContext {
+                project_root: session.project_root.clone(),
+                cancellation: cancellation.clone(),
+            },
+        );
+        if matches!(
+            interrupt_behavior,
+            bt_core::ToolInterruptBehavior::Immediate
+        ) && let Some(signal) = cancellation.as_ref()
+        {
+            return tokio::select! {
+                biased;
+                () = wait_for_cancellation(signal) => Ok(cancelled_tool_result(tool_call)),
+                result = execution => Ok(result?),
+            };
+        }
+        Ok(execution.await?)
     }
     .instrument(tool_span)
     .await
+}
+
+async fn wait_for_cancellation(signal: &bt_core::CancellationSignal) {
+    while !signal.is_cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+pub(super) fn cancelled_tool_result(tool_call: &ToolCall) -> ToolResultEnvelope {
+    ToolResultEnvelope {
+        call_id: bt_core::ToolCallId::new(tool_call.call_id.clone()),
+        tool_name: tool_call.tool_name.clone(),
+        is_error: true,
+        output: serde_json::json!({
+            "error": {
+                "code": "cancelled",
+                "message": "tool execution cancelled before completion"
+            },
+            "cancelled": true
+        }),
+        duration_ms: None,
+    }
 }
 
 pub(super) fn tool_execution_error_result(

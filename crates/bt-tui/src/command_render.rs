@@ -552,7 +552,7 @@ pub(crate) fn render_compaction_output(
             )
         }
         None => format!(
-            "No compaction was necessary for branch {} on model {}.",
+            "No context reduction was recorded for branch {} on model {}.",
             branch_label, model_id
         ),
     }

@@ -1314,11 +1314,13 @@ impl ChatApp {
         self.pending_shell_command = Some(command.clone());
         let client = self.client.clone();
         let session_id = self.session_id;
+        let branch_id = self.branch_id;
         self.pending_send = Some(tokio::spawn(async move {
             client
                 .run_shell_command(
                     session_id,
                     &RunShellCommandRequest {
+                        branch_id,
                         raw_input,
                         command,
                         timeout_seconds: Some(120),

@@ -49,6 +49,7 @@ Development docs that support implementation work:
 - [`install.md`](./install.md)
 - [`api/README.md`](./api/README.md)
 - [`development/source-of-truth-matrix.md`](./development/source-of-truth-matrix.md)
+- [`development/release-readiness-20260729.md`](./development/release-readiness-20260729.md)
 - [`development/developer-guidelines.md`](./development/developer-guidelines.md)
 - [`development/coherence-audit-20260331.md`](./development/coherence-audit-20260331.md)
 - [`development/pre-friend-testing-audit-20260401.md`](./development/pre-friend-testing-audit-20260401.md)

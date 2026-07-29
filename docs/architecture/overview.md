@@ -65,8 +65,9 @@ That means the canonical model must be able to represent and inspect:
 - the operator-visible history of what each related session did
 
 The bounded subagent foundation now uses this session graph directly: child
-sessions may select independent configured models, and direct parent-child
-messages are durable canonical events rather than hidden runtime state.
+sessions may select independent configured models, and bounded same-lineage
+related-session messages are durable canonical events rather than hidden
+runtime state.
 
 The implemented foundation and the remaining worktree/workflow constraints are documented in:
 
@@ -429,7 +430,8 @@ In v1:
 - raw chunk persistence is first-class
 - OpenInference alignment is first-class
 - standalone provider catalog/config layering is first-class
-- bounded child-session spawn and direct parent-child messaging are first-class
+- bounded child-session spawn and same-lineage related-session messaging are
+  first-class
 
 Deferred to v2:
 

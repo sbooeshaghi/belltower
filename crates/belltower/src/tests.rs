@@ -1,8 +1,9 @@
 //! Tests for launcher CLI setup, readiness, helper discovery, and auth-token compatibility.
 
 use super::launcher::{
-    WorkspaceHelperMode, server_auth_compatible_with_token_path, server_auth_token_candidate_paths,
-    server_protocol_ready_with_token_paths, sibling_binary_is_fresh_for, workspace_helper_mode_for,
+    WorkspaceHelperMode, binary_filename_for_suffix, server_auth_compatible_with_token_path,
+    server_auth_token_candidate_paths, server_protocol_ready_with_token_paths,
+    sibling_binary_is_fresh_for, workspace_helper_mode_for,
 };
 use super::{
     ConnectionChoice, ConnectionPromptMode, auth_methods_support_device_code_login,
@@ -538,6 +539,15 @@ fn installed_executables_do_not_force_workspace_helper_policy() {
         workspace_helper_mode_for(current_exe, Some(workspace), true, false),
         WorkspaceHelperMode::NotWorkspace
     );
+}
+
+#[test]
+fn helper_binary_filename_uses_the_platform_executable_suffix() {
+    assert_eq!(
+        binary_filename_for_suffix("bt-server", ".exe"),
+        "bt-server.exe"
+    );
+    assert_eq!(binary_filename_for_suffix("bt-tui", ""), "bt-tui");
 }
 
 #[test]

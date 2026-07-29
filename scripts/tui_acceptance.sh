@@ -74,6 +74,26 @@ wait_for_pane_text() {
   return 1
 }
 
+wait_for_pane_text_any() {
+  local session="$1"
+  shift
+  local pane
+  local needle
+  for _ in $(seq 1 120); do
+    pane="$(capture_tmux "$session")"
+    for needle in "$@"; do
+      if grep -Fq "$needle" <<<"$pane"; then
+        return 0
+      fi
+    done
+    sleep 0.25
+  done
+  printf 'Timed out waiting for pane text matching any expected value:\n' >&2
+  printf '  %s\n' "$@" >&2
+  capture_tmux "$session" >&2 || true
+  return 1
+}
+
 send_line() {
   local session="$1"
   local text="$2"
@@ -83,8 +103,8 @@ send_line() {
 
 run_tmux_smoke() {
   if ! command -v tmux >/dev/null 2>&1; then
-    printf 'SKIP TUI tmux acceptance: tmux is not installed.\n'
-    return 0
+    printf 'ERROR: TUI tmux acceptance was requested but tmux is not installed.\n' >&2
+    return 1
   fi
 
   local turns="${BELLTOWER_TUI_ACCEPTANCE_TURNS:-12}"
@@ -98,23 +118,35 @@ run_tmux_smoke() {
   local mock_pid=""
   local server_pid=""
 
+  # Mirror teardown state into script-scoped variables so the EXIT trap handles
+  # early returns and normal completion through the same exact-resource path.
+  tui_acceptance_temp_dir="$temp_dir"
+  tui_acceptance_tmux_session="$tmux_session"
+  tui_acceptance_mock_pid=""
+  tui_acceptance_server_pid=""
+
   cleanup() {
-    if [[ -n "${server_pid:-}" ]]; then
-      kill "$server_pid" >/dev/null 2>&1 || true
-      wait "$server_pid" 2>/dev/null || true
+    if [[ -n "${tui_acceptance_tmux_session:-}" ]]; then
+      tmux kill-session -t "$tui_acceptance_tmux_session" >/dev/null 2>&1 || true
     fi
-    if [[ -n "${mock_pid:-}" ]]; then
-      kill "$mock_pid" >/dev/null 2>&1 || true
-      wait "$mock_pid" 2>/dev/null || true
+    if [[ -n "${tui_acceptance_server_pid:-}" ]]; then
+      kill "$tui_acceptance_server_pid" >/dev/null 2>&1 || true
+      wait "$tui_acceptance_server_pid" 2>/dev/null || true
     fi
-    if [[ -n "${tmux_session:-}" ]]; then tmux kill-session -t "$tmux_session" >/dev/null 2>&1 || true; fi
-    if [[ -n "${temp_dir:-}" ]]; then rm -rf "$temp_dir"; fi
+    if [[ -n "${tui_acceptance_mock_pid:-}" ]]; then
+      kill "$tui_acceptance_mock_pid" >/dev/null 2>&1 || true
+      wait "$tui_acceptance_mock_pid" 2>/dev/null || true
+    fi
+    if [[ -n "${tui_acceptance_temp_dir:-}" ]]; then
+      rm -rf "$tui_acceptance_temp_dir"
+    fi
   }
   trap cleanup EXIT
 
   mkdir -p "$config_dir"
   python3 scripts/tui_mock_provider.py --port-file "$mock_port_file" >"$mock_log" 2>&1 &
   mock_pid="$!"
+  tui_acceptance_mock_pid="$mock_pid"
   for _ in $(seq 1 80); do
     [[ -s "$mock_port_file" ]] && break
     sleep 0.1
@@ -152,6 +184,7 @@ EOF
       --port "$server_port" \
       --database "$temp_dir/belltower.sqlite" >"$server_log" 2>&1 &
   server_pid="$!"
+  tui_acceptance_server_pid="$server_pid"
   if ! wait_for_url "http://127.0.0.1:${server_port}/health" "bt-server"; then
     printf '\n==> bt-server log\n' >&2
     cat "$server_log" >&2 || true
@@ -176,6 +209,29 @@ EOF
     wait_for_pane_text "$tmux_session" "Mock response for long-session-turn-${index}"
   done
 
+  send_line "$tmux_session" "cancel-hold-turn"
+  wait_for_pane_text "$tmux_session" "cancel-hold-turn"
+  sleep 0.2
+  send_line "$tmux_session" "/cancel"
+  wait_for_pane_text_any \
+    "$tmux_session" \
+    "Cancellation requested for the current turn" \
+    "Turn cancelled" \
+    "Session cancelled"
+  sleep 2.2
+  if capture_tmux "$tmux_session" | grep -Fq "late-cancel-output-must-not-appear"; then
+    printf 'Cancelled provider output appeared in the TUI transcript.\n' >&2
+    return 1
+  fi
+
+  send_line "$tmux_session" "steer-hold-turn"
+  wait_for_pane_text "$tmux_session" "steer-hold-turn"
+  sleep 0.2
+  send_line "$tmux_session" "/steer steer-follow-up-token"
+  wait_for_pane_text "$tmux_session" "Steering the current turn"
+  wait_for_pane_text "$tmux_session" "Initial steer turn completed"
+  wait_for_pane_text "$tmux_session" "Steered follow-up completed"
+
   send_line "$tmux_session" "approval please"
   wait_for_pane_text "$tmux_session" "approval: shell"
   tmux send-keys -t "$tmux_session" Enter
@@ -184,9 +240,54 @@ EOF
   send_line "$tmux_session" "/inspect session"
   wait_for_pane_text "$tmux_session" "Tool calls:"
   send_line "$tmux_session" "/compact"
-  wait_for_pane_text "$tmux_session" "Compacted branch"
+  wait_for_pane_text_any \
+    "$tmux_session" \
+    "Compacted branch" \
+    "No context reduction was recorded"
   send_line "$tmux_session" "/export jsonl"
+  wait_for_pane_text "$tmux_session" "› /export jsonl"
+  tmux send-keys -t "$tmux_session" -l "$temp_dir/session.jsonl"
+  tmux send-keys -t "$tmux_session" Enter
   wait_for_pane_text "$tmux_session" "Export jsonl"
+
+  python3 - "$temp_dir/session.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+events = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+assert "late-cancel-output-must-not-appear" not in path.read_text()
+
+cancel_seq = next(
+    event["seq_id"]
+    for event in events
+    if "SessionCancelled" in event["payload"]
+    and event["payload"]["SessionCancelled"]["reason"] == "cancelled from bt-tui"
+)
+finished = [
+    event
+    for event in events
+    if "TurnFinished" in event["payload"]
+    and event["payload"]["TurnFinished"]["status"] == "cancelled"
+    and event["seq_id"] > cancel_seq
+]
+assert len(finished) == 1, finished
+turn_id = finished[0]["payload"]["TurnFinished"]["turn_id"]
+assert sum(
+    1
+    for event in events
+    if "TurnFinished" in event["payload"]
+    and event["payload"]["TurnFinished"]["turn_id"] == turn_id
+) == 1
+assert not any(
+    event.get("turn_id") == turn_id
+    and event["seq_id"] > cancel_seq
+    and "MessageAppended" in event["payload"]
+    and event["payload"]["MessageAppended"]["message"]["role"] == "assistant"
+    for event in events
+)
+PY
 
   printf '\n==> TUI tmux acceptance captured pane\n'
   capture_tmux "$tmux_session" | tail -n 80

@@ -4,7 +4,7 @@ use bt_core::{
     ApprovalDecision, ApprovalRequest, ApprovalRequirement, CompletionChunk, CompletionDelta,
     CompletionRequest, CompletionSummary, FinishReason, Message, MessagePart, Result, Role,
     SessionId, TokenUsage, ToolCall, ToolCallId, ToolContext, ToolExecutionMode,
-    ToolResultEnvelope, push_message_part,
+    ToolInterruptBehavior, ToolResultEnvelope, push_message_part,
     traits::{ApprovalEvaluator, Provider},
 };
 use bt_tools::BuiltInToolRegistry;
@@ -33,6 +33,12 @@ struct StreamingToolCallAccumulator {
     tool_name: String,
     initial_arguments: Option<Value>,
     partial_json: String,
+}
+
+enum ToolExecutionOutcome {
+    Finished(ToolResultEnvelope),
+    Cancelled(ToolResultEnvelope),
+    Failed(bt_core::BelltowerError),
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +91,12 @@ pub struct TurnToolCallRequest {
     pub metadata: bt_core::ToolMetadata,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolCallRequestDisposition {
+    Recorded,
+    Cancelled,
+}
+
 /// Synchronously observes tool lifecycle boundaries before the turn can advance.
 ///
 /// Returning an error aborts the turn. In particular, a request error prevents
@@ -94,7 +106,7 @@ pub trait ToolLifecycleObserver {
         &mut self,
         request: &TurnToolCallRequest,
         message: &Message,
-    ) -> Result<()>;
+    ) -> Result<ToolCallRequestDisposition>;
 
     fn tool_approval_requested(&mut self, request: &TurnApprovalRequest) -> Result<()>;
 
@@ -124,13 +136,54 @@ pub struct LlmCallFinished {
 
 struct NoopToolLifecycleObserver;
 
+async fn wait_for_cancellation(signal: &bt_core::CancellationSignal) {
+    while !signal.is_cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn cancelled_turn_result(
+    messages: Vec<Message>,
+    tool_results: Vec<ToolResultEnvelope>,
+    completion_chunks: Vec<CompletionChunk>,
+    usage: Option<TokenUsage>,
+    approvals: Vec<TurnApproval>,
+) -> TurnResult {
+    TurnResult {
+        messages,
+        tool_results,
+        completion_chunks,
+        usage,
+        approvals,
+        approval_requests: Vec::new(),
+        input_requests: Vec::new(),
+        finish_reason: FinishReason::Cancelled,
+    }
+}
+
+fn cancelled_tool_result(tool_call: &ParsedToolCall) -> ToolResultEnvelope {
+    ToolResultEnvelope {
+        call_id: tool_call.call_id.clone(),
+        tool_name: tool_call.tool_name.clone(),
+        is_error: true,
+        output: json!({
+            "error": {
+                "code": "cancelled",
+                "message": "tool execution cancelled before completion"
+            },
+            "cancelled": true
+        }),
+        duration_ms: None,
+    }
+}
+
 impl ToolLifecycleObserver for NoopToolLifecycleObserver {
     fn tool_call_requested(
         &mut self,
         _request: &TurnToolCallRequest,
         _message: &Message,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<ToolCallRequestDisposition> {
+        Ok(ToolCallRequestDisposition::Recorded)
     }
 
     fn tool_approval_requested(&mut self, _request: &TurnApprovalRequest) -> Result<()> {
@@ -206,11 +259,40 @@ impl TurnLoop {
 
     pub async fn run_turn_with_tool_observer<FStart, FChunk, FFinish, O>(
         &self,
+        turn: TurnRequest,
+        on_llm_call_started: FStart,
+        on_chunk: FChunk,
+        on_llm_call_finished: FFinish,
+        tool_lifecycle: &mut O,
+    ) -> Result<TurnResult>
+    where
+        FStart: FnMut(&LlmCallStarted) -> Result<()>,
+        FChunk: FnMut(&CompletionChunk) -> Result<()>,
+        FFinish: FnMut(&LlmCallFinished) -> Result<()>,
+        O: ToolLifecycleObserver + ?Sized,
+    {
+        self.run_turn_with_tool_observer_and_cancellation(
+            turn,
+            on_llm_call_started,
+            on_chunk,
+            on_llm_call_finished,
+            tool_lifecycle,
+            None,
+        )
+        .await
+    }
+
+    /// Runs a turn while observing a process-local cancellation signal owned
+    /// by the runtime's exact active-turn claim. The event log, rather than
+    /// this signal, remains the canonical cancellation authority.
+    pub async fn run_turn_with_tool_observer_and_cancellation<FStart, FChunk, FFinish, O>(
+        &self,
         mut turn: TurnRequest,
         mut on_llm_call_started: FStart,
         mut on_chunk: FChunk,
         mut on_llm_call_finished: FFinish,
         tool_lifecycle: &mut O,
+        cancellation: Option<bt_core::CancellationSignal>,
     ) -> Result<TurnResult>
     where
         FStart: FnMut(&LlmCallStarted) -> Result<()>,
@@ -228,6 +310,18 @@ impl TurnLoop {
         let mut llm_call_ordinal = 0_u32;
 
         loop {
+            if cancellation
+                .as_ref()
+                .is_some_and(bt_core::CancellationSignal::is_cancelled)
+            {
+                return Ok(cancelled_turn_result(
+                    emitted_messages,
+                    tool_results,
+                    completion_chunks,
+                    usage,
+                    approvals,
+                ));
+            }
             let provider_id = self.provider.provider_id().to_owned();
             let connection_id = turn.request.connection_id.to_string();
             let model_id = turn.request.model.clone();
@@ -250,7 +344,7 @@ impl TurnLoop {
                 request: turn.request.clone(),
             })?;
             let started_at = std::time::Instant::now();
-            let response = async {
+            let response_future = async {
                 let stream = self
                     .provider
                     .stream_completion(turn.request.clone())
@@ -258,8 +352,67 @@ impl TurnLoop {
                 self.collect_response(stream, next_llm_call_ordinal, &mut on_chunk)
                     .await
             }
-            .instrument(llm_span)
-            .await?;
+            .instrument(llm_span);
+            let response = if let Some(signal) = cancellation.as_ref() {
+                tokio::select! {
+                    biased;
+                    () = wait_for_cancellation(signal) => None,
+                    response = response_future => {
+                        if signal.is_cancelled() {
+                            None
+                        } else {
+                            Some(response?)
+                        }
+                    },
+                }
+            } else {
+                Some(response_future.await?)
+            };
+            let Some(response) = response else {
+                let summary = self.provider.completion_summary(CompletionSummary {
+                    provider: provider_id,
+                    model: model_id,
+                    finish_reason: FinishReason::Cancelled,
+                    usage: zero_token_usage(),
+                    cost: None,
+                    latency_ms: started_at.elapsed().as_millis() as u64,
+                })?;
+                on_llm_call_finished(&LlmCallFinished {
+                    ordinal: next_llm_call_ordinal,
+                    summary,
+                })?;
+                return Ok(cancelled_turn_result(
+                    emitted_messages,
+                    tool_results,
+                    completion_chunks,
+                    usage,
+                    approvals,
+                ));
+            };
+            if cancellation
+                .as_ref()
+                .is_some_and(bt_core::CancellationSignal::is_cancelled)
+            {
+                let summary = self.provider.completion_summary(CompletionSummary {
+                    provider: provider_id,
+                    model: model_id,
+                    finish_reason: FinishReason::Cancelled,
+                    usage: response.usage.unwrap_or_else(zero_token_usage),
+                    cost: None,
+                    latency_ms: started_at.elapsed().as_millis() as u64,
+                })?;
+                on_llm_call_finished(&LlmCallFinished {
+                    ordinal: next_llm_call_ordinal,
+                    summary,
+                })?;
+                return Ok(cancelled_turn_result(
+                    emitted_messages,
+                    tool_results,
+                    completion_chunks,
+                    usage,
+                    approvals,
+                ));
+            }
             llm_call_ordinal = next_llm_call_ordinal;
             let summary = self.provider.completion_summary(CompletionSummary {
                 provider: provider_id,
@@ -311,7 +464,7 @@ impl TurnLoop {
                     matches!(spec.metadata.execution_mode, ToolExecutionMode::UserInput)
                         .then(|| parse_input_request(&parsed))
                         .transpose()?;
-                tool_lifecycle.tool_call_requested(
+                let request_disposition = tool_lifecycle.tool_call_requested(
                     &TurnToolCallRequest {
                         call_id: parsed.call_id.clone(),
                         tool_name: parsed.tool_name.clone(),
@@ -320,8 +473,35 @@ impl TurnLoop {
                     },
                     &tool_call_message,
                 )?;
+                if request_disposition == ToolCallRequestDisposition::Cancelled {
+                    return Ok(cancelled_turn_result(
+                        emitted_messages,
+                        tool_results,
+                        completion_chunks,
+                        usage,
+                        approvals,
+                    ));
+                }
                 turn.request.messages.push(tool_call_message.clone());
                 emitted_messages.push(tool_call_message);
+
+                if cancellation
+                    .as_ref()
+                    .is_some_and(bt_core::CancellationSignal::is_cancelled)
+                {
+                    let result = cancelled_tool_result(&parsed);
+                    let message = tool_result_message(result.clone());
+                    tool_lifecycle.tool_execution_finished(&result, &message)?;
+                    emitted_messages.push(message);
+                    tool_results.push(result);
+                    return Ok(cancelled_turn_result(
+                        emitted_messages,
+                        tool_results,
+                        completion_chunks,
+                        usage,
+                        approvals,
+                    ));
+                }
 
                 if let Some(input_request) = input_request {
                     input_requests.push(input_request);
@@ -346,10 +526,10 @@ impl TurnLoop {
                         }
                     };
                 let result = match approval_outcome {
-                    ApprovalOutcome::NotNeeded => self
-                        .execute_tool_call(&parsed, &turn.project_root)
-                        .await
-                        .unwrap_or_else(|error| tool_error_result(&parsed, error)),
+                    ApprovalOutcome::NotNeeded => {
+                        self.execute_tool_call(&parsed, &turn.project_root, cancellation.clone())
+                            .await
+                    }
                     ApprovalOutcome::Approved(request, decision) => {
                         let approval = TurnApproval {
                             call_id: parsed.call_id.clone(),
@@ -362,9 +542,8 @@ impl TurnLoop {
                             return Err(error);
                         }
                         approvals.push(approval);
-                        self.execute_tool_call(&parsed, &turn.project_root)
+                        self.execute_tool_call(&parsed, &turn.project_root, cancellation.clone())
                             .await
-                            .unwrap_or_else(|error| tool_error_result(&parsed, error))
                     }
                     ApprovalOutcome::Denied(request, decision) => {
                         let approval = TurnApproval {
@@ -378,13 +557,13 @@ impl TurnLoop {
                             return Err(error);
                         }
                         approvals.push(approval);
-                        tool_error_result(
+                        ToolExecutionOutcome::Finished(tool_error_result(
                             &parsed,
                             bt_core::BelltowerError::InvalidState(format!(
                                 "tool `{}` was denied",
                                 parsed.tool_name
                             )),
-                        )
+                        ))
                     }
                     ApprovalOutcome::Pending(request) => {
                         let approval_request = TurnApprovalRequest {
@@ -411,11 +590,31 @@ impl TurnLoop {
                         });
                     }
                 };
+                let (result, cancelled_during_tool) = match result {
+                    ToolExecutionOutcome::Finished(result) => (result, false),
+                    ToolExecutionOutcome::Cancelled(result) => (result, true),
+                    ToolExecutionOutcome::Failed(error) => {
+                        (tool_error_result(&parsed, error), false)
+                    }
+                };
                 let message = tool_result_message(result.clone());
                 tool_lifecycle.tool_execution_finished(&result, &message)?;
                 turn.request.messages.push(message.clone());
                 emitted_messages.push(message);
                 tool_results.push(result);
+                if cancelled_during_tool
+                    || cancellation
+                        .as_ref()
+                        .is_some_and(bt_core::CancellationSignal::is_cancelled)
+                {
+                    return Ok(cancelled_turn_result(
+                        emitted_messages,
+                        tool_results,
+                        completion_chunks,
+                        usage,
+                        approvals,
+                    ));
+                }
             }
         }
     }
@@ -529,7 +728,8 @@ impl TurnLoop {
         &self,
         tool_call: &ParsedToolCall,
         project_root: &Utf8PathBuf,
-    ) -> Result<ToolResultEnvelope> {
+        cancellation: Option<bt_core::CancellationSignal>,
+    ) -> ToolExecutionOutcome {
         let tool_span = info_span!(
             "tool_execution",
             session_id = %tool_call.session_id,
@@ -537,23 +737,61 @@ impl TurnLoop {
             call_id = %tool_call.call_id,
             project_root = %project_root,
         );
-        async {
+        let outcome = async {
             let tool = self.tools.get(&tool_call.tool_name).ok_or_else(|| {
                 bt_core::BelltowerError::Unsupported(format!(
                     "unknown tool `{}`",
                     tool_call.tool_name
                 ))
             })?;
-            tool.execute(
+            let interrupt_behavior = tool.spec().metadata.interrupt_behavior;
+            if cancellation
+                .as_ref()
+                .is_some_and(bt_core::CancellationSignal::is_cancelled)
+            {
+                return Ok(ToolExecutionOutcome::Cancelled(cancelled_tool_result(
+                    tool_call,
+                )));
+            }
+            let execution = tool.execute(
                 execution_arguments(tool_call),
                 ToolContext {
                     project_root: project_root.clone(),
+                    cancellation: cancellation.clone(),
                 },
-            )
-            .await
+            );
+            if matches!(interrupt_behavior, ToolInterruptBehavior::Immediate)
+                && let Some(signal) = cancellation.as_ref()
+            {
+                return tokio::select! {
+                    biased;
+                    () = wait_for_cancellation(signal) => Ok(ToolExecutionOutcome::Cancelled(
+                        cancelled_tool_result(tool_call),
+                    )),
+                    result = execution => result.map(ToolExecutionOutcome::Finished),
+                };
+            }
+            let result = execution.await?;
+            if cancellation
+                .as_ref()
+                .is_some_and(bt_core::CancellationSignal::is_cancelled)
+            {
+                // WaitForCompletion retains the real terminal result. A
+                // TerminateProcess tool is responsible for returning its own
+                // cancellation result after stopping its process tree.
+                if matches!(interrupt_behavior, ToolInterruptBehavior::WaitForCompletion) {
+                    return Ok(ToolExecutionOutcome::Cancelled(result));
+                }
+                return Ok(ToolExecutionOutcome::Cancelled(result));
+            }
+            Ok(ToolExecutionOutcome::Finished(result))
         }
         .instrument(tool_span)
-        .await
+        .await;
+        match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => ToolExecutionOutcome::Failed(error),
+        }
     }
 
     fn approval_outcome(
@@ -881,10 +1119,11 @@ fn finalize_tool_call(accumulator: StreamingToolCallAccumulator) -> Result<Compl
 mod tests {
     use super::{ToolLifecycleObserver, TurnLoop, TurnRequest, TurnToolCallRequest};
     use bt_core::{
-        ApprovalDecision, ApprovalDecisionSource, ApprovalRequest, ApprovalScope, BelltowerError,
-        CompletionChunk, CompletionDelta, CompletionRequest, ConnectionId, ConnectionStatus,
-        ModelPricing, Result, Role, SessionId, ToolContext, ToolDisplayGroup, ToolExecutionMode,
-        ToolInterruptBehavior, ToolMetadata, ToolResultEnvelope, ToolRiskClass, ToolSpec,
+        ApprovalDecision, ApprovalDecisionSource, ApprovalRequest, ApprovalRequirement,
+        ApprovalScope, BelltowerError, CompletionChunk, CompletionDelta, CompletionRequest,
+        ConnectionId, ConnectionStatus, ModelPricing, Result, Role, SessionId, ToolContext,
+        ToolDisplayGroup, ToolExecutionMode, ToolInterruptBehavior, ToolMetadata,
+        ToolResultEnvelope, ToolRiskClass, ToolSpec,
         traits::{ApprovalEvaluator, BoxFuture, BoxStream, Provider, ToolExecutor},
     };
     use bt_tools::BuiltInToolRegistry;
@@ -900,6 +1139,68 @@ mod tests {
         responses: Mutex<VecDeque<Vec<CompletionChunk>>>,
         call_count: AtomicUsize,
         lifecycle_events: Option<Arc<Mutex<Vec<String>>>>,
+    }
+
+    struct HeldProvider {
+        call_count: AtomicUsize,
+    }
+
+    impl Provider for HeldProvider {
+        fn provider_id(&self) -> &str {
+            "held"
+        }
+
+        fn validate(&self) -> BoxFuture<'_, Result<ConnectionStatus>> {
+            Box::pin(async { Ok(ConnectionStatus::Healthy) })
+        }
+
+        fn stream_completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> BoxFuture<'_, Result<BoxStream<Result<CompletionChunk>>>> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(Box::pin(stream::pending()) as BoxStream<Result<CompletionChunk>>)
+            })
+        }
+
+        fn pricing(&self, _model: &str) -> Option<ModelPricing> {
+            None
+        }
+    }
+
+    struct HeldImmediateTool;
+
+    impl ToolExecutor for HeldImmediateTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "held_immediate".to_owned(),
+                description: "hold until cancelled".to_owned(),
+                parameters_schema: json!({"type": "object"}),
+                metadata: ToolMetadata {
+                    risk_class: ToolRiskClass::Safe,
+                    is_read_only: true,
+                    is_concurrency_safe: true,
+                    interrupt_behavior: ToolInterruptBehavior::Immediate,
+                    execution_mode: ToolExecutionMode::Immediate,
+                    should_defer: false,
+                    catalogue_tags: Vec::new(),
+                    display_group: ToolDisplayGroup::Execution,
+                },
+            }
+        }
+
+        fn approval_requirement(&self, _arguments: &serde_json::Value) -> ApprovalRequirement {
+            ApprovalRequirement::Never
+        }
+
+        fn execute(
+            &self,
+            _arguments: serde_json::Value,
+            _context: ToolContext,
+        ) -> bt_core::ToolFuture<'_> {
+            Box::pin(std::future::pending())
+        }
     }
 
     impl MockProvider {
@@ -968,6 +1269,7 @@ mod tests {
     struct TestToolLifecycleObserver {
         events: Arc<Mutex<Vec<String>>>,
         fail_request: bool,
+        cancel_request: bool,
         fail_approval_requested: bool,
         fail_approval_resolved: bool,
         fail_result: bool,
@@ -978,6 +1280,7 @@ mod tests {
             Self {
                 events: Arc::new(Mutex::new(Vec::new())),
                 fail_request,
+                cancel_request: false,
                 fail_approval_requested: false,
                 fail_approval_resolved: false,
                 fail_result,
@@ -988,6 +1291,7 @@ mod tests {
             Self {
                 events: Arc::new(Mutex::new(Vec::new())),
                 fail_request: false,
+                cancel_request: false,
                 fail_approval_requested: true,
                 fail_approval_resolved: false,
                 fail_result: false,
@@ -998,6 +1302,7 @@ mod tests {
             Self {
                 events: Arc::new(Mutex::new(Vec::new())),
                 fail_request: false,
+                cancel_request: false,
                 fail_approval_requested: false,
                 fail_approval_resolved: true,
                 fail_result: false,
@@ -1008,6 +1313,18 @@ mod tests {
             Self {
                 events,
                 fail_request: false,
+                cancel_request: false,
+                fail_approval_requested: false,
+                fail_approval_resolved: false,
+                fail_result: false,
+            }
+        }
+
+        fn cancelling_request() -> Self {
+            Self {
+                events: Arc::new(Mutex::new(Vec::new())),
+                fail_request: false,
+                cancel_request: true,
                 fail_approval_requested: false,
                 fail_approval_resolved: false,
                 fail_result: false,
@@ -1020,7 +1337,7 @@ mod tests {
             &mut self,
             request: &TurnToolCallRequest,
             _message: &bt_core::Message,
-        ) -> Result<()> {
+        ) -> Result<super::ToolCallRequestDisposition> {
             self.events
                 .lock()
                 .expect("lock")
@@ -1030,7 +1347,10 @@ mod tests {
                     "tool request observation failed".to_owned(),
                 ));
             }
-            Ok(())
+            if self.cancel_request {
+                return Ok(super::ToolCallRequestDisposition::Cancelled);
+            }
+            Ok(super::ToolCallRequestDisposition::Recorded)
         }
 
         fn tool_approval_requested(&mut self, request: &super::TurnApprovalRequest) -> Result<()> {
@@ -1911,5 +2231,173 @@ mod tests {
 
         assert!(matches!(error, BelltowerError::Tool(_)));
         assert!(observer.events.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_held_provider_stream_and_closes_the_call() {
+        let provider = Arc::new(HeldProvider {
+            call_count: AtomicUsize::new(0),
+        });
+        let turn_loop = TurnLoop::new(
+            provider.clone(),
+            BuiltInToolRegistry::new(),
+            Arc::new(AlwaysApproveEvaluator),
+        );
+        let signal = bt_core::CancellationSignal::new();
+        let cancel = signal.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            cancel.cancel();
+        });
+        let finished = Arc::new(Mutex::new(Vec::new()));
+        let finished_callback = Arc::clone(&finished);
+        let mut observer = TestToolLifecycleObserver::new(false, false);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            turn_loop.run_turn_with_tool_observer_and_cancellation(
+                TurnRequest {
+                    session_id: SessionId::new(),
+                    project_root: Utf8PathBuf::from("."),
+                    request: CompletionRequest {
+                        connection_id: ConnectionId::new("local"),
+                        model: "test".to_owned(),
+                        system_prompt: None,
+                        messages: vec![bt_core::Message::text(Role::User, "hold")],
+                        tools: Vec::new(),
+                        structured_output: None,
+                        max_tokens: None,
+                        temperature: None,
+                        thinking: None,
+                    },
+                },
+                |_| Ok(()),
+                |_| Ok(()),
+                move |call| {
+                    finished_callback
+                        .lock()
+                        .expect("lock")
+                        .push(call.summary.finish_reason.clone());
+                    Ok(())
+                },
+                &mut observer,
+                Some(signal),
+            ),
+        )
+        .await
+        .expect("cancellation must bound a held provider")
+        .expect("cancelled turn result");
+
+        assert_eq!(result.finish_reason, bt_core::FinishReason::Cancelled);
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            finished.lock().expect("lock").as_slice(),
+            &[bt_core::FinishReason::Cancelled]
+        );
+    }
+
+    #[tokio::test]
+    async fn immediate_tool_cancellation_records_exactly_one_terminal_result() {
+        let provider = Arc::new(MockProvider::new(vec![vec![tool_call_chunk(
+            "call-held",
+            "held_immediate",
+            json!({}),
+        )]]));
+        let mut tools = BuiltInToolRegistry::default();
+        tools.register(HeldImmediateTool);
+        let turn_loop = TurnLoop::new(provider, tools.clone(), Arc::new(AlwaysApproveEvaluator));
+        let signal = bt_core::CancellationSignal::new();
+        let cancel = signal.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            cancel.cancel();
+        });
+        let mut observer = TestToolLifecycleObserver::new(false, false);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            turn_loop.run_turn_with_tool_observer_and_cancellation(
+                TurnRequest {
+                    session_id: SessionId::new(),
+                    project_root: Utf8PathBuf::from("."),
+                    request: CompletionRequest {
+                        connection_id: ConnectionId::new("local"),
+                        model: "test".to_owned(),
+                        system_prompt: None,
+                        messages: vec![bt_core::Message::text(Role::User, "use tool")],
+                        tools: tools.specs(),
+                        structured_output: None,
+                        max_tokens: None,
+                        temperature: None,
+                        thinking: None,
+                    },
+                },
+                |_| Ok(()),
+                |_| Ok(()),
+                |_| Ok(()),
+                &mut observer,
+                Some(signal),
+            ),
+        )
+        .await
+        .expect("immediate tool cancellation must be bounded")
+        .expect("cancelled turn result");
+
+        assert_eq!(result.finish_reason, bt_core::FinishReason::Cancelled);
+        assert_eq!(result.tool_results.len(), 1);
+        assert_eq!(result.tool_results[0].output["cancelled"], true);
+        assert_eq!(
+            observer.events.lock().expect("lock").as_slice(),
+            &["tool_requested:call-held", "tool_finished:call-held"]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_winning_tool_request_boundary_never_executes_the_tool() {
+        let provider = Arc::new(MockProvider::new(vec![vec![tool_call_chunk(
+            "call-request-race",
+            "held_immediate",
+            json!({}),
+        )]]));
+        let mut tools = BuiltInToolRegistry::default();
+        tools.register(HeldImmediateTool);
+        let turn_loop = TurnLoop::new(provider, tools.clone(), Arc::new(AlwaysApproveEvaluator));
+        let mut observer = TestToolLifecycleObserver::cancelling_request();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            turn_loop.run_turn_with_tool_observer_and_cancellation(
+                TurnRequest {
+                    session_id: SessionId::new(),
+                    project_root: Utf8PathBuf::from("."),
+                    request: CompletionRequest {
+                        connection_id: ConnectionId::new("local"),
+                        model: "test".to_owned(),
+                        system_prompt: None,
+                        messages: vec![bt_core::Message::text(Role::User, "use tool")],
+                        tools: tools.specs(),
+                        structured_output: None,
+                        max_tokens: None,
+                        temperature: None,
+                        thinking: None,
+                    },
+                },
+                |_| Ok(()),
+                |_| Ok(()),
+                |_| Ok(()),
+                &mut observer,
+                Some(bt_core::CancellationSignal::new()),
+            ),
+        )
+        .await
+        .expect("cancelled request boundary must not poll the held tool")
+        .expect("cancelled turn result");
+
+        assert_eq!(result.finish_reason, bt_core::FinishReason::Cancelled);
+        assert!(result.tool_results.is_empty());
+        assert_eq!(
+            observer.events.lock().expect("lock").as_slice(),
+            &["tool_requested:call-request-race"]
+        );
     }
 }
